@@ -5,7 +5,7 @@ import hmac
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -240,6 +240,55 @@ def cockpit_target(manager_net_uid: str, as_of_date: str | None = None) -> dict:
     result = targets.compute_target(manager_id, as_of=as_of_date)
     result["manager_name"] = signals_repository.manager_names([manager_id]).get(manager_id)
     return result
+
+
+@app.get("/cockpit/dashboard")
+def cockpit_dashboard(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+    """Chart-ready manager dashboard DTO (snake_case), computed from the SAME signals the cockpit
+    uses — the MongoDB task store (task_type/urgency/status mix) and the EUR-correct debt
+    aggregation (value_at_risk + aging). No scores are recomputed. Internal-key gated."""
+    manager_id = _resolve_manager(manager_net_uid)
+    as_of = as_of_date or datetime.now(UTC).strftime("%Y-%m-%d")
+    counts = lifecycle.dashboard_counts(manager_id)
+    debt = signals_repository.debt_dashboard_for_manager(manager_id, as_of)
+    return {
+        "manager_id": manager_id,
+        "as_of": as_of,
+        "task_type_mix": counts["task_type_mix"],
+        "urgency_mix": counts["urgency_mix"],
+        "value_at_risk_eur": debt["value_at_risk_eur"],
+        "debt_aging": debt["debt_aging"],
+        "completed_vs_open": counts["completed_vs_open"],
+    }
+
+
+@app.get("/cockpit/head/dashboard")
+def cockpit_head_dashboard(manager_net_uid: str, as_of_date: str | None = None) -> dict:
+    """Chart-ready head/team dashboard DTO (snake_case): per-manager open tasks / critical / debt
+    value-at-risk (EUR), plus the escalation count and department value-at-risk. Reuses the same
+    head/team role gate and per-manager aggregations. Non-head caller -> benign {is_head: false}
+    (200, NOT 403 — the console treats any 403 as a session expiry). Unknown caller -> 404."""
+    _resolve_manager(manager_net_uid)
+    if not signals_repository.is_head_of_sales(manager_net_uid):
+        return {"is_head": False, "as_of": None, "teams": [],
+                "escalated_count": 0, "total_value_at_risk_eur": 0.0}
+    as_of = as_of_date or datetime.now(UTC).strftime("%Y-%m-%d")
+    teams = []
+    total_var = 0.0
+    for mid in signals_repository.all_managers():
+        try:
+            debt = signals_repository.debt_dashboard_for_manager(mid, as_of)
+        except Exception:  # noqa: BLE001
+            continue
+        var = debt["value_at_risk_eur"]
+        total_var += var
+        teams.append({"manager_id": mid,
+                      "open_tasks": lifecycle.active_count(mid),
+                      "critical": lifecycle.critical_active_count(mid),
+                      "value_at_risk_eur": var})
+    return {"is_head": True, "as_of": as_of, "teams": teams,
+            "escalated_count": lifecycle.escalated_count(),
+            "total_value_at_risk_eur": round(total_var, 2)}
 
 
 @app.get("/targets/overview")

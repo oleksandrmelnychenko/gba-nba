@@ -266,6 +266,14 @@ def active_count(manager_id: int) -> int:
         {"manager_id": manager_id, "status": {"$in": list(s.value for s in ACTIVE)}})
 
 
+def escalated_count() -> int:
+    """Count of active tasks escalated to a head (the head escalation queue size), unbounded —
+    the head dashboard reports the true total, not a page cap."""
+    return mongo.tasks().count_documents(
+        {"status": {"$in": list(s.value for s in ACTIVE)},
+         "escalated_to": {"$ne": None, "$exists": True}})
+
+
 def _active_counts(manager_id: int, field: str) -> dict:
     """Count a manager's ACTIVE tasks grouped by a field — lets generation honour per-client/per-type
     caps against tasks ALREADY in the inbox (so on-demand re-runs can't exceed the daily caps)."""
@@ -294,21 +302,72 @@ def get_task(task_key: str) -> dict | None:
 def count_active_by_urgency(manager_id: int) -> dict:
     """Active inbox tasks bucketed by urgency, consistent with inbox() surfacing rules:
     open/in_progress plus snoozed tasks whose snooze_until has passed."""
+    counts = {"critical": 0, "high": 0, "normal": 0, "low": 0, "total": 0}
+    for doc in mongo.tasks().find(_active_inbox_query(manager_id), {"urgency": 1}):
+        bucket = doc.get("urgency")
+        if bucket in counts:
+            counts[bucket] += 1
+        counts["total"] += 1
+    return counts
+
+
+def _active_inbox_query(manager_id: int) -> dict:
+    """The inbox surfacing predicate (open/in_progress + woken snoozed) shared by count/dashboard."""
     now = _now()
-    query = {
+    return {
         "manager_id": manager_id,
         "$or": [
             {"status": {"$in": [TaskStatus.OPEN.value, TaskStatus.IN_PROGRESS.value]}},
             {"status": TaskStatus.SNOOZED.value, "snooze_until": {"$lte": now}},
         ],
     }
-    counts = {"critical": 0, "high": 0, "normal": 0, "low": 0, "total": 0}
-    for doc in mongo.tasks().find(query, {"urgency": 1}):
-        bucket = doc.get("urgency")
-        if bucket in counts:
-            counts[bucket] += 1
-        counts["total"] += 1
-    return counts
+
+
+def dashboard_counts(manager_id: int) -> dict:
+    """Chart-ready counts for a manager dashboard, computed from the SAME task store the cockpit
+    inbox/count use — no separate scoring. Returns:
+      task_type_mix: active inbox tasks by task_type (inbox surfacing rule);
+      urgency_mix:   active inbox tasks by urgency band (same rule as count_active_by_urgency);
+      completed_vs_open: open = active inbox count; done/dismissed = resolved this calendar month
+                         (same month window as team_stats), so the manager view matches the head view.
+    """
+    type_mix: dict[str, int] = {}
+    urgency_mix = {"critical": 0, "high": 0, "normal": 0, "low": 0}
+    open_count = 0
+    for doc in mongo.tasks().find(_active_inbox_query(manager_id), {"task_type": 1, "urgency": 1}):
+        open_count += 1
+        tt = doc.get("task_type")
+        if tt is not None:
+            type_mix[tt] = type_mix.get(tt, 0) + 1
+        u = doc.get("urgency")
+        if u in urgency_mix:
+            urgency_mix[u] += 1
+
+    now = _now()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    done_month = mongo.tasks().count_documents(
+        {"manager_id": manager_id, "status": TaskStatus.DONE.value,
+         "updated_at": {"$gte": month_start, "$lt": next_month}})
+    dismissed_month = mongo.tasks().count_documents(
+        {"manager_id": manager_id, "status": TaskStatus.DISMISSED.value,
+         "updated_at": {"$gte": month_start, "$lt": next_month}})
+
+    return {
+        "task_type_mix": [{"type": tt, "count": n} for tt, n in sorted(type_mix.items())],
+        "urgency_mix": [{"urgency": u, "count": urgency_mix[u]}
+                        for u in ("critical", "high", "normal", "low")],
+        "completed_vs_open": [{"status": "open", "count": open_count},
+                              {"status": "done", "count": done_month},
+                              {"status": "dismissed", "count": dismissed_month}],
+    }
+
+
+def critical_active_count(manager_id: int) -> int:
+    """Active inbox tasks at CRITICAL urgency (inbox surfacing rule) — for the head dashboard."""
+    q = dict(_active_inbox_query(manager_id))
+    q["urgency"] = Urgency.CRITICAL.value
+    return mongo.tasks().count_documents(q)
 
 
 def team_stats(manager_id: int) -> dict:

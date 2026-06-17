@@ -223,6 +223,39 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 3
     )
 
 
+def debt_dashboard_for_manager(manager_id: int, as_of: str) -> dict:
+    """Chart-ready debt aggregation for a manager dashboard, derived from the SAME EUR-correct
+    overdue_debts_for_manager aggregation the debt_followup generator uses (Debt.Total converted to
+    EUR via dbo.GetExchangedToEuroValue — never raw PricePerItem). Uses the configured
+    debt_max_age_days / debt_min_amount so the dashboard total matches what actually generates tasks.
+
+    Returns:
+      value_at_risk_eur: SUM of every open overdue debt (EUR) for this manager;
+      debt_aging: [{bucket, amount_eur, count}] over the client's max overdue age (days since
+                  Debt.Created), bucketed 0-30 / 31-60 / 61-90 / 90+.
+    """
+    s = get_settings()
+    rows = overdue_debts_for_manager(manager_id, as_of, max_age_days=s.debt_max_age_days,
+                                     min_amount=s.debt_min_amount)
+    buckets = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("90+", 91, None)]
+    aging = {label: {"amount_eur": 0.0, "count": 0} for label, _, _ in buckets}
+    value_at_risk = 0.0
+    for r in rows:
+        amount = float(r["overdue_amount"] or 0.0)
+        days = int(r["max_overdue_days"] or 0)
+        value_at_risk += amount
+        for label, lo, hi in buckets:
+            if days >= lo and (hi is None or days <= hi):
+                aging[label]["amount_eur"] += amount
+                aging[label]["count"] += 1
+                break
+    return {
+        "value_at_risk_eur": round(value_at_risk, 2),
+        "debt_aging": [{"bucket": label, "amount_eur": round(aging[label]["amount_eur"], 2),
+                        "count": aging[label]["count"]} for label, _, _ in buckets],
+    }
+
+
 # --- reorder_due signal ---
 
 def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,

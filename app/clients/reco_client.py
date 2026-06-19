@@ -9,6 +9,11 @@ from app.core.logging import get_logger
 log = get_logger("reco_client")
 
 
+def _headers(s) -> dict:
+    """Send the reco internal-API key when configured (reco 401s without it when keyed)."""
+    return {"X-Internal-Api-Key": s.reco_api_key} if s.reco_api_key else {}
+
+
 def recommend(customer_id: int, top_n: int = 10, as_of_date: str | None = None,
               path: str = "/recommend", timeout: int | None = None) -> list[dict]:
     """Return reco product list for a client, or [] if reco is unavailable/errors.
@@ -23,7 +28,8 @@ def recommend(customer_id: int, top_n: int = 10, as_of_date: str | None = None,
     if as_of_date:
         payload["as_of_date"] = as_of_date
     try:
-        r = httpx.post(f"{s.reco_url.rstrip('/')}{path}", json=payload, timeout=timeout or s.http_timeout)
+        r = httpx.post(f"{s.reco_url.rstrip('/')}{path}", json=payload,
+                       headers=_headers(s), timeout=timeout or s.http_timeout)
         r.raise_for_status()
         return r.json().get("recommendations", [])
     except Exception as exc:  # noqa: BLE001
@@ -39,7 +45,8 @@ def send_feedback(customer_id: int, product_ids: list[int], kind: str = "reject"
     s = get_settings()
     payload = {"customer_id": customer_id, "product_ids": list(product_ids), "kind": kind}
     try:
-        r = httpx.post(f"{s.reco_url.rstrip('/')}/feedback", json=payload, timeout=s.http_timeout)
+        r = httpx.post(f"{s.reco_url.rstrip('/')}/feedback", json=payload,
+                       headers=_headers(s), timeout=s.http_timeout)
         r.raise_for_status()
         return True
     except Exception as exc:  # noqa: BLE001

@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     # downstream AI services
     reco_url: str = "http://127.0.0.1:8000"
+    reco_api_key: str = ""  # X-Internal-Api-Key for reco; required when reco enforces a key
     procure_url: str = "http://127.0.0.1:8001"
     http_timeout: int = 30
     reco_crosssell_timeout: int = 8   # short per-call bound so a slow reco can't stall daily generation

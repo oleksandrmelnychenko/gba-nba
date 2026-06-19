@@ -47,6 +47,45 @@ _SHIPPED_BOOST_TYPES = {TaskType.REORDER_DUE, TaskType.CROSS_SELL, TaskType.NEW_
 _PAID_BOOST_TYPES = {TaskType.DEBT_FOLLOWUP}
 
 
+def _allocate_type_caps(shares: dict, cap: int, present_types: set) -> dict:
+    """Turn per-type SHARES into integer per-type caps that sum to EXACTLY the global cap.
+
+    Two policy guarantees:
+      1. Largest-remainder allocation, so the caps always sum to `cap` — the raw round(share*cap)
+         can overshoot (debt+reorder+churn+new+cross = 18+12+8+5+8 = 51 > 50), letting pass-2 hand
+         the +1 slack to the highest-priority deferred type (debt).
+      2. A type that is structurally EMPTY for this manager (no candidates this run — e.g. cross_sell
+         when reco is offline/401, or a manager with no churn risk) gets NO cap, and its share is
+         redistributed PROPORTIONALLY across the remaining present types. Otherwise its slack would
+         drain into debt via pass-2, inflating the real debt share (~0.50) well past the intended 0.35.
+
+    When every type is present this reduces to a faithful largest-remainder split of the full shares.
+    """
+    eligible = {tt: w for tt, w in shares.items() if tt in present_types and w > 0}
+    if not eligible:
+        return {}
+    total_w = sum(eligible.values())
+    # ideal (fractional) allocation, renormalised across the present types only
+    ideal = {tt: w / total_w * cap for tt, w in eligible.items()}
+    floors = {tt: int(x) for tt, x in ideal.items()}
+    allocated = sum(floors.values())
+    remainder = cap - allocated  # whole seats still to hand out
+    # largest fractional remainder wins the leftover seats (ties: heavier share first, then type order)
+    order = sorted(eligible, key=lambda tt: (-(ideal[tt] - floors[tt]), -eligible[tt], tt.value))
+    caps = dict(floors)
+    for tt in order[:max(0, remainder)]:
+        caps[tt] += 1
+    # never starve a present type to 0 (it has real candidates and a positive share); keep the sum at
+    # `cap` by borrowing the seat from the currently-largest cap. Only reachable if present types > cap.
+    for tt in sorted(caps, key=lambda t: eligible[t]):
+        if caps[tt] == 0:
+            donor = max(caps, key=lambda t: caps[t])
+            if caps[donor] > 1:
+                caps[donor] -= 1
+                caps[tt] = 1
+    return caps
+
+
 def _pace_deficit(metric: dict) -> float:
     """Fraction behind pace (0 if on/ahead): max(0, gap) / expected_to_date."""
     expected = metric.get("expected_to_date", 0.0)
@@ -116,7 +155,10 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     candidates.sort(key=lambda t: t.priority, reverse=True)
 
     cap = s.max_active_tasks_per_manager
-    type_cap = {tt: max(1, round(share * cap)) for tt, share in _TYPE_SHARE.items()}
+    # caps sum to EXACTLY the global cap (largest-remainder); a structurally-empty type's share is
+    # redistributed across the present types instead of leaking into debt via the pass-2 refill.
+    present_types = {t.task_type for t in candidates}
+    type_cap = _allocate_type_caps(_TYPE_SHARE, cap, present_types)
 
     # seed caps from tasks ALREADY active this window so re-runs (on-demand /generate) can't exceed
     # the per-client/per-type daily caps; existing tasks are refreshed, not re-counted.

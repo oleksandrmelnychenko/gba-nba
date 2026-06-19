@@ -51,14 +51,18 @@ def manager_id_for_netuid(net_uid: str) -> int | None:
     return int(rows[0]["id"]) if rows else None
 
 
+_HEAD_DASHBOARD_ROLE_TYPES = (6, 3, 8, 12)
+
+
 def is_head_of_sales(net_uid: str) -> bool:
-    """True when NetUID maps to a head-of-sales user (UserRole.UserRoleType = 6)."""
+    """True for head-of-sales (UserRoleType=6) and oversight roles that see the whole
+    department: Administrator (3), TopManager (8), GBA (12)."""
     rows = query(
         """
         SELECT 1 AS ok
         FROM dbo.[User] u
         JOIN dbo.UserRole ur ON ur.ID = u.UserRoleID
-        WHERE u.NetUID = :nu AND u.Deleted = 0 AND ur.UserRoleType = 6
+        WHERE u.NetUID = :nu AND u.Deleted = 0 AND ur.UserRoleType IN (6, 3, 8, 12)
         """,
         {"nu": net_uid},
     )

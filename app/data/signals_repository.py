@@ -386,6 +386,49 @@ def client_monetary(client_ids: list[int], as_of: str, window_days: int = 365) -
     return {int(r["client_id"]): float(r["monetary"] or 0) for r in rows}
 
 
+def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -> dict[int, dict]:
+    """Per client as-of T: the SHARED model features (trailing-365d EUR turnover, days-since-last-order
+    recency, trailing-365d distinct order_count). Identical query/window/exclusions to
+    app.ml.dataset.client_features so the LIVE feature row matches the training distribution exactly
+    — the propensity model was trained on these three shared features, so a generator must supply all
+    three (not just monetary) or the score silently degrades. recency_days is None for clients with no
+    order in the window (callers map None -> 9999, the dataset's missing-recency sentinel)."""
+    if not client_ids:
+        return {}
+    out: dict[int, dict] = {cid: {"monetary": 0.0, "recency_days": None, "order_count": 0}
+                            for cid in client_ids}
+    ph, params = in_clause("c", client_ids)
+    excl = _excluded()
+    not_in = ""
+    if excl:
+        eph, eparams = in_clause("x", sorted(excl))
+        not_in = f" AND oi.ProductID NOT IN {eph}"
+        params = {**params, **eparams}
+    rows = query(
+        f"""
+        SELECT ca.ClientID AS client_id,
+               SUM(oi.Qty * oi.PricePerItem) AS monetary,
+               COUNT(DISTINCT o.ID) AS order_count,
+               DATEDIFF(day, MAX(o.Created), :asof) AS recency_days
+        FROM dbo.ClientAgreement ca
+        JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
+        WHERE o.Deleted = 0 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+              AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}{not_in}
+        GROUP BY ca.ClientID
+        """,
+        {"asof": as_of, "win": window_days, **params},
+    )
+    for r in rows:
+        cid = int(r["client_id"])
+        out[cid] = {
+            "monetary": float(r["monetary"] or 0.0),
+            "order_count": int(r["order_count"] or 0),
+            "recency_days": int(r["recency_days"]) if r["recency_days"] is not None else None,
+        }
+    return out
+
+
 # --- sales-target engine: monthly shipped & paid per manager ---
 
 def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, float]:

@@ -25,7 +25,6 @@ from app.data import signals_repository as sig  # noqa: E402
 from app.services.generators import (  # noqa: E402
     churn_winback,
     debt_followup,
-    new_client_activation,
     reorder_due,
 )
 
@@ -90,7 +89,7 @@ def test_overdue_conversion_collapses_uah_inflation(manager_id):
 
 def test_generate_produces_a_spread_of_urgencies(manager_id):
     candidates = []
-    for gen in (debt_followup, reorder_due, churn_winback, new_client_activation):
+    for gen in (debt_followup, reorder_due, churn_winback):  # new_client_activation retired (unwired)
         candidates.extend(gen.generate(manager_id, AS_OF, WIN))
     assert candidates, "expected candidate tasks for this manager on dev data"
 

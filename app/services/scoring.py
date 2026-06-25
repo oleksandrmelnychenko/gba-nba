@@ -1,13 +1,78 @@
-"""Task prioritization: priority = w_u·urgency + w_v·value + w_c·confidence.
+"""Task prioritization.
 
-All inputs normalized to 0..1. The weights, value saturation and urgency bands are env-driven
-(app.core.config) so they can be A/B-tuned without a redeploy — bump model_version on change.
-Scoring lives in ONE place so every generator is comparable.
+`priority` (0..100) is now driven by the trained propensity model (app.ml.score_task):
+`priority = 100 * p_outcome`, where p_outcome = calibrated P(outcome in (T,T+H] | task). It replaces
+the old expert-guessed blend (w_u·urgency + w_v·value + w_c·confidence), whose pooled OOT AUC was
+~0.557 (≈coin-flip; the debt term was actually INVERTED — biggest-overdue ranked LEAST likely to
+repay). The model lifts OOT AUC to 0.727. Generators call `score_task_priority()`; the legacy blend
+(`priority()`, `value_from_monetary()`) is retained only so app.ml.dataset can recompute the OLD
+priority for the train-time benchmark.
+
+URGENCY stays a separate, real display/sort BAND (urgency_band + the per-type urgency helpers): the
+inbox sort is urgency tier -> type tier -> priority. priority and urgency are NOT collapsed — priority
+is the 0..100 likelihood score, urgency is the cash-at-risk / time-pressure triage band.
+
+The blend weights / value saturation / urgency bands are env-driven (app.core.config); bump
+model_version on any scoring change so outcomes can be sliced/A-B'd by scoring generation.
 """
 from __future__ import annotations
 
 from app.core.config import get_settings
 from app.domain.models import Urgency
+
+# Live generator feature-dict key -> model FEATURE (see app/ml/model_meta.json / app/ml/dataset.py).
+# The generators assemble a feature dict from the SAME raw signal rows the dataset builder replayed,
+# so these map 1:1 onto the model's sig_* columns. Shared features (monetary/recency_days/order_count)
+# pass through under their own names. Anything the model expects but the dict omits -> 0 (score_task's
+# _vectorize default), matching the dataset's 0-fill for non-owning-type signals.
+_FEATURE_KEY_MAP = {
+    # debt_followup
+    "overdue_amount": "sig_overdue_amount",
+    "days_past_terms": "sig_days_past_terms",
+    "max_overdue_days": "sig_max_overdue_days",
+    "debt_lines": "sig_debt_lines",
+    # reorder_due
+    "elapsed_days": "sig_elapsed_days",
+    "cycle_days": "sig_cycle_days",
+    "overdue_ratio": "sig_overdue_ratio",
+    "n_orders": "sig_n_orders",
+    # churn_winback
+    "drop_ratio": "sig_drop_ratio",
+    "silence_days": "sig_silence_days",
+    "recent_orders": "sig_recent_orders",
+    "prior_orders": "sig_prior_orders",
+    # cross_sell
+    "top_score": "sig_top_score",
+    "candidates": "sig_reco_candidates",
+}
+_SHARED_KEYS = ("monetary", "recency_days", "order_count")
+
+
+def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, float, float]:
+    """Score one candidate via the trained propensity model. `signals` is the generator's per-task
+    feature dict using the SHORT raw-signal keys (overdue_amount, elapsed_days, drop_ratio, top_score,
+    ...) plus the shared client features (monetary, recency_days, order_count). Returns
+    (priority, p_outcome, expected_value, ev_score):
+      priority      = 100 * p_outcome (0..100, the unchanged Mongo/orchestrator/inbox contract field)
+      p_outcome     = calibrated P(outcome | task)
+      expected_value= documented E[value] in EUR (score_task.expected_value)
+      ev_score      = p_outcome * expected_value (the expected-EUR ranking key for the cockpit)
+
+    Lazy import keeps the ML deps (joblib/sklearn) off the hot import path; score_task caches the
+    loaded model. recency_days=None is mapped to 9999 — the dataset's missing-recency sentinel."""
+    from app.ml.score_task import score_task
+
+    feats: dict = {"task_type": task_type}
+    for k, v in signals.items():
+        if k in _SHARED_KEYS:
+            if k == "recency_days" and v is None:
+                feats[k] = 9999.0
+            elif v is not None:
+                feats[k] = float(v)
+        elif k in _FEATURE_KEY_MAP and v is not None:
+            feats[_FEATURE_KEY_MAP[k]] = float(v)
+    s = score_task(feats)
+    return s["priority"], s["p_outcome"], s["expected_value"], s["ev_score"]
 
 
 def _sat(x: float, k: float) -> float:

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     task_ttl_days: int = 14
     dismiss_mute_days: int = 30
     service_level_due_days: int = 3
+    crit_debt_reserve: int = 5
 
     # Signal tuning (calibrated 2026-06 on ConcordDb_V5 real data)
     debt_max_age_days: int = 365         # ignore stale write-off debts older than this (Debt.Created)
@@ -66,7 +67,7 @@ class Settings(BaseSettings):
 
     # Scoring / model knobs — tunable WITHOUT redeploy (env-driven); bump model_version on change so
     # outcomes can be sliced/A-B'd by scoring generation.
-    model_version: str = "nba-v1"
+    model_version: str = "nba-v3-propensity"  # priority now = 100*p_outcome from the trained model
     w_urgency: float = 0.5
     w_value: float = 0.3
     w_confidence: float = 0.2

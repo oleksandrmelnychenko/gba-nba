@@ -56,9 +56,19 @@ def test_quota_keeps_a_balanced_mix(mongo_db, monkeypatch):
     stats = orchestrator.generate_for_manager(1, "2026-06-07")
     bt = stats["by_type"]
     assert stats["persisted"] == 50                       # cap respected
-    assert len(bt) == 5                                   # ALL types present -> diversity (incl new_client)
-    assert max(bt.values()) <= 20                         # no single type dominates the inbox
+    assert len(bt) == 4                                   # 4 live types (new_client unwired) -> diversity
+    assert max(bt.values()) <= 21                         # no single type dominates the inbox
     assert bt["debt_followup"] >= bt["cross_sell"]        # debt is the heaviest-weighted quota
+
+
+def test_new_client_activation_is_unwired_from_generation(mongo_db, monkeypatch):
+    # even if new_client_activation.generate is patched to over-produce, the orchestrator must never
+    # run it (it is dropped from _GENERATORS and _TYPE_SHARE) -> zero new_client tasks ever persisted.
+    _patch_generators(monkeypatch, {tt: 30 for tt in TaskType})
+    from app.services import orchestrator
+    assert TaskType.NEW_CLIENT_ACTIVATION not in {g for g in orchestrator._TYPE_SHARE}
+    stats = orchestrator.generate_for_manager(1, "2026-06-07")
+    assert "new_client_activation" not in stats["by_type"]
 
 
 def test_inbox_orders_by_urgency_then_debt_first(mongo_db):

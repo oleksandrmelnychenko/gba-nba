@@ -89,7 +89,10 @@ class Task(BaseModel):
     task_type: TaskType
     title: str
     reason: str
-    priority: float = 0.0
+    priority: float = 0.0          # 0..100 = 100 * p_outcome (the unchanged contract / sort field)
+    p_outcome: float = 0.0         # calibrated P(outcome in (T,T+H] | task) from the propensity model
+    expected_value: float = 0.0    # documented E[value] in EUR (cash/turnover at stake)
+    ev_score: float = 0.0          # p_outcome * expected_value — expected-EUR ordering for the cockpit
     urgency: Urgency = Urgency.NORMAL
     status: TaskStatus = TaskStatus.GENERATED
     payload: dict = Field(default_factory=dict)

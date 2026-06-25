@@ -34,7 +34,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
 
     client_ids = list(by_client.keys())
     contacts = sig.contacts_for_clients(client_ids)
-    monetary = sig.client_monetary(client_ids, as_of)
+    feats = sig.client_features(client_ids, as_of)
     all_pids = [int(r["product_id"]) for r in rows]
     names = sig.product_names(all_pids)
     due = datetime.now(UTC) + timedelta(days=s.service_level_due_days * 2)
@@ -48,11 +48,19 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
         items.sort(key=lambda x: x["_overdue_ratio"], reverse=True)
         top = items[:_MAX_PRODUCTS_PER_TASK]
         lead = top[0]
+        cf = feats.get(cid, {})
+        monetary_cid = float(cf.get("monetary") or 0.0)
 
         u = scoring.reorder_urgency(float(lead["elapsed_days"]), float(lead["cycle_days"] or 0))
-        v = scoring.value_from_monetary(monetary.get(cid, 0.0))
-        conf = min(1.0, 0.4 + 0.1 * float(lead["n_orders"]))  # more history → more confident
-        prio = scoring.priority(u, v, conf)
+        # priority = 100 * P(re-buy of the lead product | task); the lead row mirrors the dataset's
+        # one-row-per-(client,product) reorder candidate (same elapsed/cycle/ratio/n_orders features).
+        feat = {"elapsed_days": float(lead["elapsed_days"]),
+                "cycle_days": float(lead["cycle_days"] or 0),
+                "overdue_ratio": float(lead["_overdue_ratio"]),
+                "n_orders": int(lead["n_orders"]),
+                "monetary": monetary_cid, "recency_days": cf.get("recency_days"),
+                "order_count": cf.get("order_count", 0)}
+        prio, p_out, ev, ev_score = scoring.score_task_priority(TYPE.value, feat)
         us = sorted(scoring.reorder_urgency(float(it["elapsed_days"]), float(it["cycle_days"] or 0))
                     for it in items)
         u_band = us[min(int(0.75 * len(us)), len(us) - 1)] if us else u
@@ -74,17 +82,21 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             reason=f"«{lead_name}»: цикл ~{float(lead['cycle_days'] or 0):.0f} дн, "
                    f"минуло {int(lead['elapsed_days'])} дн"
                    + (f" (+{len(top) - 1} позицій)" if len(top) > 1 else ""),
-            priority=prio, urgency=scoring.urgency_band(u_band),
+            priority=prio, p_outcome=p_out, expected_value=ev, ev_score=ev_score,
+            urgency=scoring.urgency_band(u_band),
             payload={"products": products},
-            signals={"lead_elapsed_days": int(lead["elapsed_days"]),
-                     "lead_cycle_days": round(float(lead["cycle_days"] or 0), 1),
-                     "products_due": len(items), "monetary": monetary.get(cid, 0.0)},
+            signals={"elapsed_days": float(lead["elapsed_days"]),
+                     "cycle_days": float(lead["cycle_days"] or 0),
+                     "overdue_ratio": float(lead["_overdue_ratio"]),
+                     "n_orders": int(lead["n_orders"]), "products_due": len(items),
+                     "monetary": monetary_cid, "recency_days": cf.get("recency_days"),
+                     "order_count": cf.get("order_count", 0)},
             explanation=Explanation(
                 factors=[f"«{lead_name}» минуло {int(lead['elapsed_days'])} дн "
                          f"при циклі ~{float(lead['cycle_days'] or 0):.0f} дн",
                          f"{len(items)} позицій готові до повторного замовлення",
                          f"купували цей товар {int(lead['n_orders'])} раз(и)"],
-                source_signal="reorder_due", confidence=conf),
+                source_signal="reorder_due", confidence=min(1.0, 0.4 + 0.1 * float(lead["n_orders"]))),
             contact=Contact(phone=c.get("phone"), email=c.get("email"),
                             preferred="phone" if c.get("phone") else "email"),
             due_date=due, ab_variant="reorder_v1",

@@ -13,37 +13,38 @@ from datetime import UTC, datetime
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.domain.models import TaskType
+from app.domain.models import TaskType, Urgency
 from app.services import lifecycle
 from app.services.generators import (
     churn_winback,
     cross_sell,
     debt_followup,
-    new_client_activation,
     reorder_due,
 )
 
 log = get_logger("orchestrator")
 
-# generators ordered by default business value (debt first)
-_GENERATORS = [debt_followup, reorder_due, churn_winback, new_client_activation, cross_sell]
+# generators ordered by default business value (debt first).
+# new_client_activation is DROPPED: the propensity model has no head for it (it was excluded from the
+# training set — Client.Created is a 1C-sync stamp, not a real signal), and its live generator fires
+# on those sync-stamp dates, producing junk tasks. Unwired here so it is never generated/persisted.
+_GENERATORS = [debt_followup, reorder_due, churn_winback, cross_sell]
 
 # Per-type share of the manager cap. On real data each of debt/reorder/churn alone produces
 # more candidates than the cap, so without a quota the highest-confidence type (debt) fills the
 # whole inbox. The quota keeps it a balanced, actionable mix; leftover capacity (e.g. when
 # cross_sell is empty because gba-reco is offline) is redistributed in a second pass.
 _TYPE_SHARE = {
-    TaskType.DEBT_FOLLOWUP: 0.35,
-    TaskType.REORDER_DUE: 0.25,
-    TaskType.CHURN_WINBACK: 0.15,
-    TaskType.NEW_CLIENT_ACTIVATION: 0.10,
-    TaskType.CROSS_SELL: 0.15,
+    TaskType.DEBT_FOLLOWUP: 0.40,
+    TaskType.REORDER_DUE: 0.27,
+    TaskType.CHURN_WINBACK: 0.16,
+    TaskType.CROSS_SELL: 0.17,
 }
 
 # Pace coupling: a manager behind their monthly target gets a proportional priority lift —
 # revenue tasks (reorder/cross_sell) when SHIPPED is behind, debt-collection when PAID is behind —
 # up to max_pace_boost (config) at 100% behind pace. This is how the target gap "drives" the queue.
-_SHIPPED_BOOST_TYPES = {TaskType.REORDER_DUE, TaskType.CROSS_SELL, TaskType.NEW_CLIENT_ACTIVATION}
+_SHIPPED_BOOST_TYPES = {TaskType.REORDER_DUE, TaskType.CROSS_SELL}
 _PAID_BOOST_TYPES = {TaskType.DEBT_FOLLOWUP}
 
 
@@ -169,7 +170,8 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
         if raw_type in _valid_types:
             per_type[_valid_types[raw_type]] = n
     active = lifecycle.active_count(manager_id)
-    counters = {"persisted": 0, "skipped_muted": 0, "skipped_capped": 0, "refreshed": 0}
+    counters = {"persisted": 0, "skipped_muted": 0, "skipped_capped": 0, "refreshed": 0,
+                "crit_debt_reserved": 0}
 
     def attempt(task) -> None:
         nonlocal active
@@ -202,6 +204,26 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     # pass 2: fill any leftover global capacity, quota lifted (best remaining first)
     for task in deferred:
         attempt(task)
+
+    # pass 3: bounded CRITICAL-debt reserve admitted above the cap (cash-at-risk floor)
+    reserve = s.crit_debt_reserve
+    if reserve > 0:
+        crit_debt = [t for t in candidates
+                     if t.task_type == TaskType.DEBT_FOLLOWUP and t.urgency == Urgency.CRITICAL]
+        admitted = 0
+        for task in crit_debt:
+            if admitted >= reserve:
+                break
+            if lifecycle.get_task(task.task_key) is not None:
+                continue
+            if lifecycle.is_muted(manager_id, task.client_id, task.task_type.value):
+                continue
+            lifecycle.upsert_generated(task)
+            per_type[TaskType.DEBT_FOLLOWUP] += 1
+            active += 1
+            counters["persisted"] += 1
+            admitted += 1
+        counters["crit_debt_reserved"] = admitted
 
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
              "by_type": {tt.value: n for tt, n in per_type.items()}, **counters}

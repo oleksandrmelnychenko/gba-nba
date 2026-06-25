@@ -1,5 +1,16 @@
 """Generator: new_client_activation — recently-added clients with no (or ~no) orders → onboard
-and land the first sale before the relationship goes cold."""
+and land the first sale before the relationship goes cold.
+
+RETIRED (nba-v3-propensity): this generator is UNWIRED from the orchestrator registry
+(app/services/orchestrator._GENERATORS) and its type rank/share/boost entries are removed, so it is
+NEVER run in production. Two reasons:
+  1. The propensity model has NO head for new_client_activation — it was deliberately excluded from
+     the training set (app/ml/dataset.py): Client.Created is a 1C-sync stamp, not a real "new client"
+     event, so a vintaged outcome label is meaningless.
+  2. Its live signal (new_clients_for_manager) keys off those same sync-stamp dates, so it fires on
+     bulk-import batches and emits junk tasks.
+The module + its unit test are kept for reference; `generate()` is hard-guarded to return [] even if
+something calls it directly, so it cannot leak un-scored (model-less) tasks into the inbox."""
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -11,8 +22,14 @@ from app.services import scoring
 
 TYPE = TaskType.NEW_CLIENT_ACTIVATION
 
+# Retired — see module docstring. Hard kill-switch: the orchestrator no longer registers this
+# generator; this guard ensures a stray direct call also produces nothing (no model head exists).
+ENABLED = False
+
 
 def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
+    if not ENABLED:
+        return []
     rows = sig.new_clients_for_manager(manager_id, as_of)
     if not rows:
         return []

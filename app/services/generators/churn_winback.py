@@ -17,7 +17,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
         return []
     client_ids = [int(r["client_id"]) for r in rows]
     contacts = sig.contacts_for_clients(client_ids)
-    monetary = sig.client_monetary(client_ids, as_of)
+    feats = sig.client_features(client_ids, as_of)
     due = datetime.now(UTC) + timedelta(days=get_settings().service_level_due_days * 2)
 
     tasks: list[Task] = []
@@ -27,11 +27,17 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
         prior = int(r["prior_orders"] or 0)
         silence = int(r["silence_days"] or 0)
         drop_ratio = (recent / prior) if prior else 0.0
+        cf = feats.get(cid, {})
+        monetary_cid = float(cf.get("monetary") or 0.0)
 
         u = scoring.churn_urgency(drop_ratio, silence)
-        v = scoring.value_from_monetary(monetary.get(cid, 0.0))
+        # priority = 100 * P(any re-order | task) from the model (drop/silence/recent/prior + shared)
+        feat = {"drop_ratio": round(drop_ratio, 2), "silence_days": silence,
+                "recent_orders": recent, "prior_orders": prior,
+                "monetary": monetary_cid, "recency_days": cf.get("recency_days"),
+                "order_count": cf.get("order_count", 0)}
+        prio, p_out, ev, ev_score = scoring.score_task_priority(TYPE.value, feat)
         conf = min(1.0, 0.5 + 0.05 * prior)  # more baseline history → more confident it's real churn
-        prio = scoring.priority(u, v, conf)
 
         c = contacts.get(cid, {})
         name = c.get("full_name") or c.get("name") or f"Client {cid}"
@@ -43,15 +49,18 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             title="Утримати клієнта: активність впала",
             reason=f"Замовлення впали на ~{drop_pct}% (було {prior} → стало {recent}); "
                    f"мовчання {silence} дн",
-            priority=prio, urgency=scoring.urgency_band(u),
+            priority=prio, p_outcome=p_out, expected_value=ev, ev_score=ev_score,
+            urgency=scoring.urgency_band(u),
             payload={"churn": {"recent_orders": recent, "prior_orders": prior,
                               "drop_ratio": round(drop_ratio, 2), "silence_days": silence}},
             signals={"drop_ratio": round(drop_ratio, 2), "silence_days": silence,
-                     "monetary": monetary.get(cid, 0.0)},
+                     "recent_orders": recent, "prior_orders": prior,
+                     "monetary": monetary_cid, "recency_days": cf.get("recency_days"),
+                     "order_count": cf.get("order_count", 0)},
             explanation=Explanation(
                 factors=[f"активність впала на ~{drop_pct}% ({prior}→{recent} замовлень)",
                          f"не замовляв {silence} дн",
-                         f"річний оборот {monetary.get(cid, 0.0):.0f}"],
+                         f"річний оборот {monetary_cid:.0f}"],
                 source_signal="churn", confidence=conf),
             contact=Contact(phone=c.get("phone"), email=c.get("email"),
                             preferred="phone" if c.get("phone") else "email"),

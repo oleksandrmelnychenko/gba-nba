@@ -29,9 +29,10 @@ log = get_logger("lifecycle")
 # Inbox ordering policy: triage by urgency band, then by business tier (debt = cash at risk first),
 # then by score. Keeps critical items on top while surfacing overdue debt ahead of equal-urgency
 # reorder/churn — without letting a low-urgency debt jump above a critical reorder.
+# new_client_activation is no longer generated (no model head; junk on 1C-sync stamp dates) and so is
+# dropped from the rank. Any legacy new_client doc still in Mongo falls through to the default tier (9).
 _URGENCY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
-_TYPE_RANK = {"debt_followup": 0, "reorder_due": 1, "churn_winback": 2, "cross_sell": 3,
-              "new_client_activation": 4}
+_TYPE_RANK = {"debt_followup": 0, "reorder_due": 1, "churn_winback": 2, "cross_sell": 3}
 
 
 def _inbox_sort_key(doc: dict) -> tuple:
@@ -70,6 +71,9 @@ def upsert_generated(task: Task) -> str:
         "title": task.title,
         "reason": task.reason,
         "priority": task.priority,
+        "p_outcome": task.p_outcome,
+        "expected_value": task.expected_value,
+        "ev_score": task.ev_score,
         "urgency": task.urgency.value,
         "payload": task.payload,
         "signals": task.signals,
@@ -126,12 +130,19 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
         "$push": {"status_history": change},
     }
     if to == TaskStatus.SNOOZED:
-        update["$set"]["snooze_until"] = snooze_until or (now + timedelta(days=1))
+        wake = snooze_until or (now + timedelta(days=1))
+        update["$set"]["snooze_until"] = wake
+        update["$set"]["expires_at"] = max(_as_aware(wake), now) + timedelta(days=get_settings().task_ttl_days)
     if outcome:
         update["$set"]["outcome"] = outcome.model_dump()
+    if to in TERMINAL:
+        update["$set"]["resolved_at"] = now
 
     updated = mongo.tasks().find_one_and_update(
-        {"task_key": task_key}, update, return_document=ReturnDocument.AFTER)
+        {"task_key": task_key, "status": current.value}, update,
+        return_document=ReturnDocument.AFTER)
+    if updated is None:
+        raise TransitionError(f"conflict: {task_key} changed underneath {current.value}")
     _event(task_key, f"status:{to.value}", by=by, reason=reason)
 
     # DISMISS → mute (client, type) so regeneration doesn't re-spam (anti-spam rule)
@@ -189,15 +200,20 @@ def sweep_sla(escalate_to: int | None = None) -> dict:
     escalate high/critical breached tasks to them by setting escalated_to (surfaced to the head)."""
     now = _now()
     active_values = list(s.value for s in ACTIVE)
+    not_future_snoozed = [{"snooze_until": None}, {"snooze_until": {"$lte": now}}]
     flagged = mongo.tasks().update_many(
-        {"status": {"$in": active_values}, "due_date": {"$lt": now}, "sla_breached": False},
+        {"status": {"$in": active_values}, "due_date": {"$lt": now}, "sla_breached": False,
+         "$or": not_future_snoozed},
         {"$set": {"sla_breached": True, "updated_at": now}}).modified_count
     escalated = 0
     if escalate_to is not None:
         escalated = mongo.tasks().update_many(
             {"status": {"$in": active_values}, "sla_breached": True,
              "urgency": {"$in": [Urgency.CRITICAL.value, Urgency.HIGH.value]},
-             "$or": [{"escalated_to": None}, {"escalated_to": {"$exists": False}}]},
+             "$and": [
+                 {"$or": [{"escalated_to": None}, {"escalated_to": {"$exists": False}}]},
+                 {"$or": not_future_snoozed},
+             ]},
             {"$set": {"escalated_to": escalate_to, "updated_at": now}}).modified_count
     return {"flagged": flagged, "escalated": escalated}
 
@@ -348,10 +364,10 @@ def dashboard_counts(manager_id: int) -> dict:
     next_month = (month_start + timedelta(days=32)).replace(day=1)
     done_month = mongo.tasks().count_documents(
         {"manager_id": manager_id, "status": TaskStatus.DONE.value,
-         "updated_at": {"$gte": month_start, "$lt": next_month}})
+         "resolved_at": {"$gte": month_start, "$lt": next_month}})
     dismissed_month = mongo.tasks().count_documents(
         {"manager_id": manager_id, "status": TaskStatus.DISMISSED.value,
-         "updated_at": {"$gte": month_start, "$lt": next_month}})
+         "resolved_at": {"$gte": month_start, "$lt": next_month}})
 
     return {
         "task_type_mix": [{"type": tt, "count": n} for tt, n in sorted(type_mix.items())],
@@ -388,7 +404,7 @@ def team_stats(manager_id: int) -> dict:
     closed = mongo.tasks().find(
         {"manager_id": manager_id,
          "status": {"$in": [TaskStatus.DONE.value, TaskStatus.DISMISSED.value]},
-         "updated_at": {"$gte": month_start, "$lt": next_month}},
+         "resolved_at": {"$gte": month_start, "$lt": next_month}},
         {"status": 1, "outcome": 1})
     for doc in closed:
         if doc.get("status") == TaskStatus.DISMISSED.value:

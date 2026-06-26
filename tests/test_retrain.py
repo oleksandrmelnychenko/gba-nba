@@ -101,6 +101,26 @@ def test_pooled_oot_auc_reads_production_model(tmp_path):
     assert retrain._pooled_oot_auc(p) == pytest.approx(0.71)
 
 
+def test_model_card_consistency_guard_checks_headline_metrics(tmp_path):
+    metrics = tmp_path / "metrics.json"
+    card = tmp_path / "MODEL_CARD.md"
+    metrics.write_text(json.dumps({
+        "n_rows": 63378,
+        "n_clients": 862,
+        "base_rate": 0.29216762914576033,
+        "production_model": "hgb",
+        "cv": {"hgb": {"auc": 0.6976025109558861}},
+        "oot": {"hgb": {"auc": 0.7044029846834037}},
+        "benchmark": {"oot": {"auc_old": 0.5490260360611878}},
+    }))
+
+    card.write_text("rows 35,943 clients 725 base 26.6% AUC 0.727 old 0.566")
+    assert retrain._model_card_consistency_errors(metrics, card)
+
+    card.write_text("rows 63,378 clients 862 base 29.2% CV 0.698 OOT 0.704 old 0.549")
+    assert retrain._model_card_consistency_errors(metrics, card) == []
+
+
 # ----------------------------------------------------------------------- live-label union (Mongo)
 @pytest.fixture
 def patched_mongo(monkeypatch):

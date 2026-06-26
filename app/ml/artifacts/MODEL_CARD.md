@@ -1,117 +1,121 @@
 # NBA Inbox Propensity Model
 
-Pooled, calibrated `P(outcome | task)` model that replaces the expert-guessed
-`priority = 100·(0.5·urgency + 0.3·value + 0.2·confidence)` in `app/services/scoring.py`.
+Pooled, calibrated `P(outcome | task)` model for the NBA live inbox.
 
-## What it predicts
-Natural conversion propensity: P(the task's defined outcome happens in (T, T+H], H=60 days | task as-of T).
-This is **propensity, NOT manager causal lift** — it ranks who is most likely to convert, not who is
-most *moved* by a manager touch. Correct use: rank the inbox by `p_outcome × E[value]`.
+`priority` is the compatibility score `100 * p_outcome`. Live ranking uses
+`ev_score = p_outcome * expected_value` (expected EUR), with `priority` only as the fallback for
+legacy tasks that do not have `ev_score`.
 
-Outcome labels (leak-safe, outcome strictly in (T, T+H]):
-- reorder_due: client re-buys that product.
-- debt_followup: IncomePaymentOrder EUR ≥ 50% of overdue@T.
-- churn_winback: client places any valid order.
-- cross_sell: client buys a reco-discovered (as-of T) product.
+## What It Predicts
 
-(`new_client_activation` dropped — Client.Created is a 1С sync stamp, not a real activation signal.)
+Natural conversion propensity: P(the task's defined outcome happens in `(T, T+H]`, `H=60` days,
+given task signals as of `T`).
+
+This is propensity, not manager causal lift. It ranks likely value capture; it does not estimate the
+incremental effect of a manager touch.
+
+Outcome labels, leak-safe and strictly after the as-of date:
+
+- `reorder_due`: client re-buys that product.
+- `debt_followup`: income payment EUR is at least 50% of overdue amount at `T`.
+- `churn_winback`: client places any valid order.
+- `cross_sell`: client buys a reco-discovered product.
+
+`new_client_activation` is excluded because `Client.Created` is a 1C sync stamp, not a reliable
+activation signal.
 
 ## Data
-`data/nba_dataset.parquet` — historical backfill, signal SQL replayed verbatim at each historical T
-(Created<=:asof), per-manager filter dropped. 35,943 rows, 725 clients, 9 monthly vintages
-2025-08 → 2026-04, H=60d. Base rate 26.6%.
 
-**cross_sell coverage fix (2026-06):** the original backfill thinned cross_sell on the later
-vintages because the live reco service (:8000) was contended (8s-timeout graceful skips) — Nov–Apr
-had 51–407 rows/vintage with hundreds of active clients silently dropped (Jan was the worst, 51 of
-~423). The per-(client, as-of) reco responses are persisted to `data/reco_cache/`, so the cache was
-completed by replaying the missing pairs serially against an uncontended reco (1,333 new non-empty
-responses) and the dataset rebuilt purely from cache hits. cross_sell is now uniformly covered
-(391–460 rows/vintage, n 2,453 → 3,787). The pooled cross_sell H60 base rate is **9.0%** (was 9.7%):
-the thinned-out clients converted at a *lower* rate, so completing coverage slightly *lowered* the
-rate rather than raising it toward the ~20% that had been assumed — natural cross-sell conversion in
-this book is genuinely ~9%, the earlier figure was upward-biased by the well-covered early vintages.
+`data/nba_dataset.parquet` historical backfill, signal SQL replayed at each historical `T`, with
+manager filter dropped.
 
-## Features (all as-of T)
-Shared client features (`monetary` = trailing-365d EUR turnover, `recency_days`, `order_count`)
-+ 14 type-specific signals (0-filled outside owning type) + task_type one-hot.
+Current artifact metrics:
+
+- Rows: 63,378.
+- Clients: 862.
+- Base rate: 29.2%.
+- Features: 21 shared/type-signal/one-hot columns.
+- Production model: calibrated HGB.
+- Temporal OOT split: train vintages `<= 2026-01-01`, test `2026-02-01..2026-04-01`.
 
 ## Model
-HistGradientBoosting (production) vs LogisticRegression, both isotonic-calibrated.
-HGB chosen: better OOT AUC and Brier. Calibration matters because the priority math needs true probabilities.
+
+HistGradientBoosting and LogisticRegression are both isotonic-calibrated. The production model is
+selected by OOT calibration and AUC, then refit on all rows for serving.
 
 ## Validation
 
-Stratified Group CV (group = client, prevents same client across folds):
+Stratified Group CV, grouped by client:
 
 | metric | HGB | Logit |
-|---|---|---|
-| AUC | 0.724 | 0.723 |
-| KS | 0.332 | 0.329 |
-| Brier | 0.164 | 0.167 |
+|---|---:|---:|
+| AUC | 0.698 | 0.696 |
+| KS | 0.283 | 0.272 |
+| Brier | 0.186 | 0.183 |
 
-Temporal Out-of-Time split — train vintages ≤ 2026-01, test 2026-02..04 (the leakage defense):
+Temporal out-of-time split:
 
 | metric | HGB | Logit |
-|---|---|---|
-| AUC | 0.727 | 0.726 |
-| KS | 0.348 | 0.341 |
-| Brier | 0.159 | 0.162 |
+|---|---:|---:|
+| AUC | 0.704 | 0.702 |
+| KS | 0.280 | 0.279 |
+| Brier | 0.177 | 0.178 |
 
-OOT per-type (production HGB):
+OOT per type, production HGB:
 
 | task_type | n | pos | AUC | KS | Brier |
-|---|---|---|---|---|---|
-| reorder_due | 12389 | 3119 | 0.682 | 0.289 | 0.169 |
-| debt_followup | 625 | 377 | 0.909 | 0.660 | 0.126 |
-| churn_winback | 634 | 219 | 0.820 | 0.538 | 0.156 |
-| cross_sell | 1318 | 114 | 0.711 | 0.370 | 0.076 |
+|---|---:|---:|---:|---:|---:|
+| reorder_due | 22,508 | 6,499 | 0.670 | 0.235 | 0.188 |
+| debt_followup | 632 | 384 | 0.902 | 0.653 | 0.131 |
+| churn_winback | 858 | 255 | 0.815 | 0.496 | 0.149 |
+| cross_sell | 1,750 | 145 | 0.725 | 0.375 | 0.074 |
 
-Reliability (OOT, per type) is in `metrics.json` (`oot_per_type.hgb[*].reliability`). reorder_due
-(the dense mass) is well-calibrated (gaps within ±0.035). debt/churn show a mild upward gap in
-sparse mid bins because paydown/reactivation rates trend up across the test vintages — an expected
-cost of temporal extrapolation; recalibrate on a rolling window in production. After the coverage
-fix cross_sell has 1,318 OOT rows / 114 positives (was 701 / 65); its CV AUC improved 0.678 → 0.689
-on the fuller, more representative pool, while its OOT AUC reads 0.711 (was 0.740) because the test
-slice is now nearly double the size and includes the previously-skipped harder clients — the larger
-CV estimate is the more reliable read. Pooled OOT AUC is unchanged (0.727) and pooled OOT Brier
-improved (0.162 → 0.159).
+Reliability bins are in `metrics.json` under `oot_per_type.hgb[*].reliability`.
 
-## Benchmark vs OLD guessed priority (AUC on the same label)
+## Benchmark vs Old Priority
 
-| scope | old | model | Δ |
-|---|---|---|---|
-| overall (CV) | 0.571 | 0.724 | +0.153 |
-| OOT future | 0.566 | 0.727 | +0.161 |
-| reorder_due | 0.539 | 0.681 | +0.142 |
-| debt_followup | 0.320 | 0.907 | +0.587 |
-| churn_winback | 0.601 | 0.753 | +0.152 |
-| cross_sell | 0.672 | 0.689 | +0.017 |
+AUC on the same outcome label:
 
-The model beats the old priority overall and on all 4 types; the cross_sell edge (+0.017, was a tie
-before the coverage fix) is now positive on the fuller pool — its old urgency already tracked the reco
-score, which is most of the signal. Old debt_followup priority was **worse than random** (0.320) — it
-ranked debts roughly inversely to actual paydown; the model fixes this outright.
+| scope | old | model | delta |
+|---|---:|---:|---:|
+| overall CV | 0.556 | 0.698 | 0.141 |
+| OOT future | 0.549 | 0.704 | 0.155 |
+| reorder_due CV | 0.528 | 0.661 | 0.133 |
+| debt_followup CV | 0.323 | 0.905 | 0.583 |
+| churn_winback CV | 0.589 | 0.793 | 0.204 |
+| cross_sell CV | 0.705 | 0.726 | 0.020 |
 
-## E[value] head (EUR, not learned — simple + documented)
-- debt_followup → overdue_amount @ T (cash directly at stake).
-- reorder_due / cross_sell → expected line revenue ≈ avg order value = monetary / order_count.
-- churn_winback → client monetary (trailing-365 turnover, relationship at risk).
+The model beats old priority overall, out-of-time, and on the modeled task types. This card is
+generated from `metrics.json` by `app/ml/train.py`; if the metrics change, the card changes with
+them.
 
-`score_task()` returns `ev_score = p_outcome × expected_value` as the ranking key, plus a
-0..100 `priority = 100·p_outcome` convenience score.
+## E[value] Head
 
-## Ship-worthiness
-**Ship-worthy as a ranking model.** It cleanly beats the incumbent overall, OOT, and per-type
-(except a cross_sell tie), holds AUC out-of-time, and is well-calibrated on the dense reorder mass.
-Watch-items before/at integration: (1) recalibrate on a rolling window — debt/churn rates drift
-upward over time; (2) cross_sell has thin positives (65 OOT) so treat its calibration as provisional;
-(3) it is propensity, not causal lift — pair with a holdout/experiment later if causal attribution
-is needed. Integration into `scoring.py` is the next phase (not done here).
+The value head is simple, deterministic, and documented in `train.py` / `score_task.py`:
+
+- `debt_followup`: overdue amount at `T`.
+- `reorder_due` / `cross_sell`: approximate average order value, `monetary / order_count`.
+- `churn_winback`: trailing-365 turnover, the relationship value at risk.
+
+`score_task()` returns `p_outcome`, `expected_value`, `ev_score`, and `priority`.
+
+## Ship Notes
+
+Ship-worthy as a ranking model. The model improves historical and OOT ranking versus the old expert
+priority. Remaining caveat: this is a propensity model, not causal lift; causal attribution still
+needs holdout or experiment design.
+
+Operational contract:
+
+- Inbox/caps rank by `ev_score` after urgency/type policy.
+- Fallback to `priority` only when `ev_score` is absent.
+- Keep `priority = 100 * p_outcome` as the compatibility field for old clients and legacy docs.
 
 ## Artifacts
-- `propensity_model.joblib` — final isotonic-calibrated HGB, refit on all data.
-- `model_meta.json` — features, task types, OOT split, formula.
-- `metrics.json` — full CV / OOT / per-type / reliability / benchmark numbers.
-- `../score_task.py` — pure `{p_outcome, expected_value, ev_score, priority}` head.
-- `../train.py` — reproduces everything.
+
+- `propensity_model.joblib`: final isotonic-calibrated model, refit on all data.
+- `model_meta.json`: features, task types, OOT split, formula.
+- `metrics.json`: full CV, OOT, per-type, reliability, and benchmark numbers.
+- `MODEL_CARD.md`: this generated card.
+- `../score_task.py`: serving head for `{p_outcome, expected_value, ev_score, priority}`.
+- `../train.py`: training script that reproduces the artifact metrics.

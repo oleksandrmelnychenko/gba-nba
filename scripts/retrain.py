@@ -100,6 +100,28 @@ def _crosssell_oot_auc(metrics_path: Path) -> float | None:
         return None
 
 
+def _model_card_consistency_errors(metrics_path: Path, card_path: Path) -> list[str]:
+    """Lightweight stale-card guard: make sure the card names the current headline metrics."""
+    if not metrics_path.exists():
+        return [f"{metrics_path.name} missing"]
+    if not card_path.exists():
+        return [f"{card_path.name} missing"]
+
+    rep = json.loads(metrics_path.read_text())
+    prod = rep.get("production_model", "hgb")
+    card = card_path.read_text()
+    expected = {
+        "row count": f"{int(rep['n_rows']):,}",
+        "client count": f"{int(rep['n_clients']):,}",
+        "base rate": f"{float(rep['base_rate']) * 100:.1f}%",
+        "production CV AUC": f"{float(rep['cv'][prod]['auc']):.3f}",
+        "production OOT AUC": f"{float(rep['oot'][prod]['auc']):.3f}",
+        "old OOT AUC": f"{float(rep['benchmark']['oot']['auc_old']):.3f}",
+    }
+    return [f"{label} {value} not found in {card_path.name}"
+            for label, value in expected.items() if value not in card]
+
+
 def _backup(ts: str) -> Path:
     dst = ART / f"backup_{ts}"
     dst.mkdir(parents=True, exist_ok=True)
@@ -229,6 +251,13 @@ def main() -> int:
         print(f"cross_sell OOT AUC   = {cs_auc:.4f}   (reported, not gated)")
     print(f"dataset: backfill={ds_summary['backfill_rows']} live={ds_summary['live_rows']}  "
           f"cross_sell n={ds_summary['cross_sell_n']} base={ds_summary['cross_sell_base_rate']:.1%}")
+    card_errors = _model_card_consistency_errors(ART / "metrics.json", ART / "MODEL_CARD.md")
+    card_ok = not card_errors
+    if card_errors:
+        print("MODEL_CARD consistency gate FAILED:")
+        for err in card_errors:
+            print(f"  - {err}")
+    passed = passed and card_ok
 
     if args.dry_run:
         _restore(backup_dir)

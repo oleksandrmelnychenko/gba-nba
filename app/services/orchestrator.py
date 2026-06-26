@@ -48,6 +48,30 @@ _SHIPPED_BOOST_TYPES = {TaskType.REORDER_DUE, TaskType.CROSS_SELL}
 _PAID_BOOST_TYPES = {TaskType.DEBT_FOLLOWUP}
 
 
+def _float_score(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ranking_score(task) -> float:
+    """Expected-EUR ranking score, with fallback for legacy candidates that lack ev_score."""
+    ev_score = getattr(task, "ev_score", None)
+    return _float_score(getattr(task, "priority", 0.0)) if ev_score is None else _float_score(ev_score)
+
+
+def _candidate_sort_key(task) -> tuple:
+    return (_ranking_score(task), _float_score(getattr(task, "priority", 0.0)))
+
+
+def _scale_ranking_fields(task, factor: float) -> None:
+    task.priority = min(100.0, round(task.priority * factor, 2))
+    ev_score = getattr(task, "ev_score", None)
+    if ev_score is not None:
+        task.ev_score = round(_float_score(ev_score) * factor, 4)
+
+
 def _allocate_type_caps(shares: dict, cap: int, present_types: set) -> dict:
     """Turn per-type SHARES into integer per-type caps that sum to EXACTLY the global cap.
 
@@ -105,7 +129,7 @@ def _apply_pace_boost(candidates: list, pace: dict) -> None:
         else:
             factor = 1.0
         if factor > 1.0:
-            t.priority = min(100.0, round(t.priority * factor, 2))
+            _scale_ranking_fields(t, factor)
 
 
 def _apply_feedback_penalty(candidates: list, rejections: dict) -> None:
@@ -118,7 +142,7 @@ def _apply_feedback_penalty(candidates: list, rejections: dict) -> None:
         n = rejections.get((t.client_id, t.task_type.value), 0)
         if n:
             factor = max(s.feedback_penalty_floor, 1.0 - s.feedback_penalty_per_rejection * n)
-            t.priority = round(t.priority * factor, 2)
+            _scale_ranking_fields(t, factor)
 
 
 def _window_tag(as_of: str) -> str:
@@ -152,8 +176,9 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.warning("feedback_penalty_skipped", manager_id=manager_id, error=str(exc))
 
-    # highest priority first so caps keep the BEST tasks
-    candidates.sort(key=lambda t: t.priority, reverse=True)
+    # highest expected EUR first so caps keep the BEST tasks; priority remains the legacy fallback
+    # and tie-breaker for candidates without an EV score.
+    candidates.sort(key=_candidate_sort_key, reverse=True)
 
     cap = s.max_active_tasks_per_manager
     # caps sum to EXACTLY the global cap (largest-remainder); a structurally-empty type's share is

@@ -132,6 +132,171 @@ def expected_value_row(r: pd.Series) -> float:
     return monetary
 
 
+def _fmt_metric(value: float | int | None, digits: int = 3) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if np.isnan(v):
+        return "n/a"
+    return f"{v:.{digits}f}"
+
+
+def _model_card(report: dict) -> str:
+    """Render the model card from metrics.json data so artifact metadata stays atomic."""
+    prod = report.get("production_model", "hgb")
+    cv = report["cv"]
+    oot = report["oot"]
+    bench = report["benchmark"]
+    oot_per_type = report["oot_per_type"][prod]
+
+    oot_rows = []
+    for tt in TASK_TYPES:
+        m = oot_per_type.get(tt, {})
+        oot_rows.append(
+            f"| {tt} | {int(m.get('n', 0)):,} | {int(m.get('pos', 0)):,} | "
+            f"{_fmt_metric(m.get('auc'))} | {_fmt_metric(m.get('ks'))} | "
+            f"{_fmt_metric(m.get('brier'))} |"
+        )
+
+    bench_rows = [
+        (
+            "| overall CV | "
+            f"{_fmt_metric(bench['overall']['auc_old'])} | "
+            f"{_fmt_metric(bench['overall']['auc_model_cv_hgb'])} | "
+            f"{_fmt_metric(bench['overall']['auc_model_cv_hgb'] - bench['overall']['auc_old'])} |"
+        ),
+        (
+            "| OOT future | "
+            f"{_fmt_metric(bench['oot']['auc_old'])} | "
+            f"{_fmt_metric(bench['oot']['auc_model'])} | "
+            f"{_fmt_metric(bench['oot']['auc_model'] - bench['oot']['auc_old'])} |"
+        ),
+    ]
+    for tt in TASK_TYPES:
+        m = bench["per_type"][tt]
+        bench_rows.append(
+            f"| {tt} CV | {_fmt_metric(m['auc_old'])} | "
+            f"{_fmt_metric(m['auc_model_cv_hgb'])} | "
+            f"{_fmt_metric(m['auc_model_cv_hgb'] - m['auc_old'])} |"
+        )
+
+    return f"""# NBA Inbox Propensity Model
+
+Pooled, calibrated `P(outcome | task)` model for the NBA live inbox.
+
+`priority` is the compatibility score `100 * p_outcome`. Live ranking uses
+`ev_score = p_outcome * expected_value` (expected EUR), with `priority` only as the fallback for
+legacy tasks that do not have `ev_score`.
+
+## What It Predicts
+
+Natural conversion propensity: P(the task's defined outcome happens in `(T, T+H]`, `H=60` days,
+given task signals as of `T`).
+
+This is propensity, not manager causal lift. It ranks likely value capture; it does not estimate the
+incremental effect of a manager touch.
+
+Outcome labels, leak-safe and strictly after the as-of date:
+
+- `reorder_due`: client re-buys that product.
+- `debt_followup`: income payment EUR is at least 50% of overdue amount at `T`.
+- `churn_winback`: client places any valid order.
+- `cross_sell`: client buys a reco-discovered product.
+
+`new_client_activation` is excluded because `Client.Created` is a 1C sync stamp, not a reliable
+activation signal.
+
+## Data
+
+`data/nba_dataset.parquet` historical backfill, signal SQL replayed at each historical `T`, with
+manager filter dropped.
+
+Current artifact metrics:
+
+- Rows: {int(report["n_rows"]):,}.
+- Clients: {int(report["n_clients"]):,}.
+- Base rate: {float(report["base_rate"]) * 100:.1f}%.
+- Features: {len(report["features"])} shared/type-signal/one-hot columns.
+- Production model: calibrated {prod.upper()}.
+- Temporal OOT split: train vintages `<= {OOT_TRAIN_MAX}`, test `{OOT_TEST_LO}..{OOT_TEST_HI}`.
+
+## Model
+
+HistGradientBoosting and LogisticRegression are both isotonic-calibrated. The production model is
+selected by OOT calibration and AUC, then refit on all rows for serving.
+
+## Validation
+
+Stratified Group CV, grouped by client:
+
+| metric | HGB | Logit |
+|---|---:|---:|
+| AUC | {_fmt_metric(cv["hgb"]["auc"])} | {_fmt_metric(cv["logit"]["auc"])} |
+| KS | {_fmt_metric(cv["hgb"]["ks"])} | {_fmt_metric(cv["logit"]["ks"])} |
+| Brier | {_fmt_metric(cv["hgb"]["brier"])} | {_fmt_metric(cv["logit"]["brier"])} |
+
+Temporal out-of-time split:
+
+| metric | HGB | Logit |
+|---|---:|---:|
+| AUC | {_fmt_metric(oot["hgb"]["auc"])} | {_fmt_metric(oot["logit"]["auc"])} |
+| KS | {_fmt_metric(oot["hgb"]["ks"])} | {_fmt_metric(oot["logit"]["ks"])} |
+| Brier | {_fmt_metric(oot["hgb"]["brier"])} | {_fmt_metric(oot["logit"]["brier"])} |
+
+OOT per type, production {prod.upper()}:
+
+| task_type | n | pos | AUC | KS | Brier |
+|---|---:|---:|---:|---:|---:|
+{chr(10).join(oot_rows)}
+
+Reliability bins are in `metrics.json` under `oot_per_type.{prod}[*].reliability`.
+
+## Benchmark vs Old Priority
+
+AUC on the same outcome label:
+
+| scope | old | model | delta |
+|---|---:|---:|---:|
+{chr(10).join(bench_rows)}
+
+The model beats old priority overall, out-of-time, and on the modeled task types. This card is
+generated from `metrics.json` by `app/ml/train.py`; if the metrics change, the card changes with
+them.
+
+## E[value] Head
+
+The value head is simple, deterministic, and documented in `train.py` / `score_task.py`:
+
+- `debt_followup`: overdue amount at `T`.
+- `reorder_due` / `cross_sell`: approximate average order value, `monetary / order_count`.
+- `churn_winback`: trailing-365 turnover, the relationship value at risk.
+
+`score_task()` returns `p_outcome`, `expected_value`, `ev_score`, and `priority`.
+
+## Ship Notes
+
+Ship-worthy as a ranking model. The model improves historical and OOT ranking versus the old expert
+priority. Remaining caveat: this is a propensity model, not causal lift; causal attribution still
+needs holdout or experiment design.
+
+Operational contract:
+
+- Inbox/caps rank by `ev_score` after urgency/type policy.
+- Fallback to `priority` only when `ev_score` is absent.
+- Keep `priority = 100 * p_outcome` as the compatibility field for old clients and legacy docs.
+
+## Artifacts
+
+- `propensity_model.joblib`: final isotonic-calibrated model, refit on all data.
+- `model_meta.json`: features, task types, OOT split, formula.
+- `metrics.json`: full CV, OOT, per-type, reliability, and benchmark numbers.
+- `MODEL_CARD.md`: this generated card.
+- `../score_task.py`: serving head for `{{p_outcome, expected_value, ev_score, priority}}`.
+- `../train.py`: training script that reproduces the artifact metrics.
+"""
+
+
 def main() -> None:
     df = pd.read_parquet(DATA)
     df["vd"] = pd.to_datetime(df["vintage"])
@@ -267,6 +432,7 @@ def main() -> None:
     }
     (ART / "model_meta.json").write_text(json.dumps(meta, indent=2))
     (ART / "metrics.json").write_text(json.dumps(report, indent=2, default=float))
+    (ART / "MODEL_CARD.md").write_text(_model_card(report))
 
     print("\nArtifacts written to", ART)
     print(json.dumps({"cv": cv, "oot": oot, "production_model": prod_name,

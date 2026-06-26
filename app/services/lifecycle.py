@@ -27,18 +27,32 @@ from app.domain.models import (
 log = get_logger("lifecycle")
 
 # Inbox ordering policy: triage by urgency band, then by business tier (debt = cash at risk first),
-# then by score. Keeps critical items on top while surfacing overdue debt ahead of equal-urgency
-# reorder/churn — without letting a low-urgency debt jump above a critical reorder.
+# then by expected EUR score. Keeps critical items on top while surfacing overdue debt ahead of
+# equal-urgency reorder/churn — without letting a low-urgency debt jump above a critical reorder.
 # new_client_activation is no longer generated (no model head; junk on 1C-sync stamp dates) and so is
 # dropped from the rank. Any legacy new_client doc still in Mongo falls through to the default tier (9).
 _URGENCY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 _TYPE_RANK = {"debt_followup": 0, "reorder_due": 1, "churn_winback": 2, "cross_sell": 3}
 
 
+def _float_score(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _ranking_score(doc: dict) -> float:
+    """Expected-EUR ranking score, with legacy fallback to priority when ev_score is absent."""
+    ev_score = doc.get("ev_score")
+    return _float_score(doc.get("priority")) if ev_score is None else _float_score(ev_score)
+
+
 def _inbox_sort_key(doc: dict) -> tuple:
     return (_URGENCY_RANK.get(doc.get("urgency"), 9),
             _TYPE_RANK.get(doc.get("task_type"), 9),
-            -float(doc.get("priority") or 0))
+            -_ranking_score(doc),
+            -_float_score(doc.get("priority")))
 
 
 def _now() -> datetime:
@@ -182,11 +196,11 @@ def inbox(manager_id: int, limit: int = 50, statuses: list[str] | None = None) -
             {"status": TaskStatus.SNOOZED.value, "snooze_until": {"$lte": now}},
         ],
     }
-    # fetch the top page by score (cap == limit, so this is the full active set), then apply the
-    # urgency/tier display ordering in-process.
-    docs = list(mongo.tasks().find(query).sort("priority", -1).limit(limit))
+    # Active manager queues are capped; fetch the active set, then apply the full urgency/tier/EV
+    # ordering in-process so high-EV, lower-probability tasks are not truncated by the legacy priority.
+    docs = list(mongo.tasks().find(query))
     docs.sort(key=_inbox_sort_key)
-    return docs
+    return docs[:max(0, limit)]
 
 
 def wake_snoozed() -> int:
@@ -277,9 +291,9 @@ def escalated_tasks(limit: int = 100) -> list[dict]:
         "status": {"$in": list(s.value for s in ACTIVE)},
         "escalated_to": {"$ne": None, "$exists": True},
     }
-    docs = list(mongo.tasks().find(query).sort("priority", -1).limit(limit))
+    docs = list(mongo.tasks().find(query))
     docs.sort(key=_inbox_sort_key)
-    return docs
+    return docs[:max(0, limit)]
 
 
 _TEAM_BOARD_FIELDS = (
@@ -297,7 +311,7 @@ def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgenc
     """Team-wide live board (head-of-sales). ONE Mongo aggregation over `tasks` with NO single-manager
     filter — team = ALL managers (optionally narrowed to manager_ids), status $in statuses, optional
     urgency match. Sorted by urgency band, then actively-worked first (in_progress_since asc, nulls
-    last via a presence rank), then priority desc — so in-progress + most-urgent surface on top.
+    last via a presence rank), then EV desc — so in-progress + most-urgent surface on top.
 
     Returns (page, total, by_status) where page is the skip/limit window with manager_name joined,
     total is the count over the same filter, and by_status is the {open/in_progress/done/snoozed/
@@ -316,8 +330,10 @@ def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgenc
                          for u, r in _URGENCY_RANK.items()],
             "default": 9}},
         "_ip_present": {"$cond": [{"$ifNull": ["$in_progress_since", False]}, 0, 1]},
+        "_rank_score": {"$ifNull": ["$ev_score", "$priority"]},
     }
-    sort_stage = {"_u_rank": 1, "_ip_present": 1, "in_progress_since": 1, "priority": -1}
+    sort_stage = {"_u_rank": 1, "_ip_present": 1, "in_progress_since": 1,
+                  "_rank_score": -1, "priority": -1}
     projection = {f: 1 for f in _TEAM_BOARD_FIELDS}
     projection["_id"] = 0
 

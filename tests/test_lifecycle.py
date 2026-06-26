@@ -117,14 +117,45 @@ def test_in_progress_since_set_once(patched_mongo):
     assert doc3["in_progress_since"] == first
 
 
-def _team_task(mgr, client_id, key, urgency=Urgency.NORMAL, priority=50.0) -> Task:
+def _team_task(mgr, client_id, key, urgency=Urgency.NORMAL, priority=50.0,
+               ev_score: float | None = 0.0) -> Task:
     return Task(
         task_key=key, manager_id=mgr, client_id=client_id, client_name=f"Client {client_id}",
         task_type=TaskType.DEBT_FOLLOWUP, title="Call", reason="overdue",
-        priority=priority, urgency=urgency,
+        priority=priority, urgency=urgency, ev_score=ev_score,
         explanation=Explanation(factors=["x"], source_signal="debt", confidence=0.5),
         contact=Contact(phone="+380"),
     )
+
+
+def test_inbox_ranks_equal_urgency_type_by_ev_score(patched_mongo):
+    from app.data import mongo
+    from app.services import lifecycle
+
+    high_ev = lifecycle.upsert_generated(
+        _team_task(1, 20, "same_type_high_ev", Urgency.HIGH, priority=25.0, ev_score=800.0))
+    high_probability = lifecycle.upsert_generated(
+        _team_task(1, 21, "same_type_high_probability", Urgency.HIGH, priority=95.0, ev_score=50.0))
+    legacy = lifecycle.upsert_generated(
+        _team_task(1, 22, "same_type_legacy_priority", Urgency.HIGH, priority=90.0))
+    mongo.tasks().update_one({"task_key": legacy}, {"$unset": {"ev_score": ""}})
+
+    assert [d["task_key"] for d in lifecycle.inbox(1)] == [high_ev, legacy, high_probability]
+
+
+def test_team_tasks_ranks_equal_urgency_type_by_ev_score(patched_mongo, monkeypatch):
+    from app.data import signals_repository
+    from app.services import lifecycle
+
+    monkeypatch.setattr(signals_repository, "manager_names", lambda ids: {i: f"Manager {i}" for i in ids})
+    high_ev = lifecycle.upsert_generated(
+        _team_task(1, 30, "team_high_ev", Urgency.HIGH, priority=20.0, ev_score=900.0))
+    high_probability = lifecycle.upsert_generated(
+        _team_task(1, 31, "team_high_probability", Urgency.HIGH, priority=95.0, ev_score=100.0))
+
+    tasks, total, _ = lifecycle.team_tasks(["open"], manager_ids=[1])
+    assert total == 2
+    assert [t["task_key"] for t in tasks] == [high_ev, high_probability]
 
 
 def test_team_tasks_paging_total_by_status_and_sort(patched_mongo, monkeypatch):

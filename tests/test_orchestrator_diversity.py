@@ -1,6 +1,8 @@
 """Orchestrator diversity-quota tests — the inbox stays a balanced mix under over-subscription."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import mongomock
 import pytest
 
@@ -20,11 +22,12 @@ def mongo_db(monkeypatch):
     return db
 
 
-def _mk(task_type: TaskType, i: int, prio: float) -> Task:
+def _mk(task_type: TaskType, i: int, prio: float, ev_score: float = 0.0) -> Task:
     return Task(
         task_key=f"mgr:1|client:{task_type.value}:{i}|type:{task_type.value}|win:2026-06",
         manager_id=1, client_id=hash((task_type.value, i)) % 1_000_000,
-        task_type=task_type, title="t", reason="r", priority=prio, urgency=Urgency.HIGH,
+        task_type=task_type, title="t", reason="r", priority=prio, ev_score=ev_score,
+        urgency=Urgency.HIGH,
     )
 
 
@@ -69,6 +72,35 @@ def test_new_client_activation_is_unwired_from_generation(mongo_db, monkeypatch)
     assert TaskType.NEW_CLIENT_ACTIVATION not in {g for g in orchestrator._TYPE_SHARE}
     stats = orchestrator.generate_for_manager(1, "2026-06-07")
     assert "new_client_activation" not in stats["by_type"]
+
+
+def test_caps_keep_higher_ev_over_higher_probability_same_type(mongo_db, monkeypatch):
+    from app.services import orchestrator
+    from app.services.generators import churn_winback, cross_sell, debt_followup, reorder_due
+
+    low_probability_high_ev = _mk(TaskType.DEBT_FOLLOWUP, 1, prio=25.0, ev_score=900.0)
+    high_probability_low_ev = _mk(TaskType.DEBT_FOLLOWUP, 2, prio=90.0, ev_score=100.0)
+    monkeypatch.setattr(debt_followup, "generate",
+                        lambda manager_id, as_of, window: [high_probability_low_ev, low_probability_high_ev])
+    for mod in (reorder_due, churn_winback, cross_sell):
+        monkeypatch.setattr(mod, "generate", lambda manager_id, as_of, window: [])
+
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: SimpleNamespace(
+        max_active_tasks_per_manager=1,
+        max_tasks_per_client_per_day=2,
+        crit_debt_reserve=0,
+        feedback_window_days=90,
+        max_pace_boost=1.0,
+        feedback_penalty_floor=0.5,
+        feedback_penalty_per_rejection=0.15,
+    ))
+    monkeypatch.setattr(orchestrator.lifecycle, "feedback_rejections", lambda manager_id, days: {})
+
+    stats = orchestrator.generate_for_manager(1, "2026-06-07")
+    assert stats["persisted"] == 1
+    assert [d["task_key"] for d in mongo_db["tasks"].find({}, {"_id": 0, "task_key": 1})] == [
+        low_probability_high_ev.task_key
+    ]
 
 
 def test_inbox_orders_by_urgency_then_debt_first(mongo_db):

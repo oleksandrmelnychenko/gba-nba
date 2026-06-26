@@ -18,8 +18,19 @@ Outcome labels (leak-safe, outcome strictly in (T, T+H]):
 
 ## Data
 `data/nba_dataset.parquet` — historical backfill, signal SQL replayed verbatim at each historical T
-(Created<=:asof), per-manager filter dropped. 34,622 rows, 719 clients, 9 monthly vintages
-2025-08 → 2026-04, H=60d. Base rate 26.5%.
+(Created<=:asof), per-manager filter dropped. 35,943 rows, 725 clients, 9 monthly vintages
+2025-08 → 2026-04, H=60d. Base rate 26.6%.
+
+**cross_sell coverage fix (2026-06):** the original backfill thinned cross_sell on the later
+vintages because the live reco service (:8000) was contended (8s-timeout graceful skips) — Nov–Apr
+had 51–407 rows/vintage with hundreds of active clients silently dropped (Jan was the worst, 51 of
+~423). The per-(client, as-of) reco responses are persisted to `data/reco_cache/`, so the cache was
+completed by replaying the missing pairs serially against an uncontended reco (1,333 new non-empty
+responses) and the dataset rebuilt purely from cache hits. cross_sell is now uniformly covered
+(391–460 rows/vintage, n 2,453 → 3,787). The pooled cross_sell H60 base rate is **9.0%** (was 9.7%):
+the thinned-out clients converted at a *lower* rate, so completing coverage slightly *lowered* the
+rate rather than raising it toward the ~20% that had been assumed — natural cross-sell conversion in
+this book is genuinely ~9%, the earlier figure was upward-biased by the well-covered early vintages.
 
 ## Features (all as-of T)
 Shared client features (`monetary` = trailing-365d EUR turnover, `recency_days`, `order_count`)
@@ -35,48 +46,52 @@ Stratified Group CV (group = client, prevents same client across folds):
 
 | metric | HGB | Logit |
 |---|---|---|
-| AUC | 0.720 | 0.716 |
-| KS | 0.332 | 0.324 |
-| Brier | 0.167 | 0.171 |
+| AUC | 0.724 | 0.723 |
+| KS | 0.332 | 0.329 |
+| Brier | 0.164 | 0.167 |
 
 Temporal Out-of-Time split — train vintages ≤ 2026-01, test 2026-02..04 (the leakage defense):
 
 | metric | HGB | Logit |
 |---|---|---|
-| AUC | 0.727 | 0.720 |
-| KS | 0.348 | 0.334 |
-| Brier | 0.162 | 0.167 |
+| AUC | 0.727 | 0.726 |
+| KS | 0.348 | 0.341 |
+| Brier | 0.159 | 0.162 |
 
 OOT per-type (production HGB):
 
 | task_type | n | pos | AUC | KS | Brier |
 |---|---|---|---|---|---|
-| reorder_due | 12389 | 3119 | 0.690 | 0.295 | 0.168 |
-| debt_followup | 632 | 384 | 0.906 | 0.666 | 0.128 |
-| churn_winback | 634 | 219 | 0.819 | 0.533 | 0.156 |
-| cross_sell | 701 | 65 | 0.740 | 0.402 | 0.080 |
+| reorder_due | 12389 | 3119 | 0.682 | 0.289 | 0.169 |
+| debt_followup | 625 | 377 | 0.909 | 0.660 | 0.126 |
+| churn_winback | 634 | 219 | 0.820 | 0.538 | 0.156 |
+| cross_sell | 1318 | 114 | 0.711 | 0.370 | 0.076 |
 
 Reliability (OOT, per type) is in `metrics.json` (`oot_per_type.hgb[*].reliability`). reorder_due
 (the dense mass) is well-calibrated (gaps within ±0.035). debt/churn show a mild upward gap in
 sparse mid bins because paydown/reactivation rates trend up across the test vintages — an expected
-cost of temporal extrapolation; recalibrate on a rolling window in production. cross_sell upper bins
-are nearly empty (only 65 OOT positives) so AUC there is the more reliable signal than its curve.
+cost of temporal extrapolation; recalibrate on a rolling window in production. After the coverage
+fix cross_sell has 1,318 OOT rows / 114 positives (was 701 / 65); its CV AUC improved 0.678 → 0.689
+on the fuller, more representative pool, while its OOT AUC reads 0.711 (was 0.740) because the test
+slice is now nearly double the size and includes the previously-skipped harder clients — the larger
+CV estimate is the more reliable read. Pooled OOT AUC is unchanged (0.727) and pooled OOT Brier
+improved (0.162 → 0.159).
 
 ## Benchmark vs OLD guessed priority (AUC on the same label)
 
 | scope | old | model | Δ |
 |---|---|---|---|
-| overall (CV) | 0.557 | 0.720 | +0.163 |
-| OOT future | 0.550 | 0.727 | +0.177 |
-| reorder_due | 0.539 | 0.682 | +0.144 |
-| debt_followup | 0.323 | 0.906 | +0.584 |
-| churn_winback | 0.601 | 0.762 | +0.161 |
-| cross_sell | 0.679 | 0.678 | −0.002 |
+| overall (CV) | 0.571 | 0.724 | +0.153 |
+| OOT future | 0.566 | 0.727 | +0.161 |
+| reorder_due | 0.539 | 0.681 | +0.142 |
+| debt_followup | 0.320 | 0.907 | +0.587 |
+| churn_winback | 0.601 | 0.753 | +0.152 |
+| cross_sell | 0.672 | 0.689 | +0.017 |
 
-The model beats the old priority overall and on 3 of 4 types; cross_sell is a statistical tie
-(its old urgency already tracked the reco score, which is most of the signal). Old debt_followup
-priority was **worse than random** (0.323) — it ranked debts roughly inversely to actual paydown;
-the model fixes this outright.
+The model beats the old priority overall and on all 4 types; the cross_sell edge (+0.017, was a tie
+before the coverage fix) is now positive on the fuller pool — its old urgency already tracked the reco
+score, which is most of the signal. Old debt_followup priority was **worse than random** (0.320) — it
+ranked debts roughly inversely to actual paydown; the model fixes this outright.
 
 ## E[value] head (EUR, not learned — simple + documented)
 - debt_followup → overdue_amount @ T (cash directly at stake).

@@ -28,7 +28,7 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
             FROM dbo.[Order] o
             JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            WHERE o.Deleted = 0 AND oi.ProductID IS NOT NULL
+            WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
                   AND o.Created >= DATEADD(month, -12, GETDATE())
         ),
         tot AS (SELECT COUNT(DISTINCT cid) AS n FROM base)
@@ -108,10 +108,11 @@ def new_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 90,
                   AND c.Created >= DATEADD(day, -:recent, :asof)
         ),
         oc AS (
-            SELECT ca.ClientID AS cid, COUNT(DISTINCT o.ID) AS n
+            SELECT ca.ClientID AS cid, COUNT(DISTINCT oi.OrderID) AS n
             FROM dbo.ClientAgreement ca
             JOIN cand ON cand.ID = ca.ClientID
-            LEFT JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Deleted = 0 AND o.Created < :asof
+            LEFT JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Created < :asof
+            LEFT JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             GROUP BY ca.ClientID
         )
         SELECT cand.ID AS client_id, cand.FullName AS full_name, cand.Name AS name,
@@ -158,8 +159,9 @@ def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 1
         WITH act AS (
             SELECT ca.ClientID AS cid
             FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Deleted = 0
+            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
                  AND o.Created >= DATEADD(day, -:recent, :asof) AND o.Created < :asof
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
             GROUP BY ca.ClientID
             HAVING COUNT(DISTINCT o.ID) >= :minord
@@ -284,7 +286,7 @@ def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: i
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Deleted = 0 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
                   AND c.Deleted = 0 AND c.MainManagerID = :mid
             GROUP BY ca.ClientID, oi.ProductID
             HAVING COUNT(DISTINCT o.ID) >= :minp
@@ -334,11 +336,12 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
     return query(
         """
         WITH client_orders AS (
-            SELECT ca.ClientID AS client_id, o.ID AS order_id, o.Created AS dt
+            SELECT DISTINCT ca.ClientID AS client_id, o.ID AS order_id, o.Created AS dt
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Deleted = 0 AND o.Created < :asof
+            WHERE o.Created < :asof
                   AND c.Deleted = 0 AND c.MainManagerID = :mid
         ),
         agg AS (
@@ -377,7 +380,7 @@ def client_monetary(client_ids: list[int], as_of: str, window_days: int = 365) -
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
               AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}{not_in}
         GROUP BY ca.ClientID
         """,
@@ -413,7 +416,7 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
               AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}{not_in}
         GROUP BY ca.ClientID
         """,
@@ -448,7 +451,7 @@ def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, float]
         JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
         JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
-        WHERE o.Deleted = 0 AND o.Created >= :since AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= :since AND o.Created < :asof
               AND oi.ProductID IS NOT NULL{not_in}
         GROUP BY FORMAT(o.Created, 'yyyy-MM')
         """,

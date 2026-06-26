@@ -11,7 +11,9 @@ outcome window covers everyone whether or not a manager would have acted. It is 
 target for RANKING the inbox by P(outcome)xE[value]; it is not a treatment-effect estimate.
 
 Data traps honored (ConcordDb_V5), identical to the generators:
-  * Order/OrderItem validity = Deleted=0; Order.Created is the event time used for windows.
+  * Sale/Order/OrderItem validity = oi.IsValidForCurrentSale=1 (NOT Deleted: dbo.Order/OrderItem
+    are nearly all Deleted=1, so Deleted=0 kept only ~16% of sales); Order.Created is the event
+    time used for windows.
   * PricePerItem is already EUR (turnover via SUM(Qty*PricePerItem)).
   * Debt.Total -> EUR via dbo.GetExchangedToEuroValue(Total, ISNULL(Agreement.CurrencyID,2), Created).
   * Payments: IncomePaymentOrder.Amount -> EUR via GetExchangedToEuroValue(Amount,CurrencyID,FromDate);
@@ -73,7 +75,7 @@ def client_features(client_ids: list[int], asof: str, window_days: int = 365) ->
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= DATEADD(day, -:win, :asof) AND o.Created < :asof
               AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}
               AND oi.ProductID NOT IN {eph}
         GROUP BY ca.ClientID
@@ -105,7 +107,7 @@ def reorder_candidates(asof: str) -> list[dict]:
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
             JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Deleted = 0 AND o.Created < :asof AND oi.ProductID IS NOT NULL
+            WHERE oi.IsValidForCurrentSale = 1 AND o.Created < :asof AND oi.ProductID IS NOT NULL
                   AND c.Deleted = 0
             GROUP BY ca.ClientID, oi.ProductID
             HAVING COUNT(DISTINCT o.ID) >= 3
@@ -179,11 +181,12 @@ def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365)
     rows = query(
         """
         WITH client_orders AS (
-            SELECT ca.ClientID AS client_id, o.ID AS order_id, o.Created AS dt
+            SELECT DISTINCT ca.ClientID AS client_id, o.ID AS order_id, o.Created AS dt
             FROM dbo.ClientAgreement ca
             JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Deleted = 0 AND o.Created < :asof AND c.Deleted = 0
+            WHERE o.Created < :asof AND c.Deleted = 0
         ),
         agg AS (
             SELECT client_id,
@@ -223,8 +226,9 @@ def active_clients(asof: str) -> list[int]:
         WITH act AS (
             SELECT ca.ClientID AS cid
             FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Deleted = 0
+            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
                  AND o.Created >= DATEADD(day, -:recent, :asof) AND o.Created < :asof
+            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
             JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0
             GROUP BY ca.ClientID
             HAVING COUNT(DISTINCT o.ID) >= :minord
@@ -317,7 +321,7 @@ def label_reorder(asof: str, pairs: list[tuple[int, int]]) -> set[tuple[int, int
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0 AND o.Created > :asof AND o.Created <= :end
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created > :asof AND o.Created <= :end
               AND ca.ClientID IN {cph} AND oi.ProductID IN {pph}
         """,
         {"asof": asof, "end": _t_plus_h(asof), **cparams, **pparams},
@@ -337,7 +341,8 @@ def label_any_order(asof: str, client_ids: list[int]) -> set[int]:
         SELECT DISTINCT ca.ClientID AS client_id
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-        WHERE o.Deleted = 0 AND o.Created > :asof AND o.Created <= :end AND ca.ClientID IN {ph}
+        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
+        WHERE o.Created > :asof AND o.Created <= :end AND ca.ClientID IN {ph}
         """,
         {"asof": asof, "end": _t_plus_h(asof), **params},
     )
@@ -380,7 +385,7 @@ def label_buy_products(asof: str, client_products: dict[int, list[int]]) -> set[
         FROM dbo.ClientAgreement ca
         JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
         JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE o.Deleted = 0 AND o.Created > :asof AND o.Created <= :end
+        WHERE oi.IsValidForCurrentSale = 1 AND o.Created > :asof AND o.Created <= :end
               AND ca.ClientID IN {cph} AND oi.ProductID IN {pph}
         """,
         {"asof": asof, "end": _t_plus_h(asof), **cparams, **pparams},

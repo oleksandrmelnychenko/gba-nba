@@ -117,7 +117,7 @@ def test_team_stats_current_month_only(client):
     key_old = _seed(1, "mgr:1|client:13|type:debt_followup|win:old")
     lifecycle.change_status(key_old, TaskStatus.DONE, by=1, outcome=Outcome(sold=True, amount=9000))
     last_month = datetime.now(UTC).replace(day=1) - timedelta(days=2)
-    mongo.tasks().update_one({"task_key": key_old}, {"$set": {"updated_at": last_month}})
+    mongo.tasks().update_one({"task_key": key_old}, {"$set": {"resolved_at": last_month}})
 
     stats = lifecycle.team_stats(1)
     assert stats["done_month"] == 1

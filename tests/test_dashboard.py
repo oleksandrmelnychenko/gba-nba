@@ -123,7 +123,7 @@ def test_manager_dashboard_done_last_month_excluded(client):
     old = _seed(1, "k|old")
     lifecycle.change_status(old, TaskStatus.DONE, by=1, outcome=Outcome(sold=True, amount=99))
     last_month = datetime.now(UTC).replace(day=1) - timedelta(days=2)
-    mongo.tasks().update_one({"task_key": old}, {"$set": {"updated_at": last_month}})
+    mongo.tasks().update_one({"task_key": old}, {"$set": {"resolved_at": last_month}})
 
     resp = client.get("/cockpit/dashboard", params={"manager_net_uid": MGR_UID})
     cvo = {r["status"]: r["count"] for r in resp.json()["completed_vs_open"]}

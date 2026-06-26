@@ -108,6 +108,7 @@ class Task(BaseModel):
     outcome: Outcome | None = None
     ab_variant: str | None = None
     model_version: str = "nba-v1"
+    in_progress_since: datetime | None = None  # UTC stamp set when first moved to IN_PROGRESS (work-started)
     generated_at: datetime | None = None
     updated_at: datetime | None = None
     expires_at: datetime | None = None

@@ -46,6 +46,10 @@ def ensure_indexes() -> None:
                    name="ix_inbox")
     t.create_index([("client_id", ASCENDING), ("task_type", ASCENDING)], name="ix_client_type")
     t.create_index([("status", ASCENDING), ("expires_at", ASCENDING)], name="ix_expiry")
+    # team live board (/head/tasks): status $in + optional urgency match, sorted with in_progress
+    # work surfaced first. (status, urgency, in_progress_since) serves the team-wide filter+sort.
+    t.create_index([("status", ASCENDING), ("urgency", ASCENDING), ("in_progress_since", ASCENDING)],
+                   name="ix_team_board")
     t.create_index([("snooze_until", ASCENDING)], name="ix_snooze")
     t.create_index([("status", ASCENDING), ("due_date", ASCENDING)], name="ix_sla")
     t.create_index([("escalated_to", ASCENDING), ("status", ASCENDING)], name="ix_escalated")

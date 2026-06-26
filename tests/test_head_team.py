@@ -102,6 +102,58 @@ def test_unknown_manager_404(client):
     assert resp.json()["detail"] == "unknown_manager"
 
 
+def test_head_tasks_non_head_403(client):
+    # /head/tasks is HEAD-ONLY team data -> 403 for a non-head (unlike /head/team's benign is_head:false)
+    resp = client.get("/head/tasks", params={"manager_net_uid": MGR_UID})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "forbidden"
+
+
+def test_head_tasks_unknown_404(client):
+    resp = client.get("/head/tasks", params={"manager_net_uid": UNKNOWN_UID})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "unknown_manager"
+
+
+def test_head_tasks_shape_for_head(client):
+    from app.services import lifecycle
+
+    k_crit = _seed(1, "mgr:1|client:10|board:crit", urgency=Urgency.CRITICAL)
+    _seed(2, "mgr:2|client:11|board:hi", urgency=Urgency.HIGH)
+    k_ip = _seed(1, "mgr:1|client:12|board:ip", urgency=Urgency.HIGH)
+    lifecycle.change_status(k_ip, TaskStatus.IN_PROGRESS, by=1)
+
+    resp = client.get("/head/tasks", params={"manager_net_uid": HEAD_UID,
+                                             "statuses": "open,in_progress", "limit": 50})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"total", "tasks", "by_status", "managers"}
+    assert body["total"] == 3
+    assert body["by_status"] == {"open": 2, "in_progress": 1, "done": 0, "snoozed": 0,
+                                 "dismissed": 0}
+    # board surfaces critical first, then the in-progress (actively-worked) high
+    assert [t["task_key"] for t in body["tasks"][:2]] == [k_crit, k_ip]
+    row = body["tasks"][0]
+    assert set(row) >= {"task_key", "manager_id", "manager_name", "client_id", "client_name",
+                        "task_type", "title", "status", "urgency", "priority", "p_outcome",
+                        "expected_value", "ev_score", "in_progress_since", "generated_at",
+                        "updated_at", "sla_breached"}
+    assert row["manager_name"] == "Manager 1"
+    # managers dropdown = all_managers()+names
+    assert body["managers"] == [{"manager_id": 1, "name": "Manager 1"},
+                                {"manager_id": 2, "name": "Manager 2"}]
+
+
+def test_head_tasks_manager_filter(client):
+    _seed(1, "mgr:1|client:10|f", urgency=Urgency.HIGH)
+    _seed(2, "mgr:2|client:11|f", urgency=Urgency.HIGH)
+    resp = client.get("/head/tasks", params={"manager_net_uid": HEAD_UID, "manager_id": 2})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert {t["manager_id"] for t in body["tasks"]} == {2}
+    assert body["total"] == 1
+
+
 def test_team_stats_current_month_only(client):
     from app.data import mongo
     from app.services import lifecycle

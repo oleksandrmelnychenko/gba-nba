@@ -99,3 +99,76 @@ def test_done_task_not_regenerated(patched_mongo):
     lifecycle.change_status(k, TaskStatus.DONE, by=1)
     lifecycle.upsert_generated(_task())  # same key — should NOT reopen
     assert lifecycle.inbox(1) == []  # done is not in inbox; not resurrected
+
+
+def test_in_progress_since_set_once(patched_mongo):
+    from app.services import lifecycle
+    k = lifecycle.upsert_generated(_task())
+    assert patched_mongo["tasks"].find_one({"task_key": k}).get("in_progress_since") is None
+    doc = lifecycle.change_status(k, TaskStatus.IN_PROGRESS, by=1)
+    first = doc["in_progress_since"]
+    assert first is not None
+    # bounce back to open then in_progress again — the stamp records when work FIRST started.
+    lifecycle.change_status(k, TaskStatus.OPEN, by=1)
+    doc2 = lifecycle.change_status(k, TaskStatus.IN_PROGRESS, by=1)
+    assert doc2["in_progress_since"] == first
+    # may remain set on done (board/history can show duration).
+    doc3 = lifecycle.change_status(k, TaskStatus.DONE, by=1)
+    assert doc3["in_progress_since"] == first
+
+
+def _team_task(mgr, client_id, key, urgency=Urgency.NORMAL, priority=50.0) -> Task:
+    return Task(
+        task_key=key, manager_id=mgr, client_id=client_id, client_name=f"Client {client_id}",
+        task_type=TaskType.DEBT_FOLLOWUP, title="Call", reason="overdue",
+        priority=priority, urgency=urgency,
+        explanation=Explanation(factors=["x"], source_signal="debt", confidence=0.5),
+        contact=Contact(phone="+380"),
+    )
+
+
+def test_team_tasks_paging_total_by_status_and_sort(patched_mongo, monkeypatch):
+    from app.data import signals_repository
+    from app.services import lifecycle
+    monkeypatch.setattr(signals_repository, "manager_names",
+                        lambda ids: {i: f"Manager {i}" for i in ids})
+
+    # seed across managers + statuses + urgencies
+    k_crit = lifecycle.upsert_generated(_team_task(1, 10, "m1c10", Urgency.CRITICAL, 50.0))
+    k_hi_lo_pri = lifecycle.upsert_generated(_team_task(2, 11, "m2c11", Urgency.HIGH, 30.0))
+    k_hi_hi_pri = lifecycle.upsert_generated(_team_task(1, 12, "m1c12", Urgency.HIGH, 90.0))
+    k_ip = lifecycle.upsert_generated(_team_task(2, 13, "m2c13", Urgency.HIGH, 10.0))
+    lifecycle.change_status(k_ip, TaskStatus.IN_PROGRESS, by=2)  # actively worked
+    k_done = lifecycle.upsert_generated(_team_task(1, 14, "m1c14", Urgency.LOW, 5.0))
+    lifecycle.change_status(k_done, TaskStatus.DONE, by=1)
+
+    tasks, total, by_status = lifecycle.team_tasks(
+        ["open", "in_progress"], manager_ids=None, urgency=None, skip=0, limit=50)
+    keys = [t["task_key"] for t in tasks]
+    # critical first; then high band — actively-worked (in_progress) ahead of equal-band opens,
+    # then opens by priority desc; done excluded by the status filter.
+    assert keys == [k_crit, k_ip, k_hi_hi_pri, k_hi_lo_pri]
+    assert total == 4
+    assert by_status == {"open": 3, "in_progress": 1, "done": 0, "snoozed": 0, "dismissed": 0}
+    # joined name + denormalized stamp present on the in_progress row
+    ip_row = next(t for t in tasks if t["task_key"] == k_ip)
+    assert ip_row["manager_name"] == "Manager 2"
+    assert ip_row["in_progress_since"] is not None
+
+    # paging: page of 2 + total still over the whole filter
+    page1, total1, _ = lifecycle.team_tasks(["open", "in_progress"], skip=0, limit=2)
+    page2, total2, _ = lifecycle.team_tasks(["open", "in_progress"], skip=2, limit=2)
+    assert [t["task_key"] for t in page1] == [k_crit, k_ip]
+    assert [t["task_key"] for t in page2] == [k_hi_hi_pri, k_hi_lo_pri]
+    assert total1 == total2 == 4
+
+    # manager filter narrows to one manager but keeps the by_status rollup over that filter
+    only1, total_only1, bs1 = lifecycle.team_tasks(["open", "in_progress", "done"], manager_ids=[1])
+    assert {t["manager_id"] for t in only1} == {1}
+    assert total_only1 == 3  # m1: 2 open + 1 done
+    assert bs1 == {"open": 2, "in_progress": 0, "done": 1, "snoozed": 0, "dismissed": 0}
+
+    # urgency filter
+    crit_only, crit_total, _ = lifecycle.team_tasks(["open", "in_progress"], urgency="critical")
+    assert [t["task_key"] for t in crit_only] == [k_crit] and crit_total == 1
+    assert k_hi_lo_pri  # referenced

@@ -354,6 +354,59 @@ def head_team(manager_net_uid: str, as_of_date: str | None = None) -> dict:
     return {"is_head": True, "as_of": as_of, "team": team, "totals": totals}
 
 
+class TeamBoardTask(BaseModel):
+    task_key: str
+    manager_id: int
+    manager_name: str | None = None
+    client_id: int | None = None
+    client_name: str | None = None
+    task_type: str | None = None
+    title: str | None = None
+    status: str
+    urgency: str | None = None
+    priority: float = 0.0
+    p_outcome: float = 0.0
+    expected_value: float = 0.0
+    ev_score: float = 0.0
+    in_progress_since: datetime | None = None
+    generated_at: datetime | None = None
+    updated_at: datetime | None = None
+    sla_breached: bool = False
+
+
+class TeamBoardManager(BaseModel):
+    manager_id: int
+    name: str | None = None
+
+
+class TeamBoardResponse(BaseModel):
+    total: int
+    tasks: list[TeamBoardTask]
+    by_status: dict[str, int]
+    managers: list[TeamBoardManager]
+
+
+@app.get("/head/tasks", response_model=TeamBoardResponse)
+def head_tasks(manager_net_uid: str, statuses: str = "open,in_progress", manager_id: int | None = None,
+               urgency: str | None = None, skip: int = 0, limit: int = 50) -> TeamBoardResponse:
+    """Head-of-sales team-wide live board: ALL managers' tasks (optionally filtered to one manager via
+    manager_id), status $in the csv `statuses` (default open,in_progress), optional urgency. Sorted to
+    surface actively-worked + most-urgent first. HEAD-ONLY (team data) -> 403 for a non-head caller.
+    Unknown caller -> 404. Returns the page, the total over the filter, a by_status rollup, and the
+    full manager list (for the board's filter dropdown)."""
+    _resolve_manager(manager_net_uid)
+    if not signals_repository.is_head_of_sales(manager_net_uid):
+        raise HTTPException(status_code=403, detail="forbidden")
+    status_list = [s.strip() for s in statuses.split(",") if s.strip()] or ["open", "in_progress"]
+    mgr_filter = [manager_id] if manager_id is not None else None
+    tasks, total, by_status = lifecycle.team_tasks(
+        status_list, manager_ids=mgr_filter, urgency=urgency, skip=skip, limit=limit)
+    mids = signals_repository.all_managers()
+    names = signals_repository.manager_names(mids)
+    managers = [{"manager_id": mid, "name": names.get(mid)} for mid in mids]
+    return TeamBoardResponse(total=total, tasks=tasks, by_status=by_status, managers=managers)
+
+
 @app.get("/head/escalated")
 def head_escalated(manager_net_uid: str, limit: int = 100) -> dict:
     """Head-of-sales escalation queue: SLA-breached high/critical tasks escalated by the sweep.

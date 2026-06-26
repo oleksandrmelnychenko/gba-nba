@@ -132,7 +132,12 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
     if to == TaskStatus.SNOOZED:
         wake = snooze_until or (now + timedelta(days=1))
         update["$set"]["snooze_until"] = wake
-        update["$set"]["expires_at"] = max(_as_aware(wake), now) + timedelta(days=get_settings().task_ttl_days)
+        update["$set"]["expires_at"] = (
+            max(_as_aware(wake), now) + timedelta(days=get_settings().task_ttl_days))
+    if to == TaskStatus.IN_PROGRESS and doc.get("in_progress_since") is None:
+        # denormalized work-started stamp: set once, never overwritten on later transitions
+        # (records when work began; may remain set on done so the board can show duration).
+        update["$set"]["in_progress_since"] = now
     if outcome:
         update["$set"]["outcome"] = outcome.model_dump()
     if to in TERMINAL:
@@ -275,6 +280,77 @@ def escalated_tasks(limit: int = 100) -> list[dict]:
     docs = list(mongo.tasks().find(query).sort("priority", -1).limit(limit))
     docs.sort(key=_inbox_sort_key)
     return docs
+
+
+_TEAM_BOARD_FIELDS = (
+    "task_key", "manager_id", "client_id", "client_name", "task_type", "title", "status",
+    "urgency", "priority", "p_outcome", "expected_value", "ev_score", "in_progress_since",
+    "generated_at", "updated_at", "sla_breached",
+)
+
+# Status order for the by_status rollup (fixed shape the board renders).
+_TEAM_STATUS_KEYS = ("open", "in_progress", "done", "snoozed", "dismissed")
+
+
+def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgency: str | None = None,
+               skip: int = 0, limit: int = 50) -> tuple[list[dict], int, dict]:
+    """Team-wide live board (head-of-sales). ONE Mongo aggregation over `tasks` with NO single-manager
+    filter — team = ALL managers (optionally narrowed to manager_ids), status $in statuses, optional
+    urgency match. Sorted by urgency band, then actively-worked first (in_progress_since asc, nulls
+    last via a presence rank), then priority desc — so in-progress + most-urgent surface on top.
+
+    Returns (page, total, by_status) where page is the skip/limit window with manager_name joined,
+    total is the count over the same filter, and by_status is the {open/in_progress/done/snoozed/
+    dismissed} rollup over the same filter (computed in the same aggregation via $facet)."""
+    match: dict = {"status": {"$in": statuses}}
+    if manager_ids:
+        match["manager_id"] = {"$in": list(manager_ids)}
+    if urgency:
+        match["urgency"] = urgency
+
+    # urgency rank + has-in_progress_since rank as ENGINE-side computed fields so the sort works
+    # in the aggregation (nulls last: docs with no in_progress_since sort after those that have one).
+    add_fields = {
+        "_u_rank": {"$switch": {
+            "branches": [{"case": {"$eq": ["$urgency", u]}, "then": r}
+                         for u, r in _URGENCY_RANK.items()],
+            "default": 9}},
+        "_ip_present": {"$cond": [{"$ifNull": ["$in_progress_since", False]}, 0, 1]},
+    }
+    sort_stage = {"_u_rank": 1, "_ip_present": 1, "in_progress_since": 1, "priority": -1}
+    projection = {f: 1 for f in _TEAM_BOARD_FIELDS}
+    projection["_id"] = 0
+
+    pipeline = [
+        {"$match": match},
+        {"$addFields": add_fields},
+        {"$facet": {
+            "page": [
+                {"$sort": sort_stage},
+                {"$skip": max(0, skip)},
+                {"$limit": max(1, limit)},
+                {"$project": projection},
+            ],
+            "total": [{"$count": "n"}],
+            "by_status": [{"$group": {"_id": "$status", "n": {"$sum": 1}}}],
+        }},
+    ]
+    result = list(mongo.tasks().aggregate(pipeline))
+    facet = result[0] if result else {"page": [], "total": [], "by_status": []}
+    page = facet["page"]
+    total = facet["total"][0]["n"] if facet["total"] else 0
+    by_status = {k: 0 for k in _TEAM_STATUS_KEYS}
+    for row in facet["by_status"]:
+        if row["_id"] in by_status:
+            by_status[row["_id"]] = row["n"]
+
+    # join manager display names once for the page.
+    from app.data import signals_repository
+    mgr_ids = sorted({d["manager_id"] for d in page if d.get("manager_id") is not None})
+    names = signals_repository.manager_names(mgr_ids) if mgr_ids else {}
+    for d in page:
+        d["manager_name"] = names.get(d.get("manager_id"))
+    return page, total, by_status
 
 
 def active_count(manager_id: int) -> int:

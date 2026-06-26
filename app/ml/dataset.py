@@ -522,3 +522,107 @@ def build_dataset(snapshots: list[str]) -> pd.DataFrame:
             for ttype, r in by_type.iterrows():
                 print(f"      {ttype:16s} n={int(r['size']):5d}  base_rate={r['mean']:.1%}")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# --------------------------------------------------------------------------------------
+# LIVE labels — real manager-logged outcomes from Mongo, shaped into the training schema.
+#
+# Once managers start logging Outcome(sold) on terminal tasks, those rows are GROUND TRUTH
+# (a manager touched the client and recorded whether it converted) and are far more valuable
+# than the backfill's natural-conversion proxy. This pulls terminal tasks that carry an
+# explicit outcome and maps each task's stored `signals` dict (the exact feature payload the
+# generator computed at creation time) onto the dataset's `sig_*` / shared / one-hot columns,
+# so a live row is row-for-row unionable with a backfill row.
+#
+# TODAY: 0 live labels exist (managers haven't begun logging), so this returns an empty frame
+# and the training set is backfill-only. The path is wired and tested so the moment real
+# outcomes land they flow into the next retrain with no code change.
+# --------------------------------------------------------------------------------------
+
+# Map a Task.signals key -> the dataset feature column. Mirrors each generator's signals dict.
+_LIVE_SIGNAL_MAP = {
+    # debt_followup
+    "overdue_amount": "sig_overdue_amount",
+    "days_past_terms": "sig_days_past_terms",
+    "max_overdue_days": "sig_max_overdue_days",
+    "debt_lines": "sig_debt_lines",
+    # reorder_due
+    "elapsed_days": "sig_elapsed_days",
+    "cycle_days": "sig_cycle_days",
+    "overdue_ratio": "sig_overdue_ratio",
+    "n_orders": "sig_n_orders",
+    # churn_winback
+    "drop_ratio": "sig_drop_ratio",
+    "silence_days": "sig_silence_days",
+    "recent_orders": "sig_recent_orders",
+    "prior_orders": "sig_prior_orders",
+    # cross_sell
+    "top_score": "sig_top_score",
+    "candidates": "sig_reco_candidates",
+}
+
+_LIVE_TASK_TYPES = {"reorder_due", "debt_followup", "churn_winback", "cross_sell"}
+
+
+def _live_row_from_task(doc: dict) -> dict | None:
+    """Map one terminal Mongo task (with an explicit outcome) to a training row, or None to skip.
+
+    The label is the manager-recorded conversion: outcome.sold. Features come from the task's
+    persisted `signals` dict (what the generator computed at creation), so they match the
+    backfill's leak-safe as-of feature vector exactly.
+    """
+    tt = doc.get("task_type")
+    if tt not in _LIVE_TASK_TYPES:
+        return None  # new_client_activation is out of the model
+    outcome = doc.get("outcome")
+    if not outcome or outcome.get("sold") is None:
+        return None  # no recorded outcome -> not a label
+    sig = doc.get("signals") or {}
+    cid = doc.get("client_id")
+    if cid is None:
+        return None
+
+    row: dict = {
+        "vintage": "live", "task_type": tt, "client_id": int(cid),
+        "monetary": float(sig.get("monetary") or 0.0),
+        "recency_days": float(sig.get("recency_days") if sig.get("recency_days") is not None else 9999),
+        "order_count": int(sig.get("order_count") or 0),
+        "is_reorder_due": int(tt == "reorder_due"),
+        "is_debt_followup": int(tt == "debt_followup"),
+        "is_churn_winback": int(tt == "churn_winback"),
+        "is_cross_sell": int(tt == "cross_sell"),
+        "sig_overdue_amount": 0.0, "sig_days_past_terms": 0.0, "sig_max_overdue_days": 0.0,
+        "sig_debt_lines": 0.0,
+        "sig_elapsed_days": 0.0, "sig_cycle_days": 0.0, "sig_overdue_ratio": 0.0, "sig_n_orders": 0.0,
+        "sig_drop_ratio": 0.0, "sig_silence_days": 0.0, "sig_recent_orders": 0.0, "sig_prior_orders": 0.0,
+        "sig_top_score": 0.0, "sig_reco_candidates": 0.0,
+        "label": int(bool(outcome.get("sold"))),
+        "old_priority": float(doc.get("priority") or 0.0),
+        "is_live": 1,
+    }
+    for k, col in _LIVE_SIGNAL_MAP.items():
+        if k in sig and sig[k] is not None:
+            row[col] = float(sig[k])
+    return row
+
+
+def live_labels() -> pd.DataFrame:
+    """Terminal tasks with a manager-recorded outcome, shaped into the training-row schema.
+
+    Returns an EMPTY DataFrame (no rows) when Mongo is unreachable or no outcomes are logged yet,
+    so callers can unconditionally `pd.concat` it onto the backfill. Best-effort: never raises.
+    """
+    try:
+        from app.data import mongo
+        from app.domain.models import TaskStatus
+        cur = mongo.tasks().find(
+            {"status": {"$in": [TaskStatus.DONE.value, TaskStatus.DISMISSED.value]},
+             "outcome.sold": {"$ne": None}},
+            {"task_type": 1, "client_id": 1, "signals": 1, "outcome": 1, "priority": 1},
+        )
+        rows = [r for r in (_live_row_from_task(d) for d in cur) if r is not None]
+    except Exception as exc:  # noqa: BLE001 — Mongo down / not configured -> backfill-only retrain
+        print(f"[live_labels] none pulled ({type(exc).__name__}: {exc})")
+        return pd.DataFrame()
+    print(f"[live_labels] pulled {len(rows)} manager-logged outcome rows")
+    return pd.DataFrame(rows)

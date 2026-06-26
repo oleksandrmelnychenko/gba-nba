@@ -64,6 +64,13 @@ class Settings(BaseSettings):
     # Exclude products bought by >this share of clients — synthetic accounting lines ("Ввід боргів"
     # = debt entry, ~75% of clients) that aren't real products. Real parts top out ~14%.
     ubiquity_exclude_pct: float = 0.20
+    # Synthetic accounting product(s) (e.g. debt-entry line 25422404 "Ввід боргів з 1С") excluded
+    # UNCONDITIONALLY from turnover/feature signals, independent of the rolling ubiquity window.
+    # 25422404 is today the only product clearing ubiquity_exclude_pct (~0.77), so it would be the
+    # only one silently re-absorbed if its 12-month ubiquity ever dipped below the threshold — pin
+    # it here so the exclusion is a hard guard, not a side effect of the data-driven ubiquity set.
+    # Mirrors gba-reco/gba-products' synthetic-id hard exclusion.
+    synthetic_product_ids: frozenset[int] = frozenset({25422404})
 
     # Scoring / model knobs — tunable WITHOUT redeploy (env-driven); bump model_version on change so
     # outcomes can be sliced/A-B'd by scoring generation.

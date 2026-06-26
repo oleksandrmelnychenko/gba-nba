@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import re
 
+from app.core import config
 from app.data import signals_repository as sig
 from app.ml import dataset as ds
 
@@ -80,6 +81,73 @@ def test_sales_spine_uses_validity_flag_not_deleted():
             f"{fn.__module__}.{fn.__name__} reintroduced o.Deleted=0 on the Order spine (~16% bug)"
         assert not re.search(r"\boi\.Deleted\s*=\s*0", src), \
             f"{fn.__module__}.{fn.__name__} reintroduced oi.Deleted=0 on the OrderItem spine"
+
+
+# --- Hard synthetic-product exclusion (independent of the ubiquity filter) ---------------------
+# The synthetic debt-injection line 25422404 ("Ввід боргів з 1С") is today excluded from
+# turnover/feature signals ONLY because it clears the dynamic ubiquity threshold (~0.77 > 0.20).
+# It is the ONLY product clearing that threshold — if its rolling 12-month ubiquity ever dipped
+# below 0.20, client_monetary/client_features turnover would silently re-absorb 100K+ EUR of
+# synthetic debt. These guards pin a HARD exclusion via settings.synthetic_product_ids that holds
+# regardless of ubiquity, mirroring every other GBA service (gba-reco / gba-products).
+_SYNTHETIC_ID = 25422404
+
+# Turnover/feature queries that must hard-exclude the synthetic ids (in addition to ubiquity).
+_TURNOVER_FUNCS = [sig.client_monetary, sig.client_features, sig.monthly_shipped, ds.client_features]
+
+
+def test_synthetic_product_id_pinned_in_settings_default():
+    """25422404 must be the DEFAULT synthetic exclusion (pinned in source), not just an env override."""
+    assert _SYNTHETIC_ID in config.get_settings().synthetic_product_ids, (
+        "synthetic debt-entry line 25422404 must be pinned in Settings.synthetic_product_ids"
+    )
+    field = config.Settings.model_fields["synthetic_product_ids"]
+    assert _SYNTHETIC_ID in field.default, (
+        "25422404 must be the *default* synthetic exclusion (pinned in source, not only env)"
+    )
+
+
+def test_excluded_helpers_union_synthetic_ids_unconditionally():
+    """Both exclusion helpers must UNION settings.synthetic_product_ids so the synthetic exclusion is
+    independent of the data-driven ubiquity set — it can never be lost if ubiquity stops firing."""
+    for fn in (sig._excluded, ds._excluded_pids):
+        src = inspect.getsource(fn)
+        assert "synthetic_product_ids" in src, (
+            f"{fn.__module__}.{fn.__name__} must reference settings.synthetic_product_ids so the "
+            "hard exclusion does not depend on the ubiquity threshold catching 25422404"
+        )
+        assert re.search(r"synthetic_product_ids\s*\)?\s*\|", src), (
+            f"{fn.__module__}.{fn.__name__} must UNION (|) the synthetic ids with the ubiquity set, "
+            "so the pinned exclusion is unconditional"
+        )
+
+
+def test_turnover_queries_emit_hard_not_in_exclusion():
+    """Every turnover/feature query must apply an `AND oi.ProductID NOT IN (...)` exclusion built from
+    the _excluded()/_excluded_pids() set (which now always contains the synthetic ids), so 25422404
+    is dropped regardless of ubiquity. DB-free guard."""
+    for fn in _TURNOVER_FUNCS:
+        src = _norm(inspect.getsource(fn))
+        assert "_excluded" in src, (
+            f"{fn.__module__}.{fn.__name__} must source its exclusion set from the _excluded helper "
+            "(which unions the hard synthetic ids), not from ubiquity alone"
+        )
+        assert re.search(r"oi\.ProductID NOT IN", src), (
+            f"{fn.__module__}.{fn.__name__} must emit `AND oi.ProductID NOT IN (...)` to hard-exclude "
+            "the synthetic accounting line from turnover"
+        )
+
+
+def test_synthetic_exclusion_holds_when_ubiquity_does_not_fire(monkeypatch):
+    """Simulate the latent failure: ubiquity returns EMPTY (25422404 dropped below 0.20). The hard
+    guard must STILL exclude the synthetic id from the effective exclusion set."""
+    monkeypatch.setattr(sig, "ubiquitous_product_ids", lambda pct: frozenset())
+    assert _SYNTHETIC_ID in sig._excluded(), (
+        "with ubiquity not firing, the synthetic id must still be excluded via the hard guard"
+    )
+    assert _SYNTHETIC_ID in ds._excluded_pids(), (
+        "dataset path must also hard-exclude the synthetic id when ubiquity does not fire"
+    )
 
 
 def test_debt_and_payment_paths_keep_their_deleted_flags():

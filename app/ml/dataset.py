@@ -19,7 +19,8 @@ Data traps honored (ConcordDb_V5), identical to the generators:
   * Payments: IncomePaymentOrder.Amount -> EUR via GetExchangedToEuroValue(Amount,CurrencyID,FromDate);
     payment event time is FromDate (NOT the bulk-sync Created).
   * Synthetic/ubiquitous SKUs (e.g. debt-entry) excluded from reorder + monetary.
-  * Hard-exclude ProductID 25422404 everywhere.
+  * Hard-exclude the configured synthetic ids (settings.synthetic_product_ids, default {25422404})
+    everywhere — unconditional, independent of the data-driven ubiquity threshold.
 The four types: reorder_due, debt_followup, churn_winback, cross_sell.
 new_client_activation is intentionally dropped (Client.Created is a 1C sync stamp, not a real signal).
 """
@@ -34,8 +35,6 @@ from app.core.config import get_settings
 from app.data import signals_repository as sig
 from app.data.db import in_clause, query
 
-# Hard product exclusion required by the spec (a non-sellable accounting SKU).
-EXCLUDE_PRODUCT_ID = 25422404
 H_DAYS = 60
 DEBT_PAYDOWN_FRACTION = 0.5  # >=50% of overdue@T paid in (T,T+H] = debt_followup success.
 
@@ -46,11 +45,13 @@ def _t_plus_h(asof: str, h: int = H_DAYS) -> str:
 
 
 def _excluded_pids() -> set[int]:
-    """Ubiquitous synthetic SKUs (generator-calibrated pct) plus the hard-excluded product id."""
+    """The configured synthetic accounting ids (HARD guard, pinned in settings.synthetic_product_ids
+    — e.g. debt-entry 25422404) UNION the data-driven ubiquity set (generator-calibrated pct). The
+    synthetic ids are excluded unconditionally so the guard holds even if 25422404's rolling ubiquity
+    ever dips below ubiquity_exclude_pct. Identical exclusion semantics to
+    app.data.signals_repository._excluded so the live feature row matches the training distribution."""
     s = get_settings()
-    excl = set(sig.ubiquitous_product_ids(s.ubiquity_exclude_pct))
-    excl.add(EXCLUDE_PRODUCT_ID)
-    return excl
+    return set(s.synthetic_product_ids) | set(sig.ubiquitous_product_ids(s.ubiquity_exclude_pct))
 
 
 # --------------------------------------------------------------------------------------

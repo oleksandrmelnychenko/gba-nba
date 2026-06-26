@@ -43,7 +43,14 @@ def ubiquitous_product_ids(pct: float) -> frozenset[int]:
 
 
 def _excluded() -> frozenset[int]:
-    return ubiquitous_product_ids(get_settings().ubiquity_exclude_pct)
+    """Products excluded from turnover/feature signals: the configured synthetic accounting ids
+    (debt-entry "Ввід боргів з 1С" = 25422404) UNION the data-driven ubiquity set. The synthetic
+    ids are a HARD guard — pinned in settings.synthetic_product_ids and excluded unconditionally, so
+    the exclusion holds even if 25422404's rolling 12-month ubiquity ever dips below
+    ubiquity_exclude_pct (today it sits at ~0.77 and is the ONLY product clearing the threshold).
+    Mirrors gba-reco/gba-products. The ubiquity set still catches any OTHER future universal staple."""
+    s = get_settings()
+    return frozenset(s.synthetic_product_ids) | ubiquitous_product_ids(s.ubiquity_exclude_pct)
 
 
 def manager_id_for_netuid(net_uid: str) -> int | None:

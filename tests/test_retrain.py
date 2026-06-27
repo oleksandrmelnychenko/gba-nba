@@ -224,9 +224,18 @@ def test_main_swaps_on_pass_restores_on_fail(tmp_path, monkeypatch):
     def fake_train_writing(new_auc):
         def _train():
             (art / "propensity_model.joblib").write_bytes(b"MODEL_NEW")
-            (art / "metrics.json").write_text(json.dumps(
-                {"production_model": "hgb", "oot": {"hgb": {"auc": new_auc}},
-                 "oot_per_type": {"hgb": {"cross_sell": {"auc": 0.70}}}}))
+            (art / "metrics.json").write_text(json.dumps({
+                "n_rows": 100,
+                "n_clients": 10,
+                "base_rate": 0.2,
+                "production_model": "hgb",
+                "cv": {"hgb": {"auc": 0.7}},
+                "oot": {"hgb": {"auc": new_auc}},
+                "benchmark": {"oot": {"auc_old": 0.5}},
+                "oot_per_type": {"hgb": {"cross_sell": {"auc": 0.70}}},
+            }))
+            (art / "MODEL_CARD.md").write_text(
+                f"rows 100 clients 10 base 20.0% CV 0.700 OOT {new_auc:.3f} old 0.500")
         return _train
 
     import sys

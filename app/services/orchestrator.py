@@ -24,7 +24,7 @@ from app.services.generators import (
 
 log = get_logger("orchestrator")
 
-# generators ordered by default business value (debt first).
+# Generator collection order is not the final ranking; candidates are sorted by expected EUR below.
 # new_client_activation is DROPPED: the propensity model has no head for it (it was excluded from the
 # training set — Client.Created is a 1C-sync stamp, not a real signal), and its live generator fires
 # on those sync-stamp dates, producing junk tasks. Unwired here so it is never generated/persisted.
@@ -230,20 +230,28 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     for task in deferred:
         attempt(task)
 
-    # pass 3: bounded CRITICAL-debt reserve admitted above the cap (cash-at-risk floor)
+    # pass 3: bounded CRITICAL-debt reserve admitted above the cap (cash-at-risk floor). The reserve
+    # is a total active allowance (cap + reserve), not "+reserve every generation run".
     reserve = s.crit_debt_reserve
     if reserve > 0:
+        reserve_limit = cap + reserve
         crit_debt = [t for t in candidates
                      if t.task_type == TaskType.DEBT_FOLLOWUP and t.urgency == Urgency.CRITICAL]
         admitted = 0
         for task in crit_debt:
+            if active >= reserve_limit:
+                break
             if admitted >= reserve:
                 break
             if lifecycle.get_task(task.task_key) is not None:
                 continue
             if lifecycle.is_muted(manager_id, task.client_id, task.task_type.value):
                 continue
+            if per_client[task.client_id] >= s.max_tasks_per_client_per_day:
+                counters["skipped_capped"] += 1
+                continue
             lifecycle.upsert_generated(task)
+            per_client[task.client_id] += 1
             per_type[TaskType.DEBT_FOLLOWUP] += 1
             active += 1
             counters["persisted"] += 1

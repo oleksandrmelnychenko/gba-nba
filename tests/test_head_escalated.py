@@ -43,13 +43,14 @@ def client(monkeypatch):
 def _seed(key: str, manager_id: int = 1,
           task_type: TaskType = TaskType.DEBT_FOLLOWUP,
           urgency: Urgency = Urgency.HIGH, priority: float = 80.0,
+          ev_score: float = 0.0,
           escalated_to: int | None = None) -> str:
     from app.data import mongo
     from app.services import lifecycle
     task = Task(
         task_key=key, manager_id=manager_id, client_id=10, client_name="Acme",
         task_type=task_type, title="Call", reason="overdue",
-        priority=priority, urgency=urgency,
+        priority=priority, ev_score=ev_score, urgency=urgency,
         explanation=Explanation(factors=["overdue 12d"], source_signal="debt", confidence=0.8),
         contact=Contact(phone="+380"),
     )
@@ -90,7 +91,7 @@ def test_unknown_manager_404(client):
 
 
 def test_escalated_ordering(client):
-    # urgency band -> type rank -> priority desc (mirrors the manager inbox sort)
+    # urgency band -> EV desc -> type tie-breaker -> priority desc (mirrors the manager inbox sort)
     _seed("k|high|debt|low_pri", urgency=Urgency.HIGH, task_type=TaskType.DEBT_FOLLOWUP,
           priority=10.0, escalated_to=99)
     _seed("k|crit|reorder", urgency=Urgency.CRITICAL, task_type=TaskType.REORDER_DUE,
@@ -104,6 +105,26 @@ def test_escalated_ordering(client):
     body = resp.json()
     keys = [t["task_key"] for t in body["tasks"]]
     assert keys == ["k|crit|reorder", "k|high|debt|high_pri", "k|high|debt|low_pri", "k|high|reorder"]
+
+
+def test_escalated_ordering_uses_ev_and_sinks_unvalued_legacy(client):
+    high_ev = _seed("k|high|debt|high_ev", urgency=Urgency.HIGH, task_type=TaskType.DEBT_FOLLOWUP,
+                    priority=20.0, ev_score=900.0, escalated_to=99)
+    high_probability = _seed("k|high|debt|high_probability", urgency=Urgency.HIGH,
+                             task_type=TaskType.DEBT_FOLLOWUP, priority=95.0, ev_score=40.0,
+                             escalated_to=99)
+    legacy = _seed("k|high|debt|legacy", urgency=Urgency.HIGH, task_type=TaskType.DEBT_FOLLOWUP,
+                   priority=80.0, escalated_to=99)
+    from app.data import mongo
+    mongo.tasks().update_one(
+        {"task_key": legacy},
+        {"$unset": {"p_outcome": "", "expected_value": "", "ev_score": ""}},
+    )
+
+    resp = client.get("/head/escalated", params={"manager_net_uid": HEAD_UID})
+    keys = [t["task_key"] for t in resp.json()["tasks"]]
+
+    assert keys[:3] == [high_ev, high_probability, legacy]
 
 
 def test_limit_respected(client):

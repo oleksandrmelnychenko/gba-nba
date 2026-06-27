@@ -1,4 +1,4 @@
-"""Post-generation analysis: urgency-band x task_type cross-tab + debt-first ordering check."""
+"""Post-generation analysis: urgency-band x task_type cross-tab + top-of-inbox mix check."""
 from __future__ import annotations
 
 import collections
@@ -10,8 +10,10 @@ TYPES = ["debt_followup", "reorder_due", "churn_winback", "cross_sell", "new_cli
 
 
 def main():
-    docs = list(mongo.tasks().find({"status": {"$in": ["generated", "open"]}},
-                                   {"task_type": 1, "urgency": 1, "priority": 1, "manager_id": 1}))
+    docs = list(mongo.tasks().find(
+        {"status": {"$in": ["generated", "open", "in_progress"]}},
+        {"task_type": 1, "urgency": 1, "priority": 1, "p_outcome": 1,
+         "expected_value": 1, "ev_score": 1, "manager_id": 1}))
     print(f"=== inbox analysis: {len(docs)} active tasks ===\n")
 
     ct = collections.defaultdict(lambda: collections.Counter())
@@ -26,16 +28,26 @@ def main():
     print()
 
     by_type_prio = collections.defaultdict(list)
+    by_type_ev = collections.defaultdict(list)
     for d in docs:
         by_type_prio[d.get("task_type")].append(d.get("priority", 0))
+        by_type_ev[d.get("task_type")].append(d.get("ev_score", d.get("priority", 0)))
+    print("P(outcome)% distribution by task type:")
     print(f"{'task_type':24}{'min':>8}{'median':>8}{'max':>8}")
     for t in TYPES:
         ps = sorted(by_type_prio.get(t, []))
         if ps:
             print(f"{t:24}{ps[0]:>8.1f}{ps[len(ps)//2]:>8.1f}{ps[-1]:>8.1f}")
     print()
+    print("EV score distribution by task type:")
+    print(f"{'task_type':24}{'min':>10}{'median':>10}{'max':>10}")
+    for t in TYPES:
+        es = sorted(by_type_ev.get(t, []))
+        if es:
+            print(f"{t:24}{es[0]:>10.1f}{es[len(es)//2]:>10.1f}{es[-1]:>10.1f}")
+    print()
 
-    # debt-first check: of the top-10 tasks per manager (inbox order), how many are debt vs reorder?
+    # top-of-inbox mix: of the top-10 tasks per manager (inbox order), how many are each type?
     from app.services import lifecycle
     print("TOP-10 composition per manager (inbox-ordered):")
     for mid in sorted({d["manager_id"] for d in docs}):

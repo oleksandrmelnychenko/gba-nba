@@ -271,6 +271,8 @@ def main() -> int:
             why.append(f"{new_auc:.4f} < floor {args.auc_floor:.2f}")
         if not regress_ok:
             why.append(f"{new_auc:.4f} < old {old_auc:.4f} - eps {args.auc_epsilon}")
+        if not card_ok:
+            why.append("MODEL_CARD.md is stale or missing")
         print(f"\nGATE FAILED ({'; '.join(why)}) -> ABORTING swap.")
         _restore(backup_dir)
         _hr("RETRAIN ABORTED — old artifacts kept")

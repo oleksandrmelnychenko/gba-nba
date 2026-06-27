@@ -1,16 +1,20 @@
 """Task prioritization.
 
 `priority` (0..100) is now driven by the trained propensity model (app.ml.score_task):
-`priority = 100 * p_outcome`, where p_outcome = calibrated P(outcome in (T,T+H] | task). It replaces
-the old expert-guessed blend (w_u·urgency + w_v·value + w_c·confidence), whose pooled OOT AUC was
-~0.557 (≈coin-flip; the debt term was actually INVERTED — biggest-overdue ranked LEAST likely to
-repay). The model lifts OOT AUC to 0.727. Generators call `score_task_priority()`; the legacy blend
-(`priority()`, `value_from_monetary()`) is retained only so app.ml.dataset can recompute the OLD
-priority for the train-time benchmark.
+`priority = 100 * p_outcome`, where p_outcome = calibrated P(outcome in (T,T+H] | task). Live
+ranking/caps use `ev_score = p_outcome * expected_value` after the urgency band, with task type only
+as a deterministic tie-breaker and `priority` only as the compatibility field / legacy fallback. This
+replaces the old expert-guessed blend
+(w_u·urgency + w_v·value + w_c·confidence), whose pooled OOT AUC was ~0.55 (≈coin-flip; the debt
+term was actually INVERTED — biggest-overdue ranked LEAST likely to repay). The current model lifts
+OOT AUC to ~0.70. Generators call `score_task_priority()`; the legacy blend (`priority()`,
+`value_from_monetary()`) is retained only so app.ml.dataset can recompute the OLD priority for the
+train-time benchmark.
 
 URGENCY stays a separate, real display/sort BAND (urgency_band + the per-type urgency helpers): the
-inbox sort is urgency tier -> type tier -> priority. priority and urgency are NOT collapsed — priority
-is the 0..100 likelihood score, urgency is the cash-at-risk / time-pressure triage band.
+inbox sort is urgency tier -> EV score -> type tie-breaker -> priority fallback. priority and
+urgency are NOT collapsed — priority is the 0..100 likelihood score, urgency is the cash-at-risk /
+time-pressure triage band.
 
 The blend weights / value saturation / urgency bands are env-driven (app.core.config); bump
 model_version on any scoring change so outcomes can be sliced/A-B'd by scoring generation.

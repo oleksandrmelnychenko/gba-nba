@@ -107,7 +107,7 @@ needs holdout or experiment design.
 
 Operational contract:
 
-- Inbox/caps rank by `ev_score` after urgency/type policy.
+- Inbox/caps rank by `ev_score` after the urgency band; task type is only a tie-breaker.
 - Fallback to `priority` only when `ev_score` is absent.
 - Keep `priority = 100 * p_outcome` as the compatibility field for old clients and legacy docs.
 

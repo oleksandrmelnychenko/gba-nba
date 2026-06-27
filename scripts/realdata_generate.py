@@ -26,15 +26,24 @@ def main():
         urg = collections.Counter(d.get("urgency") for d in inbox)
         typ = collections.Counter(d.get("task_type") for d in inbox)
         prios = [d.get("priority", 0) for d in inbox]
+        evs = [d.get("ev_score", d.get("priority", 0)) for d in inbox]
         print(f"--- mgr {mid} ({nm}) ---")
         print(f"  candidates={stats['candidates']} persisted={stats['persisted']} "
               f"refreshed={stats.get('refreshed',0)} skipped_capped={stats.get('skipped_capped',0)} "
               f"skipped_muted={stats.get('skipped_muted',0)}")
         print(f"  inbox={len(inbox)}  by_type={dict(typ)}")
-        print(f"  urgency={dict(urg)}  priority[min={min(prios):.1f} med={sorted(prios)[len(prios)//2]:.1f} max={max(prios):.1f}]" if prios else "  (empty inbox)")
+        if prios:
+            print(f"  urgency={dict(urg)}")
+            print(f"  p_outcome%[min={min(prios):.1f} med={sorted(prios)[len(prios)//2]:.1f} "
+                  f"max={max(prios):.1f}]")
+            print(f"  ev_score[min={min(evs):.1f} med={sorted(evs)[len(evs)//2]:.1f} "
+                  f"max={max(evs):.1f}]")
+        else:
+            print("  (empty inbox)")
         print("  TOP 8:")
         for d in inbox[:8]:
-            print(f"    [{d.get('urgency','?'):8}] p{d.get('priority',0):5.1f} {d.get('task_type','?'):22} "
+            print(f"    [{d.get('urgency','?'):8}] ev{d.get('ev_score',0):8.1f} "
+                  f"p{d.get('priority',0):5.1f} {d.get('task_type','?'):22} "
                   f"{(d.get('client_name') or '?')[:28]:28} | {(d.get('reason') or '')[:60]}")
         print()
 

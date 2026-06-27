@@ -16,12 +16,11 @@ import logging
 from pathlib import Path
 
 import numpy as np
-
-logging.getLogger("httpx").setLevel(logging.WARNING)
-import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from app.ml.dataset import build_dataset
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 SNAPSHOTS = [
     "2025-08-01", "2025-09-01", "2025-10-01", "2025-11-01", "2025-12-01",
@@ -40,7 +39,8 @@ FEATURE_COLS = [
 
 
 def safe_auc(y, x) -> float | None:
-    y = np.asarray(y); x = np.asarray(x, dtype=float)
+    y = np.asarray(y)
+    x = np.asarray(x, dtype=float)
     m = ~np.isnan(x)
     if m.sum() < 2 or len(set(y[m].tolist())) < 2:
         return None
@@ -63,7 +63,10 @@ def main() -> None:
     g = df.groupby("task_type")["label"].agg(["size", "sum", "mean"]).sort_index()
     for ttype, r in g.iterrows():
         print(f"  {ttype:16s}  n={int(r['size']):6d}  pos={int(r['sum']):5d}  base_rate={r['mean']:.1%}")
-    print(f"  {'POOLED':16s}  n={len(df):6d}  pos={int(df['label'].sum()):5d}  base_rate={df['label'].mean():.1%}")
+    print(
+        f"  {'POOLED':16s}  n={len(df):6d}  "
+        f"pos={int(df['label'].sum()):5d}  base_rate={df['label'].mean():.1%}"
+    )
 
     print("\n-- per-vintage rows --")
     for t, sub in df.groupby("vintage"):

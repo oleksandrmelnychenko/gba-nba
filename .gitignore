@@ -12,3 +12,5 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+data/
+app/ml/artifacts/backup_*/

@@ -103,20 +103,23 @@ def test_caps_keep_higher_ev_over_higher_probability_same_type(mongo_db, monkeyp
     ]
 
 
-def test_inbox_orders_by_urgency_then_debt_first(mongo_db):
+def test_inbox_orders_by_urgency_then_ev_before_type_tiebreaker(mongo_db):
     from app.services import lifecycle
-    lifecycle.upsert_generated(_band_task("reorder_crit", TaskType.REORDER_DUE, Urgency.CRITICAL, 99.0))
-    lifecycle.upsert_generated(_band_task("debt_crit", TaskType.DEBT_FOLLOWUP, Urgency.CRITICAL, 80.0))
-    lifecycle.upsert_generated(_band_task("reorder_high", TaskType.REORDER_DUE, Urgency.HIGH, 95.0))
+    lifecycle.upsert_generated(_band_task("reorder_crit", TaskType.REORDER_DUE, Urgency.CRITICAL,
+                                          99.0, ev_score=900.0))
+    lifecycle.upsert_generated(_band_task("debt_crit", TaskType.DEBT_FOLLOWUP, Urgency.CRITICAL,
+                                          80.0, ev_score=100.0))
+    lifecycle.upsert_generated(_band_task("reorder_high", TaskType.REORDER_DUE, Urgency.HIGH,
+                                          95.0, ev_score=9999.0))
     order = [d["task_key"] for d in lifecycle.inbox(1)]
-    # within the critical band, debt (p80) sorts above reorder (p99); the high-band reorder (p95)
-    # comes after both criticals (urgency band wins over raw score).
-    assert order == ["debt_crit", "reorder_crit", "reorder_high"]
+    # within the critical band, EV wins across task types; the high-band reorder still comes after
+    # both criticals because urgency band wins over raw EV.
+    assert order == ["reorder_crit", "debt_crit", "reorder_high"]
 
 
-def _band_task(key: str, tt: TaskType, urg: Urgency, prio: float) -> Task:
+def _band_task(key: str, tt: TaskType, urg: Urgency, prio: float, ev_score: float = 0.0) -> Task:
     return Task(task_key=key, manager_id=1, client_id=hash(key) % 1_000_000,
-                task_type=tt, title="t", reason="r", priority=prio, urgency=urg)
+                task_type=tt, title="t", reason="r", priority=prio, ev_score=ev_score, urgency=urg)
 
 
 def test_sweep_expired_purges_only_stale_active(mongo_db):
@@ -205,3 +208,48 @@ def test_leftover_capacity_redistributes_when_other_types_empty(mongo_db, monkey
     stats = orchestrator.generate_for_manager(1, "2026-06-07")
     assert stats["persisted"] == 50                       # cap still filled, not stuck at the 20 quota
     assert stats["by_type"]["debt_followup"] == 50
+
+
+def test_critical_debt_reserve_is_total_active_allowance_not_per_run(mongo_db, monkeypatch):
+    from app.services import orchestrator
+    from app.services.generators import churn_winback, cross_sell, debt_followup, reorder_due
+
+    def debt_candidates(manager_id, as_of, window):
+        return [
+            Task(
+                task_key=f"mgr:{manager_id}|client:{i}|type:debt_followup|win:{window}",
+                manager_id=manager_id,
+                client_id=i,
+                task_type=TaskType.DEBT_FOLLOWUP,
+                title="t",
+                reason="r",
+                priority=90.0,
+                ev_score=1000.0 - i,
+                urgency=Urgency.CRITICAL,
+            )
+            for i in range(10)
+        ]
+
+    monkeypatch.setattr(debt_followup, "generate", debt_candidates)
+    for mod in (reorder_due, churn_winback, cross_sell):
+        monkeypatch.setattr(mod, "generate", lambda manager_id, as_of, window: [])
+
+    monkeypatch.setattr(orchestrator, "get_settings", lambda: SimpleNamespace(
+        max_active_tasks_per_manager=3,
+        max_tasks_per_client_per_day=2,
+        crit_debt_reserve=2,
+        feedback_window_days=90,
+        max_pace_boost=1.0,
+        feedback_penalty_floor=0.5,
+        feedback_penalty_per_rejection=0.15,
+    ))
+    monkeypatch.setattr(orchestrator.lifecycle, "feedback_rejections", lambda manager_id, days: {})
+
+    first = orchestrator.generate_for_manager(1, "2026-06-07")
+    second = orchestrator.generate_for_manager(1, "2026-07-07")
+
+    assert first["persisted"] == 5
+    assert first["crit_debt_reserved"] == 2
+    assert second["persisted"] == 0
+    assert second["crit_debt_reserved"] == 0
+    assert mongo_db["tasks"].count_documents({"manager_id": 1, "status": "open"}) == 5

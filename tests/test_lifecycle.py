@@ -128,7 +128,7 @@ def _team_task(mgr, client_id, key, urgency=Urgency.NORMAL, priority=50.0,
     )
 
 
-def test_inbox_ranks_equal_urgency_type_by_ev_score(patched_mongo):
+def test_inbox_ranks_equal_urgency_type_by_ev_score_and_sinks_unvalued_legacy(patched_mongo):
     from app.data import mongo
     from app.services import lifecycle
 
@@ -138,9 +138,48 @@ def test_inbox_ranks_equal_urgency_type_by_ev_score(patched_mongo):
         _team_task(1, 21, "same_type_high_probability", Urgency.HIGH, priority=95.0, ev_score=50.0))
     legacy = lifecycle.upsert_generated(
         _team_task(1, 22, "same_type_legacy_priority", Urgency.HIGH, priority=90.0))
-    mongo.tasks().update_one({"task_key": legacy}, {"$unset": {"ev_score": ""}})
+    mongo.tasks().update_one(
+        {"task_key": legacy},
+        {"$unset": {"p_outcome": "", "expected_value": "", "ev_score": ""}},
+    )
 
-    assert [d["task_key"] for d in lifecycle.inbox(1)] == [high_ev, legacy, high_probability]
+    docs = lifecycle.inbox(1)
+    keys = [d["task_key"] for d in docs]
+    legacy_doc = next(d for d in docs if d["task_key"] == legacy)
+    persisted = mongo.tasks().find_one({"task_key": legacy})
+
+    assert keys == [high_ev, high_probability, legacy]
+    assert legacy_doc["p_outcome"] == 0.9
+    assert legacy_doc["expected_value"] == 0.0
+    assert legacy_doc["ev_score"] == 0.0
+    assert persisted["ev_score"] == 0.0
+
+
+def test_inbox_backfills_legacy_debt_ev_fields_from_signals(patched_mongo):
+    from app.data import mongo
+    from app.services import lifecycle
+
+    legacy = lifecycle.upsert_generated(
+        _team_task(1, 23, "same_type_legacy_debt", Urgency.HIGH, priority=50.0))
+    high_probability_low_ev = lifecycle.upsert_generated(
+        _team_task(1, 24, "same_type_high_probability_low_ev", Urgency.HIGH,
+                   priority=95.0, ev_score=100.0))
+    mongo.tasks().update_one(
+        {"task_key": legacy},
+        {"$unset": {"p_outcome": "", "expected_value": "", "ev_score": ""},
+         "$set": {"signals": {"overdue_amount": 1000.0}}},
+    )
+
+    docs = lifecycle.inbox(1)
+    keys = [d["task_key"] for d in docs]
+    legacy_doc = next(d for d in docs if d["task_key"] == legacy)
+    persisted = mongo.tasks().find_one({"task_key": legacy})
+
+    assert keys[:2] == [legacy, high_probability_low_ev]
+    assert legacy_doc["p_outcome"] == 0.5
+    assert legacy_doc["expected_value"] == 1000.0
+    assert legacy_doc["ev_score"] == 500.0
+    assert persisted["ev_score"] == 500.0
 
 
 def test_team_tasks_ranks_equal_urgency_type_by_ev_score(patched_mongo, monkeypatch):

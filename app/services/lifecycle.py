@@ -26,9 +26,9 @@ from app.domain.models import (
 
 log = get_logger("lifecycle")
 
-# Inbox ordering policy: triage by urgency band, then by business tier (debt = cash at risk first),
-# then by expected EUR score. Keeps critical items on top while surfacing overdue debt ahead of
-# equal-urgency reorder/churn — without letting a low-urgency debt jump above a critical reorder.
+# Inbox ordering policy: triage by urgency band, then expected EUR score, with task type only as a
+# deterministic tie-breaker. Keeps critical items on top without double-counting debt after the value
+# head has already priced cash/turnover at stake.
 # new_client_activation is no longer generated (no model head; junk on 1C-sync stamp dates) and so is
 # dropped from the rank. Any legacy new_client doc still in Mongo falls through to the default tier (9).
 _URGENCY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
@@ -42,16 +42,113 @@ def _float_score(value) -> float:
         return 0.0
 
 
+def _optional_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _derived_expected_value(doc: dict) -> float | None:
+    """Best-effort E[value] for legacy active docs created before ev_score was persisted."""
+    task_type = doc.get("task_type")
+    signals = doc.get("signals") or {}
+    payload = doc.get("payload") or {}
+    if task_type == TaskType.DEBT_FOLLOWUP.value:
+        debt_payload = payload.get("debt") or {}
+        return _optional_float(signals.get("overdue_amount") or debt_payload.get("overdue_amount"))
+    if task_type in {TaskType.REORDER_DUE.value, TaskType.CROSS_SELL.value}:
+        monetary = _float_score(signals.get("monetary"))
+        order_count = _float_score(signals.get("order_count"))
+        return monetary / order_count if order_count > 0 else None
+    if task_type == TaskType.CHURN_WINBACK.value:
+        return _optional_float(signals.get("monetary"))
+    return None
+
+
+def _ranking_field_updates(doc: dict) -> dict:
+    updates: dict = {}
+    priority = _float_score(doc.get("priority"))
+    p_outcome = doc.get("p_outcome")
+    if p_outcome is None:
+        p_outcome = priority / 100.0 if priority > 0 else 0.0
+        updates["p_outcome"] = round(p_outcome, 6)
+    else:
+        p_outcome = _float_score(p_outcome)
+
+    expected_value = doc.get("expected_value")
+    if expected_value is None:
+        expected_value = _derived_expected_value(doc)
+        if expected_value is None:
+            expected_value = 0.0
+        updates["expected_value"] = round(expected_value, 2)
+    else:
+        expected_value = _float_score(expected_value)
+
+    if doc.get("ev_score") is None and expected_value is not None:
+        updates["ev_score"] = round(p_outcome * expected_value, 4)
+    return updates
+
+
+def _hydrate_ranking_fields(docs: list[dict], *, persist: bool = False) -> None:
+    for doc in docs:
+        updates = _ranking_field_updates(doc)
+        if not updates:
+            continue
+        doc.update(updates)
+        if persist and doc.get("_id") is not None:
+            mongo.tasks().update_one({"_id": doc["_id"]}, {"$set": updates})
+
+
+def backfill_active_ranking_fields(manager_id: int | None = None, limit: int = 1000) -> int:
+    """Persist missing p_outcome/expected_value/ev_score on active legacy tasks.
+
+    This is intentionally narrow: it only touches active docs and only fills absent fields. If the
+    current value head has no grounded value input, expected_value/ev_score are filled as zero.
+    """
+    query: dict = {
+        "status": {"$in": list(s.value for s in ACTIVE)},
+        "$or": [
+            {"p_outcome": {"$exists": False}},
+            {"p_outcome": None},
+            {"expected_value": {"$exists": False}},
+            {"expected_value": None},
+            {"ev_score": {"$exists": False}},
+            {"ev_score": None},
+        ],
+    }
+    if manager_id is not None:
+        query["manager_id"] = manager_id
+    changed = 0
+    for doc in mongo.tasks().find(query).limit(limit):
+        updates = _ranking_field_updates(doc)
+        if updates:
+            mongo.tasks().update_one({"_id": doc["_id"]}, {"$set": updates})
+            changed += 1
+    return changed
+
+
 def _ranking_score(doc: dict) -> float:
     """Expected-EUR ranking score, with legacy fallback to priority when ev_score is absent."""
     ev_score = doc.get("ev_score")
-    return _float_score(doc.get("priority")) if ev_score is None else _float_score(ev_score)
+    if ev_score is not None:
+        return _float_score(ev_score)
+    expected_value = doc.get("expected_value")
+    if expected_value is None:
+        expected_value = _derived_expected_value(doc)
+    if expected_value is not None:
+        p_outcome = doc.get("p_outcome")
+        p = _float_score(p_outcome) if p_outcome is not None else _float_score(doc.get("priority")) / 100.0
+        return p * _float_score(expected_value)
+    return _float_score(doc.get("priority"))
 
 
 def _inbox_sort_key(doc: dict) -> tuple:
     return (_URGENCY_RANK.get(doc.get("urgency"), 9),
-            _TYPE_RANK.get(doc.get("task_type"), 9),
             -_ranking_score(doc),
+            _TYPE_RANK.get(doc.get("task_type"), 9),
             -_float_score(doc.get("priority")))
 
 
@@ -184,8 +281,8 @@ def add_note(task_key: str, author_id: int, text: str) -> dict:
 
 
 def inbox(manager_id: int, limit: int = 50, statuses: list[str] | None = None) -> list[dict]:
-    """Manager's active task queue (the cockpit query). Ordered by urgency band, then business
-    tier (debt first), then score — see _inbox_sort_key. SNOOZED tasks whose snooze_until has
+    """Manager's active task queue (the cockpit query). Ordered by urgency band, then EV score,
+    then business tier tie-breaker — see _inbox_sort_key. SNOOZED tasks whose snooze_until has
     passed are surfaced as OPEN-eligible."""
     now = _now()
     statuses = statuses or [TaskStatus.OPEN.value, TaskStatus.IN_PROGRESS.value]
@@ -196,9 +293,11 @@ def inbox(manager_id: int, limit: int = 50, statuses: list[str] | None = None) -
             {"status": TaskStatus.SNOOZED.value, "snooze_until": {"$lte": now}},
         ],
     }
-    # Active manager queues are capped; fetch the active set, then apply the full urgency/tier/EV
+    backfill_active_ranking_fields(manager_id=manager_id)
+    # Active manager queues are capped; fetch the active set, then apply the full urgency/EV
     # ordering in-process so high-EV, lower-probability tasks are not truncated by the legacy priority.
     docs = list(mongo.tasks().find(query))
+    _hydrate_ranking_fields(docs, persist=False)
     docs.sort(key=_inbox_sort_key)
     return docs[:max(0, limit)]
 
@@ -286,12 +385,15 @@ def cross_sell_negatives(window_days: int = 90) -> dict[int, set[int]]:
 
 def escalated_tasks(limit: int = 100) -> list[dict]:
     """Active tasks escalated to the head (escalated_to set) — the head's escalation queue.
-    Ordered by the same urgency band -> business tier -> score policy as the manager inbox."""
+    Ordered by the same urgency band -> EV score -> business tier tie-breaker policy as the manager
+    inbox."""
     query = {
         "status": {"$in": list(s.value for s in ACTIVE)},
         "escalated_to": {"$ne": None, "$exists": True},
     }
+    backfill_active_ranking_fields()
     docs = list(mongo.tasks().find(query))
+    _hydrate_ranking_fields(docs, persist=False)
     docs.sort(key=_inbox_sort_key)
     return docs[:max(0, limit)]
 
@@ -316,6 +418,7 @@ def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgenc
     Returns (page, total, by_status) where page is the skip/limit window with manager_name joined,
     total is the count over the same filter, and by_status is the {open/in_progress/done/snoozed/
     dismissed} rollup over the same filter (computed in the same aggregation via $facet)."""
+    backfill_active_ranking_fields()
     match: dict = {"status": {"$in": statuses}}
     if manager_ids:
         match["manager_id"] = {"$in": list(manager_ids)}

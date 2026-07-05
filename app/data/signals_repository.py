@@ -9,6 +9,7 @@ Verified columns:
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from functools import lru_cache
 
 from app.core.config import get_settings
@@ -134,11 +135,14 @@ def new_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 90,
 
 
 def all_managers() -> list[int]:
-    """Distinct managers that have at least one client (Client.MainManagerID)."""
+    """Distinct managers that have at least one client (Client.MainManagerID). Soft-deleted
+    managers (dbo.[User].Deleted=1) are excluded so they never surface in team/head views."""
     rows = query(
         """
-        SELECT DISTINCT MainManagerID AS mid
-        FROM dbo.Client WHERE Deleted = 0 AND MainManagerID IS NOT NULL
+        SELECT DISTINCT c.MainManagerID AS mid
+        FROM dbo.Client c
+        JOIN dbo.[User] u ON u.ID = c.MainManagerID AND u.Deleted = 0
+        WHERE c.Deleted = 0 AND c.MainManagerID IS NOT NULL
         """,
     )
     return [int(r["mid"]) for r in rows]
@@ -198,6 +202,61 @@ def contacts_for_clients(client_ids: list[int]) -> dict[int, dict]:
 
 # --- debt_followup signal ---
 
+_EUR_VALUE_CTE = """
+    WITH eur AS (
+        SELECT TOP(1) ID AS eur_id FROM dbo.Currency WHERE Deleted = 0 AND Code = 'EUR'
+    ),
+    rws AS (
+        SELECT {extra_select}c.ID AS client_id,
+               CAST(CASE
+                   WHEN ISNULL(a.CurrencyID, 2) = eur.eur_id THEN CAST(d.Total AS decimal(30,14))
+                   WHEN er.rate IS NOT NULL THEN CAST(d.Total AS decimal(30,14)) / er.rate
+                   WHEN cr.rate IS NOT NULL THEN CAST(d.Total AS decimal(30,14)) * cr.rate
+                   WHEN ir.rate IS NOT NULL THEN CAST(d.Total AS decimal(30,14)) / ir.rate
+                   ELSE CAST(d.Total AS decimal(30,14))
+               END AS money) AS eur_value,
+               DATEDIFF(day, d.Created, :asof) AS overdue_days,
+               DATEDIFF(day, d.Created, :asof) - ISNULL(a.NumberDaysDebt, 0) AS days_past_terms
+        FROM dbo.ClientInDebt cid
+        JOIN dbo.Debt d ON d.ID = cid.DebtID AND d.Deleted = 0
+        JOIN dbo.Client c ON c.ID = cid.ClientID AND c.Deleted = 0
+        LEFT JOIN dbo.Agreement a ON a.ID = cid.AgreementID
+        CROSS JOIN eur
+        OUTER APPLY (
+            SELECT TOP(1) IIF(erh.Amount IS NOT NULL, erh.Amount, er0.Amount) AS rate
+            FROM dbo.ExchangeRate er0
+            LEFT JOIN dbo.ExchangeRateHistory erh
+                ON erh.ExchangeRateID = er0.ID AND erh.Created <= d.Created
+            WHERE er0.CurrencyID = ISNULL(a.CurrencyID, 2) AND er0.Code = 'EUR' AND er0.Deleted = 0
+            ORDER BY erh.ID DESC
+        ) er
+        OUTER APPLY (
+            SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
+            FROM dbo.CrossExchangeRate cr0
+            LEFT JOIN dbo.CrossExchangeRateHistory crh
+                ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
+            WHERE cr0.CurrencyFromID = ISNULL(a.CurrencyID, 2) AND cr0.CurrencyToID = eur.eur_id
+                  AND cr0.Deleted = 0
+            ORDER BY crh.ID DESC
+        ) cr
+        OUTER APPLY (
+            SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
+            FROM dbo.CrossExchangeRate cr0
+            LEFT JOIN dbo.CrossExchangeRateHistory crh
+                ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
+            WHERE cr0.CurrencyFromID = eur.eur_id AND cr0.CurrencyToID = ISNULL(a.CurrencyID, 2)
+                  AND cr0.Deleted = 0
+            ORDER BY crh.ID DESC
+        ) ir
+        WHERE cid.Deleted = 0
+              {manager_filter}
+              AND d.Total > 0
+              AND DATEDIFF(day, d.Created, :asof) > ISNULL(a.NumberDaysDebt, 0)
+              AND DATEDIFF(day, d.Created, :asof) <= :maxage
+    )
+"""
+
+
 def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 365,
                               min_amount: float = 0.0) -> list[dict]:
     """Per client: overdue debt in EUR, summed. Overdue age = DATEDIFF(Debt.Created, as_of).
@@ -205,7 +264,8 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 3
     NB: Debt.Days (the prod-computed overdue column) is NOT maintained on ConcordDb_V5 here
     (always 0), so overdue is derived from Debt.Created age vs Agreement.NumberDaysDebt terms.
     Debt has NO CurrencyID — Debt.Total is in the AGREEMENT currency, so each line is converted to
-    EUR via dbo.GetExchangedToEuroValue(Total, ISNULL(Agreement.CurrencyID, 2=EUR), Debt.Created).
+    EUR via _EUR_VALUE_CTE, a set-based, per-row reproduction of dbo.GetExchangedToEuroValue(Total,
+    ISNULL(Agreement.CurrencyID, 2=EUR), Debt.Created) that is identical to the UDF to the cent.
     Without this, UAH debts (CurrencyID 10038) were summed as if EUR (~50× inflated), saturating
     every client's urgency/value to critical. min_amount is therefore an EUR threshold.
     max_age_days drops stale write-off debts (real data has overdue up to ~3800 days, i.e. 2015
@@ -213,43 +273,47 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 3
     overdues (on real data ~25% of debt clients owe < €10 — not worth a collection call).
     """
     return query(
-        """
-        SELECT c.ID AS client_id,
-               SUM(dbo.GetExchangedToEuroValue(d.Total, ISNULL(a.CurrencyID, 2), d.Created))
-                   AS overdue_amount,
-               MAX(DATEDIFF(day, d.Created, :asof)) AS max_overdue_days,
-               MAX(DATEDIFF(day, d.Created, :asof) - ISNULL(a.NumberDaysDebt, 0)) AS max_days_past_terms,
+        _EUR_VALUE_CTE.format(extra_select="", manager_filter="AND c.MainManagerID = :mid")
+        + """
+        SELECT client_id,
+               SUM(eur_value) AS overdue_amount,
+               MAX(overdue_days) AS max_overdue_days,
+               MAX(days_past_terms) AS max_days_past_terms,
                COUNT(*) AS debt_lines
-        FROM dbo.ClientInDebt cid
-        JOIN dbo.Debt d ON d.ID = cid.DebtID AND d.Deleted = 0
-        JOIN dbo.Client c ON c.ID = cid.ClientID AND c.Deleted = 0
-        LEFT JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-        WHERE cid.Deleted = 0
-              AND c.MainManagerID = :mid
-              AND d.Total > 0
-              AND DATEDIFF(day, d.Created, :asof) > ISNULL(a.NumberDaysDebt, 0)
-              AND DATEDIFF(day, d.Created, :asof) <= :maxage
-        GROUP BY c.ID
-        HAVING SUM(dbo.GetExchangedToEuroValue(d.Total, ISNULL(a.CurrencyID, 2), d.Created)) >= :minamt
+        FROM rws
+        GROUP BY client_id
+        HAVING SUM(eur_value) >= :minamt
         """,
         {"mid": manager_id, "asof": as_of, "maxage": max_age_days, "minamt": min_amount},
     )
 
 
-def debt_dashboard_for_manager(manager_id: int, as_of: str) -> dict:
-    """Chart-ready debt aggregation for a manager dashboard, derived from the SAME EUR-correct
-    overdue_debts_for_manager aggregation the debt_followup generator uses (Debt.Total converted to
-    EUR via dbo.GetExchangedToEuroValue — never raw PricePerItem). Uses the configured
-    debt_max_age_days / debt_min_amount so the dashboard total matches what actually generates tasks.
+def overdue_debts_all_managers(as_of: str, max_age_days: int = 365,
+                               min_amount: float = 0.0) -> list[dict]:
+    """overdue_debts_for_manager for EVERY manager in a single set-based pass (per-client rows tagged
+    with c.MainManagerID). Identical per-client EUR math, filters and HAVING; only the manager
+    scoping moves into the GROUP BY so the head/team dashboard needs one query, not one per manager."""
+    return query(
+        _EUR_VALUE_CTE.format(extra_select="c.MainManagerID AS manager_id, ",
+                              manager_filter="AND c.MainManagerID IS NOT NULL")
+        + """
+        SELECT manager_id, client_id,
+               SUM(eur_value) AS overdue_amount,
+               MAX(overdue_days) AS max_overdue_days,
+               MAX(days_past_terms) AS max_days_past_terms,
+               COUNT(*) AS debt_lines
+        FROM rws
+        GROUP BY manager_id, client_id
+        HAVING SUM(eur_value) >= :minamt
+        """,
+        {"asof": as_of, "maxage": max_age_days, "minamt": min_amount},
+    )
 
-    Returns:
-      value_at_risk_eur: SUM of every open overdue debt (EUR) for this manager;
-      debt_aging: [{bucket, amount_eur, count}] over the client's max overdue age (days since
-                  Debt.Created), bucketed 0-30 / 31-60 / 61-90 / 90+.
-    """
-    s = get_settings()
-    rows = overdue_debts_for_manager(manager_id, as_of, max_age_days=s.debt_max_age_days,
-                                     min_amount=s.debt_min_amount)
+
+def _debt_dashboard_from_rows(rows: list[dict]) -> dict:
+    """Fold overdue_debts_for_manager rows into the chart-ready debt dashboard DTO (value_at_risk +
+    aging buckets). Shared by the single-manager and all-managers paths so both produce identical
+    numbers from identical per-client rows."""
     buckets = [("0-30", 0, 30), ("31-60", 31, 60), ("61-90", 61, 90), ("90+", 91, None)]
     aging = {label: {"amount_eur": 0.0, "count": 0} for label, _, _ in buckets}
     value_at_risk = 0.0
@@ -267,6 +331,36 @@ def debt_dashboard_for_manager(manager_id: int, as_of: str) -> dict:
         "debt_aging": [{"bucket": label, "amount_eur": round(aging[label]["amount_eur"], 2),
                         "count": aging[label]["count"]} for label, _, _ in buckets],
     }
+
+
+def debt_dashboards_for_all_managers(as_of: str) -> dict[int, dict]:
+    """{manager_id: debt dashboard DTO} for every manager, from ONE overdue_debts_all_managers query.
+    Each manager's DTO equals debt_dashboard_for_manager(manager_id, as_of) exactly (same rows, same
+    fold); managers with no qualifying overdue debt are simply absent (callers default them to 0)."""
+    s = get_settings()
+    rows = overdue_debts_all_managers(as_of, max_age_days=s.debt_max_age_days,
+                                      min_amount=s.debt_min_amount)
+    by_manager: dict[int, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_manager[int(r["manager_id"])].append(r)
+    return {mid: _debt_dashboard_from_rows(rs) for mid, rs in by_manager.items()}
+
+
+def debt_dashboard_for_manager(manager_id: int, as_of: str) -> dict:
+    """Chart-ready debt aggregation for a manager dashboard, derived from the SAME EUR-correct
+    overdue_debts_for_manager aggregation the debt_followup generator uses (Debt.Total converted to
+    EUR via dbo.GetExchangedToEuroValue — never raw PricePerItem). Uses the configured
+    debt_max_age_days / debt_min_amount so the dashboard total matches what actually generates tasks.
+
+    Returns:
+      value_at_risk_eur: SUM of every open overdue debt (EUR) for this manager;
+      debt_aging: [{bucket, amount_eur, count}] over the client's max overdue age (days since
+                  Debt.Created), bucketed 0-30 / 31-60 / 61-90 / 90+.
+    """
+    s = get_settings()
+    rows = overdue_debts_for_manager(manager_id, as_of, max_age_days=s.debt_max_age_days,
+                                     min_amount=s.debt_min_amount)
+    return _debt_dashboard_from_rows(rows)
 
 
 # --- reorder_due signal ---

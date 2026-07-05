@@ -62,6 +62,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
     monkeypatch.setattr(main.signals_repository, "debt_dashboard_for_manager",
                         lambda mid, as_of: _DEBT.get(mid, {"value_at_risk_eur": 0.0, "debt_aging": []}))
+    monkeypatch.setattr(main.signals_repository, "debt_dashboards_for_all_managers",
+                        lambda as_of: dict(_DEBT))
     return TestClient(main.app)
 
 
@@ -133,6 +135,19 @@ def test_manager_dashboard_done_last_month_excluded(client):
 def test_manager_dashboard_unknown_404(client):
     assert client.get("/cockpit/dashboard",
                       params={"manager_net_uid": UNKNOWN_UID}).status_code == 404
+
+
+def test_manager_dashboard_malformed_as_of_date_422(client):
+    resp = client.get("/cockpit/dashboard",
+                      params={"manager_net_uid": MGR_UID, "as_of_date": "not-a-date"})
+    assert resp.status_code == 422
+
+
+def test_manager_dashboard_iso_as_of_date_ok(client):
+    resp = client.get("/cockpit/dashboard",
+                      params={"manager_net_uid": MGR_UID, "as_of_date": "2026-06-15"})
+    assert resp.status_code == 200
+    assert resp.json()["as_of"] == "2026-06-15"
 
 
 # ---------------- head dashboard ----------------

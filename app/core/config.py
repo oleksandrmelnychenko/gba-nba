@@ -1,6 +1,7 @@
 """Settings — env-only, no secrets in code."""
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 
 from pydantic import Field
@@ -22,6 +23,10 @@ class Settings(BaseSettings):
     db_password: str = ""
     db_pool_size: int = 10
     db_max_overflow: int = 10
+    source_history_start_date: date = Field(
+        default=date(2025, 1, 1),
+        description="Earliest complete source date shared by all AI data paths",
+    )
 
     # downstream AI services
     reco_url: str = "http://127.0.0.1:8000"
@@ -75,7 +80,7 @@ class Settings(BaseSettings):
 
     # Scoring / model knobs — tunable WITHOUT redeploy (env-driven); bump model_version on change so
     # outcomes can be sliced/A-B'd by scoring generation.
-    model_version: str = "nba-v3-propensity"  # priority now = 100*p_outcome from the trained model
+    model_version: str = "nba-v4-history-20250101"
     w_urgency: float = 0.5
     w_value: float = 0.3
     w_confidence: float = 0.2

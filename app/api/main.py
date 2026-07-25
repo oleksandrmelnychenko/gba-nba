@@ -28,6 +28,7 @@ from app.services import lifecycle
 
 log = get_logger("api")
 settings = get_settings()
+_EXPECTED_SOURCE_HISTORY_START = "2025-01-01"
 
 # Routes reachable without the internal key (operational endpoints).
 _OPEN_PATHS = {"/health"}
@@ -228,6 +229,17 @@ def health() -> dict:
         except Exception as exc:  # noqa: BLE001
             log.error("nba_generation_readiness_failed", error=str(exc))
             generation["generation_reasons"] = ["generation_readiness_failed"]
+    source_history_start = settings.source_history_start_date.isoformat()
+    source_history_contract_ready = (
+        source_history_start == _EXPECTED_SOURCE_HISTORY_START
+    )
+    source = {**source, "source_history_start": source_history_start}
+    if not source_history_contract_ready:
+        source["source_ready"] = False
+        source["source_reasons"] = [
+            *list(source.get("source_reasons") or []),
+            "source_history_start_mismatch",
+        ]
     try:
         from app.ml.score_task import model_compatibility
 
@@ -255,6 +267,7 @@ def health() -> dict:
         **source,
         **generation,
         **model,
+        "source_history_contract_ready": source_history_contract_ready,
         "version": "0.1.0",
         "model_version": settings.model_version,
     }

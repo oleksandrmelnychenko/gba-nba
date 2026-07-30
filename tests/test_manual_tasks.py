@@ -250,3 +250,44 @@ def test_head_board_surfaces_dismiss_reason_and_outcome(client, monkeypatch):
     assert rows[manual_key]["resolution_reason"] == "Клієнт відмовився"
     assert rows[done_key]["outcome"]["sold"] is True
     assert rows[done_key]["outcome"]["amount"] == 700
+
+
+def test_head_dismissals_aggregation(client, monkeypatch):
+    from app.api import main
+    monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
+    k1 = _seed_ai(1, "mgr:1|client:10|type:debt_followup|win:2026-06")
+    k2 = _seed_ai(1, "mgr:1|client:11|type:debt_followup|win:2026-06", client_id=11)
+    manual_key = _create_manual(client)["task_key"]
+    client.post("/cockpit/status", params={"manager_net_uid": MGR_UID},
+                json={"task_key": k1, "to": "dismissed", "reason": "Ціна зависока"})
+    client.post("/cockpit/status", params={"manager_net_uid": MGR_UID},
+                json={"task_key": k2, "to": "dismissed", "reason": "ціна  зависока"})
+    client.post("/cockpit/status", params={"manager_net_uid": MGR_UID},
+                json={"task_key": manual_key, "to": "dismissed"})
+
+    resp = client.get("/head/dismissals",
+                      params={"manager_net_uid": HEAD_UID, "window_days": 30})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["is_head"] is True
+    assert data["window_days"] == 30
+    assert data["total_dismissed"] == 3
+    assert len(data["managers"]) == 1
+    mgr = data["managers"][0]
+    assert mgr["manager_id"] == 1
+    assert mgr["manager_name"] == "Іван Менеджер"
+    assert mgr["dismissed"] == 3
+    assert mgr["manual"] == 1
+    assert mgr["no_reason"] == 1
+    # case/whitespace variants of the same wording collapse into one bucket
+    assert mgr["reasons"] == [{"reason": "Ціна зависока", "count": 2}]
+    assert data["top_reasons"] == [{"reason": "Ціна зависока", "count": 2, "managers": 1}]
+
+
+def test_head_dismissals_non_head_is_benign(client):
+    resp = client.get("/head/dismissals", params={"manager_net_uid": MGR_UID})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["is_head"] is False
+    assert data["total_dismissed"] == 0
+    assert data["managers"] == []

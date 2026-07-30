@@ -981,6 +981,33 @@ def head_tasks(
     )
 
 
+@app.get("/head/dismissals")
+def head_dismissals(
+    manager_net_uid: str,
+    window_days: Annotated[int, Query(ge=1, le=365)] = 30,
+    manager_id: Annotated[int | None, Query(gt=0)] = None,
+) -> dict:
+    """«Не актуально» analytics for the head board: dismissed tasks over the window grouped per
+    manager and per dismissal reason, plus team-wide top reasons. Non-head caller -> benign
+    {is_head: false} (200, same contract as every other /head GET route)."""
+    _resolve_manager(manager_net_uid)
+    requested_net_uid = _canonical_net_uid(manager_net_uid)
+    if not signals_repository.is_head_of_sales(manager_net_uid):
+        return {"is_head": False, "requested_manager_net_uid": requested_net_uid,
+                "window_days": window_days, "total_dismissed": 0,
+                "managers": [], "top_reasons": []}
+    mids = signals_repository.all_managers()
+    if manager_id is not None and manager_id not in mids:
+        raise HTTPException(status_code=422, detail="manager_not_in_active_team_scope")
+    scope = [manager_id] if manager_id is not None else mids
+    if scope:
+        stats = lifecycle.dismissal_stats(window_days=window_days, manager_ids=scope)
+    else:
+        stats = {"window_days": window_days, "total_dismissed": 0,
+                 "managers": [], "top_reasons": []}
+    return {"is_head": True, "requested_manager_net_uid": requested_net_uid, **stats}
+
+
 @app.post("/head/tasks/new")
 def head_task_create(manager_net_uid: str, req: HeadTaskCreateRequest) -> dict:
     """Head-of-sales assigns a manual task to a manager (origin=head). Unlike the benign

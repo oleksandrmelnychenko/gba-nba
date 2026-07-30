@@ -644,6 +644,65 @@ def escalated_count() -> int:
          "escalated_to": {"$ne": None, "$exists": True}})
 
 
+def dismissal_stats(window_days: int = 30, manager_ids: list[int] | None = None) -> dict:
+    """Aggregated «не актуально» analytics for the head board: dismissed tasks over the window,
+    grouped per manager and per dismissal reason (the reason of the LAST status change carrying
+    one — the same collapse rule the board rows use). Reasons are grouped after whitespace/case
+    normalisation so quick-chip texts and hand-typed variants of the same wording land in one
+    bucket; the first-seen original spelling is what gets displayed."""
+    since = _now() - timedelta(days=window_days)
+    match: dict = {"status": TaskStatus.DISMISSED.value, "updated_at": {"$gte": since}}
+    if manager_ids:
+        match["manager_id"] = {"$in": list(manager_ids)}
+    docs = list(mongo.tasks().find(
+        match, {"manager_id": 1, "task_type": 1, "status_history": 1}))
+
+    per_mgr: dict[int, dict] = {}
+    reason_totals: dict[str, dict] = {}
+    for doc in docs:
+        mid = doc.get("manager_id")
+        entry = per_mgr.setdefault(
+            mid, {"dismissed": 0, "manual": 0, "no_reason": 0, "reasons": {}})
+        entry["dismissed"] += 1
+        if doc.get("task_type") == TaskType.MANUAL.value:
+            entry["manual"] += 1
+        reason = _resolution_reason(doc.get("status_history"))
+        if not reason:
+            entry["no_reason"] += 1
+            continue
+        key = " ".join(reason.split()).casefold()
+        bucket = entry["reasons"].setdefault(key, {"reason": reason, "count": 0})
+        bucket["count"] += 1
+        total = reason_totals.setdefault(key, {"reason": reason, "count": 0, "managers": set()})
+        total["count"] += 1
+        total["managers"].add(mid)
+
+    from app.data import signals_repository
+    names = signals_repository.manager_names(sorted(per_mgr)) if per_mgr else {}
+    managers = [
+        {
+            "manager_id": mid,
+            "manager_name": names.get(mid),
+            "dismissed": entry["dismissed"],
+            "manual": entry["manual"],
+            "no_reason": entry["no_reason"],
+            "reasons": sorted(entry["reasons"].values(), key=lambda r: -r["count"]),
+        }
+        for mid, entry in per_mgr.items()
+    ]
+    managers.sort(key=lambda m: -m["dismissed"])
+    top_reasons = sorted(
+        ({"reason": v["reason"], "count": v["count"], "managers": len(v["managers"])}
+         for v in reason_totals.values()),
+        key=lambda r: -r["count"])
+    return {
+        "window_days": window_days,
+        "total_dismissed": len(docs),
+        "managers": managers,
+        "top_reasons": top_reasons,
+    }
+
+
 def _active_counts(manager_id: int, field: str) -> dict:
     """Count a manager's ACTIVE tasks grouped by a field — lets generation honour per-client/per-type
     caps against tasks ALREADY in the inbox (so on-demand re-runs can't exceed the daily caps)."""

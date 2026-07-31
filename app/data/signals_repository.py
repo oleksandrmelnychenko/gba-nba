@@ -424,7 +424,7 @@ _EUR_VALUE_CTE = """
             LEFT JOIN dbo.ExchangeRateHistory erh
                 ON erh.ExchangeRateID = er0.ID AND erh.Created <= d.Created
             WHERE er0.CurrencyID = ISNULL(a.CurrencyID, 2) AND er0.Code = 'EUR' AND er0.Deleted = 0
-            ORDER BY erh.ID DESC
+            ORDER BY erh.Created DESC, erh.ID DESC
         ) er
         OUTER APPLY (
             SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
@@ -433,7 +433,7 @@ _EUR_VALUE_CTE = """
                 ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
             WHERE cr0.CurrencyFromID = ISNULL(a.CurrencyID, 2) AND cr0.CurrencyToID = eur.eur_id
                   AND cr0.Deleted = 0
-            ORDER BY crh.ID DESC
+            ORDER BY crh.Created DESC, crh.ID DESC
         ) cr
         OUTER APPLY (
             SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
@@ -442,7 +442,7 @@ _EUR_VALUE_CTE = """
                 ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
             WHERE cr0.CurrencyFromID = eur.eur_id AND cr0.CurrencyToID = ISNULL(a.CurrencyID, 2)
                   AND cr0.Deleted = 0
-            ORDER BY crh.ID DESC
+            ORDER BY crh.Created DESC, crh.ID DESC
         ) ir
         WHERE cid.Deleted = 0
               {manager_filter}

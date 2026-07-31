@@ -422,27 +422,33 @@ _EUR_VALUE_CTE = """
             SELECT TOP(1) IIF(erh.Amount IS NOT NULL, erh.Amount, er0.Amount) AS rate
             FROM dbo.ExchangeRate er0
             LEFT JOIN dbo.ExchangeRateHistory erh
-                ON erh.ExchangeRateID = er0.ID AND erh.Created <= d.Created
+                ON erh.ExchangeRateID = er0.ID
+               AND erh.Deleted = 0
+               AND erh.Created <= d.Created
             WHERE er0.CurrencyID = ISNULL(a.CurrencyID, 2) AND er0.Code = 'EUR' AND er0.Deleted = 0
-            ORDER BY erh.Created DESC, erh.ID DESC
+            ORDER BY erh.Created DESC, erh.ID DESC, er0.ID DESC
         ) er
         OUTER APPLY (
             SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
             FROM dbo.CrossExchangeRate cr0
             LEFT JOIN dbo.CrossExchangeRateHistory crh
-                ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
+                ON crh.CrossExchangeRateID = cr0.ID
+               AND crh.Deleted = 0
+               AND crh.Created <= d.Created
             WHERE cr0.CurrencyFromID = ISNULL(a.CurrencyID, 2) AND cr0.CurrencyToID = eur.eur_id
                   AND cr0.Deleted = 0
-            ORDER BY crh.Created DESC, crh.ID DESC
+            ORDER BY crh.Created DESC, crh.ID DESC, cr0.ID DESC
         ) cr
         OUTER APPLY (
             SELECT TOP(1) IIF(crh.Amount IS NOT NULL, crh.Amount, cr0.Amount) AS rate
             FROM dbo.CrossExchangeRate cr0
             LEFT JOIN dbo.CrossExchangeRateHistory crh
-                ON crh.CrossExchangeRateID = cr0.ID AND crh.Created <= d.Created
+                ON crh.CrossExchangeRateID = cr0.ID
+               AND crh.Deleted = 0
+               AND crh.Created <= d.Created
             WHERE cr0.CurrencyFromID = eur.eur_id AND cr0.CurrencyToID = ISNULL(a.CurrencyID, 2)
                   AND cr0.Deleted = 0
-            ORDER BY crh.Created DESC, crh.ID DESC
+            ORDER BY crh.Created DESC, crh.ID DESC, cr0.ID DESC
         ) ir
         WHERE cid.Deleted = 0
               {manager_filter}

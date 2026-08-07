@@ -412,6 +412,7 @@ def main() -> None:
 
     # ----------------------------------------------------------------- temporal OOT split
     oot_train_max, oot_test_lo, oot_test_hi = resolve_oot_split(df["vd"].tolist())
+    report["oot_split"] = {"train_max": oot_train_max, "test": [oot_test_lo, oot_test_hi]}
     tr_mask = df["vd"] <= oot_train_max
     te_mask = (df["vd"] >= oot_test_lo) & (df["vd"] <= oot_test_hi)
     Xtr, ytr = X[tr_mask], y[tr_mask]

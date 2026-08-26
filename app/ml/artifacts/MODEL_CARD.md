@@ -31,8 +31,8 @@ manager filter dropped.
 
 Current artifact metrics:
 
-- Rows: 16,717.
-- Clients: 709.
+- Rows: 16,716.
+- Clients: 708.
 - Base rate: 25.7%.
 - Features: 21 shared/type-signal/one-hot columns.
 - Production model: calibrated HGB.
@@ -52,26 +52,26 @@ Stratified Group CV, grouped by client:
 
 | metric | HGB | Logit |
 |---|---:|---:|
-| AUC | 0.680 | 0.691 |
-| KS | 0.259 | 0.285 |
-| Brier | 0.175 | 0.172 |
+| AUC | 0.690 | 0.690 |
+| KS | 0.277 | 0.280 |
+| Brier | 0.173 | 0.173 |
 
 Temporal out-of-time split:
 
 | metric | HGB | Logit |
 |---|---:|---:|
-| AUC | 0.668 | 0.652 |
-| KS | 0.243 | 0.221 |
-| Brier | 0.168 | 0.175 |
+| AUC | 0.668 | 0.651 |
+| KS | 0.247 | 0.219 |
+| Brier | 0.170 | 0.175 |
 
 OOT per type, production HGB:
 
 | task_type | n | pos | AUC | KS | Brier |
 |---|---:|---:|---:|---:|---:|
-| reorder_due | 6,037 | 1,386 | 0.648 | 0.218 | 0.174 |
-| debt_followup | 7 | 0 | n/a | n/a | 0.006 |
-| churn_winback | 421 | 140 | 0.744 | 0.380 | 0.184 |
-| cross_sell | 870 | 125 | 0.714 | 0.373 | 0.113 |
+| reorder_due | 6,041 | 1,390 | 0.648 | 0.224 | 0.177 |
+| debt_followup | 7 | 0 | n/a | n/a | 0.005 |
+| churn_winback | 422 | 140 | 0.752 | 0.391 | 0.187 |
+| cross_sell | 867 | 125 | 0.704 | 0.353 | 0.114 |
 
 Reliability bins are in `metrics.json` under `oot_per_type.hgb[*].reliability`.
 
@@ -81,12 +81,12 @@ AUC on the same outcome label:
 
 | scope | old | model | delta |
 |---|---:|---:|---:|
-| overall CV | 0.579 | 0.680 | 0.101 |
+| overall CV | 0.579 | 0.690 | 0.111 |
 | OOT future | 0.551 | 0.668 | 0.117 |
-| reorder_due CV | 0.557 | 0.654 | 0.097 |
+| reorder_due CV | 0.557 | 0.667 | 0.110 |
 | debt_followup CV | n/a | n/a | n/a |
-| churn_winback CV | 0.494 | 0.770 | 0.276 |
-| cross_sell CV | 0.697 | 0.682 | -0.015 |
+| churn_winback CV | 0.495 | 0.774 | 0.279 |
+| cross_sell CV | 0.698 | 0.678 | -0.020 |
 
 The model beats old priority overall, out-of-time, and on the modeled task types. This card is
 generated from `metrics.json` by `app/ml/train.py`; if the metrics change, the card changes with

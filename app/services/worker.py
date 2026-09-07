@@ -36,7 +36,7 @@ def push_reco_feedback(window_days: int | None = None) -> dict:
     return {"clients": clients, "sent": sent, "products": products}
 
 
-def run(as_of: str | None = None, limit: int | None = None) -> dict:
+def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bool = True) -> dict:
     as_of = as_of or datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
     started = time.time()
     managers = sig.all_managers()
@@ -53,7 +53,7 @@ def run(as_of: str | None = None, limit: int | None = None) -> dict:
         orphaned = 0
 
     try:
-        fb = push_reco_feedback()
+        fb = push_reco_feedback() if push_feedback else {"clients": 0, "sent": 0, "products": 0}
     except Exception as exc:  # noqa: BLE001
         log.warning("reco_feedback_skipped", error=str(exc))
         fb = {"clients": 0, "sent": 0, "products": 0}

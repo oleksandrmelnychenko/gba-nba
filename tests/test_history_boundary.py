@@ -248,7 +248,9 @@ def test_training_dataset_requires_complete_floor_aware_vintages():
         )
 
 
-def test_model_metadata_rejects_legacy_partial_and_duplicate_vintages(monkeypatch):
+def test_model_metadata_rejects_legacy_partial_and_duplicate_vintages(monkeypatch, tmp_path):
+    (tmp_path / "propensity_model.joblib").write_bytes(b"")
+    monkeypatch.setattr(score_task, "ART", tmp_path)
     monkeypatch.setattr(score_task, "_meta", lambda: {})
     legacy = score_task.model_compatibility()
     assert legacy["model_compatible"] is False

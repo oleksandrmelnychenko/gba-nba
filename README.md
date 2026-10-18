@@ -21,6 +21,23 @@ All source data is considered complete starting at `SOURCE_HISTORY_START_DATE`
 Changing the boundary requires rebuilding the NBA dataset and passing the existing retraining
 quality gates before the new model can be served.
 
+## Model artifacts
+
+The propensity model in `app/ml/artifacts/` (`propensity_model.joblib`, `model_meta.json`,
+`metrics.json`, `MODEL_CARD.md`) is produced on the host and is not tracked in Git. The weekly
+`gba-nba-retrain.timer` (`deploy/systemd/`) rebuilds the dataset, retrains, gates and swaps these
+files in place, keeping the previous set in `app/ml/artifacts/backup_<ts>/`.
+
+A fresh checkout has no model: task generation falls back to the deterministic heuristic, `/health`
+reports `degraded` with `model_artifact_missing`, and `/ready` returns 503. Train the first model
+with the same command the timer runs (requires the `.env` SQL and Mongo access):
+
+```bash
+.venv/bin/python scripts/retrain.py --auc-floor 0.62 --auc-epsilon 0.01
+```
+
+Model-dependent scoring tests are skipped until the model exists.
+
 ## Checks
 
 ```bash

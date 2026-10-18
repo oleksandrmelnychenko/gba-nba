@@ -14,3 +14,7 @@ venv/
 .idea/
 /data/
 app/ml/artifacts/backup_*/
+app/ml/artifacts/propensity_model.joblib
+app/ml/artifacts/model_meta.json
+app/ml/artifacts/metrics.json
+app/ml/artifacts/MODEL_CARD.md

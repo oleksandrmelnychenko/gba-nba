@@ -4,7 +4,13 @@ from __future__ import annotations
 import pytest
 
 from app.domain.models import Urgency
+from app.ml import score_task as score_task_module
 from app.services import scoring
+
+requires_trained_model = pytest.mark.skipif(
+    not (score_task_module.ART / "propensity_model.joblib").is_file(),
+    reason="trained model artifact absent; run scripts/retrain.py",
+)
 
 
 def test_scoring_knobs_are_env_tunable(monkeypatch):
@@ -63,6 +69,7 @@ def test_urgency_bands():
     assert scoring.urgency_band(0.1) == Urgency.LOW
 
 
+@requires_trained_model
 def test_score_task_priority_delegates_to_the_model():
     # priority must come from the trained propensity model (100 * p_outcome), NOT the legacy blend.
     from app.ml.score_task import score_task
@@ -85,6 +92,7 @@ def test_score_task_priority_delegates_to_the_model():
     assert ev == 8000.0
 
 
+@requires_trained_model
 def test_score_task_priority_maps_short_signal_keys_per_type():
     # each type's short raw-signal keys land on the right model FEATURE (mapping is the load-bearing
     # part: a wrong/missing key silently degrades the score).
@@ -110,6 +118,7 @@ def test_score_task_priority_maps_short_signal_keys_per_type():
         assert abs(p_out - ref["p_outcome"]) < 1e-9, tt
 
 
+@requires_trained_model
 def test_score_task_priority_maps_missing_recency_to_sentinel():
     # recency_days None (client with no order in the trailing window) -> 9999, the dataset sentinel.
     from app.ml.score_task import score_task

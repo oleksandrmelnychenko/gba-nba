@@ -26,6 +26,7 @@ def fixture(monkeypatch):
     monkeypatch.setattr(signals_repository, "manager_id_for_netuid", lambda uid: 9 if uid == HEAD else 2)
     monkeypatch.setattr(signals_repository, "is_head_of_sales", lambda uid: uid == HEAD)
     monkeypatch.setattr(signals_repository, "all_managers", lambda: [1, 2])
+    monkeypatch.setattr(signals_repository, "task_manager_ids", lambda ids: [1, 2])
     monkeypatch.setattr(signals_repository, "manager_names", lambda ids: {mid: f"Manager {mid}" for mid in ids})
     book = [{"client_id": i, "manager_id": 1, "client_name": f"Client {i}", "name": f"Client {i}"} for i in range(1, 252)]
     monkeypatch.setattr(signals_repository, "query", lambda sql, params: [r for r in book if r["manager_id"] in params.values()])
@@ -195,3 +196,31 @@ def test_scoped_notes_advance_revision_with_frozen_clock(fixture, monkeypatch):
     with pytest.raises(lifecycle.TaskConflictError):
         lifecycle.add_note("one", 1, "Stale", expected_manager_id=1, expected_updated_at=NOW)
     assert [entry["text"] for entry in db.tasks.find_one()["notes"]] == ["First"]
+
+
+
+def test_zero_book_assignee_remains_visible_and_filter_keeps_all_recipient_choices(fixture):
+    client, db, _ = fixture
+    task(db)
+    assert assign(client).status_code == 200
+    response = client.get("/cockpit/head/coaching", params={"manager_net_uid": HEAD,
+        "manager_id": 2, "bucket": "workload"})
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["total"] == 1 and page["rows"][0]["manager_id"] == 2
+    assert [manager["id"] for manager in page["managers"]] == [1, 2]
+    board = client.get("/head/tasks", params={"manager_net_uid": HEAD, "manager_id": 2})
+    assert board.status_code == 200, board.text
+    assert board.json()["total"] == 1
+
+
+def test_new_manual_task_keeps_explicit_assignee_and_grants_active_context(fixture):
+    client, db, _ = fixture
+    response = client.post("/head/tasks/new", params={"manager_net_uid": HEAD},
+        json={"manager_id": 2, "client_id": 1, "title": "Delegated call"})
+    assert response.status_code == 200, response.text
+    row = db.tasks.find_one()
+    assert row["assignment_mode"] == "head_task_only" and row["manager_id"] == 2
+    assert task_delegation.contact_book(2, 1)[0]["delegated_task_context"]
+    db.tasks.update_one({"_id": row["_id"]}, {"$set": {"status": "done"}})
+    assert task_delegation.contact_book(2, 1) == []

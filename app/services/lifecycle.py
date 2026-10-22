@@ -333,6 +333,7 @@ def create_manual(task: Task, created_by: int) -> dict:
         "due_date": task.due_date,
         "ab_variant": None,
         "origin": "head",
+        "assignment_mode": "head_task_only",
         "created_by": created_by,
         "model_version": get_settings().model_version,
         "updated_at": now,

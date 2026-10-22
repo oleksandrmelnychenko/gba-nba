@@ -269,6 +269,27 @@ def all_managers() -> list[int]:
     return [int(r["mid"]) for r in rows]
 
 
+def task_manager_ids(active_assignee_ids: list[int]) -> list[int]:
+    """Task-only team: current book owners, active assignees and active sales analysts.
+
+    Deliberately separate from all_managers(), whose financial scope stays current client book.
+    """
+    assignees = sorted({int(value) for value in active_assignee_ids if int(value) > 0})
+    predicate, params = "", {}
+    if assignees:
+        placeholders, params = in_clause("assignee", assignees)
+        predicate = f" OR u.ID IN {placeholders}"
+    rows = query(f"""
+        SELECT u.ID AS id FROM dbo.[User] u
+        LEFT JOIN dbo.UserRole role ON role.ID=u.UserRoleID
+        WHERE u.Deleted=0 AND (role.UserRoleType=0
+          OR EXISTS (SELECT 1 FROM dbo.Client c WHERE c.MainManagerID=u.ID AND c.Deleted=0)
+          {predicate})
+        ORDER BY u.ID
+    """, params)
+    return [int(row["id"]) for row in rows]
+
+
 def clients_for_manager(manager_id: int) -> list[dict]:
     return query(
         """

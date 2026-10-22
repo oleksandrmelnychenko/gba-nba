@@ -12,11 +12,11 @@ def queue(manager_id: int | None, bucket: Bucket, status: str,
           date_from: date | None, date_to: date | None, offset: int, limit: int):
     now = datetime.now(UTC)
     day_start, _ = seller_contacts.day_bounds(now)
-    managers = signals_repository.all_managers()
+    managers = task_delegation.manager_ids()
     if manager_id is not None and manager_id not in managers:
         raise ValueError("manager_not_active")
     scope = [manager_id] if manager_id is not None else managers
-    names = signals_repository.manager_names(scope)
+    names = signals_repository.manager_names(managers)
     ph, params = signals_repository.in_clause("manager", scope) if scope else ("(NULL)", {})
     book = signals_repository.query(f"""
         SELECT c.ID AS client_id, c.MainManagerID AS manager_id,
@@ -82,5 +82,5 @@ def queue(manager_id: int | None, bucket: Bucket, status: str,
         "total": len(rows), "count": len(rows[offset:offset+limit]),
         "counts": {name: len(items) for name, items in groups.items()},
         "rows": rows[offset:offset+limit],
-        "managers": [{"id": mid, "name": names.get(mid, str(mid))} for mid in scope],
+        "managers": [{"id": mid, "name": names.get(mid, str(mid))} for mid in managers],
         "basis": "current_tasks_and_latest_client_contact", "task_status_applies_to": ["workload", "repeat_tasks"]})

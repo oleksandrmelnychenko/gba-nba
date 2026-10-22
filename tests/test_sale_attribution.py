@@ -95,6 +95,7 @@ def env(monkeypatch):
         "candidates",
         lambda cid, off, limit: ([deepcopy(facts[SALE])] if cid == 7 and off == 0 else [], 1),
     )
+    monkeypatch.setattr(main.signals_repository, "task_manager_ids", lambda ids: [1, 2])
     yield TestClient(main.app), db, facts, owner
     conn.drop_database(name)
     conn.close()

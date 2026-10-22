@@ -54,6 +54,8 @@ def client(monkeypatch):
     monkeypatch.setattr(main.signals_repository, "is_head_of_sales",
                         lambda nu: nu in _HEADS)
     monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
+    monkeypatch.setattr(main.signals_repository, "task_manager_ids",
+                        lambda ids: main.signals_repository.all_managers())
     monkeypatch.setattr(main.signals_repository, "manager_names",
                         lambda ids: {i: f"Manager {i}" for i in ids})
 

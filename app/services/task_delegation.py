@@ -38,7 +38,7 @@ class AssignmentConflict(ValueError):
 
 
 def assign(head_id: int, request: AssignmentRequest) -> dict:
-    if request.manager_id not in signals_repository.all_managers():
+    if request.manager_id not in manager_ids():
         raise ValueError("manager_not_active")
     now = datetime.now(UTC)
     now = now.replace(microsecond=(now.microsecond // 1000) * 1000)
@@ -59,6 +59,12 @@ def assign(head_id: int, request: AssignmentRequest) -> dict:
     if task is None:
         raise AssignmentConflict("task_changed_or_closed")
     return task
+
+
+def manager_ids() -> list[int]:
+    active = mongo.tasks().distinct("manager_id", {
+        "status": {"$in": ACTIVE}, "manager_id": {"$gt": 0}})
+    return signals_repository.task_manager_ids(active)
 
 
 def delegated_client_ids(manager_id: int) -> list[int]:

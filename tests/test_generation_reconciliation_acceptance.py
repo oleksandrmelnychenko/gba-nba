@@ -184,9 +184,11 @@ def test_payment_purchase_return_second_cycle_transfer_preserve_manual_backlog(s
 
     state["owner"] = 2
     transferred = generate(2)
-    assert transferred["reassigned"] == 9  # eight commitments plus remaining debt task
-    assert lifecycle.active_workload_counts(1)["active_total"] == 0
-    assert lifecycle.active_workload_counts(2) == {"ai_active": 1, "manual_backlog": 8, "active_total": 9}
+    assert transferred["reassigned"] == 3  # copied source commitments plus remaining AI debt task
+    # Explicit head-assigned tasks remain with their assignee when the client book moves.
+    assert lifecycle.active_workload_counts(1) == {"ai_active": 0, "manual_backlog": 6, "active_total": 6}
+    assert lifecycle.active_workload_counts(2) == {"ai_active": 1, "manual_backlog": 2, "active_total": 3}
+    assert database.tasks.count_documents({"manager_id": 1, "assignment_mode": "head_task_only"}) == 6
     assert (
         database.tasks.find_one({"task_key": copied["task_key"]})["notes"][0]["text"]
         == "Promise to call Friday"

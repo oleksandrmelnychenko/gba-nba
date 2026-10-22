@@ -39,6 +39,7 @@ def client(monkeypatch):
                         lambda ids: {i: _NAMES[i] for i in ids if i in _NAMES})
     monkeypatch.setattr(main.signals_repository, "contacts_for_clients",
                         lambda ids: {i: _CONTACTS[i] for i in ids if i in _CONTACTS})
+    monkeypatch.setattr(main.signals_repository, "task_manager_ids", lambda ids: [1, 2])
     return TestClient(main.app)
 
 

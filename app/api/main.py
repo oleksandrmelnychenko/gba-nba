@@ -1091,7 +1091,7 @@ def head_tasks(
             by_status=_empty_team_board_statuses(),
             managers=[],
         )
-    mids = signals_repository.all_managers()
+    mids = task_delegation.manager_ids()
     if manager_id is not None and manager_id not in mids:
         raise HTTPException(status_code=422, detail="manager_not_in_active_team_scope")
     mgr_filter = [manager_id] if manager_id is not None else mids
@@ -1139,7 +1139,7 @@ def head_dismissals(
         return {"is_head": False, "requested_manager_net_uid": requested_net_uid,
                 "window_days": window_days, "total_dismissed": 0,
                 "managers": [], "top_reasons": []}
-    mids = signals_repository.all_managers()
+    mids = task_delegation.manager_ids()
     if manager_id is not None and manager_id not in mids:
         raise HTTPException(status_code=422, detail="manager_not_in_active_team_scope")
     scope = [manager_id] if manager_id is not None else mids
@@ -1162,6 +1162,8 @@ def head_task_create(manager_net_uid: str, req: HeadTaskCreateRequest) -> dict:
     target_names = signals_repository.manager_names([req.manager_id])
     if req.manager_id not in target_names:
         raise HTTPException(status_code=404, detail="unknown_target_manager")
+    if req.manager_id not in task_delegation.manager_ids():
+        raise HTTPException(status_code=422, detail="manager_not_in_active_task_scope")
 
     client_id = 0
     client_name = None

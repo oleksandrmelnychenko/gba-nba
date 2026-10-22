@@ -300,6 +300,19 @@ def clients_for_manager(manager_id: int) -> list[dict]:
     )
 
 
+def contact_book_for_manager(manager_id: int, client_id: int | None = None) -> list[dict]:
+    """Current ownership/identity only: no order/debt aggregation on contact actions."""
+    return query(
+        """
+        SELECT c.ID AS client_id, c.FullName AS full_name, c.Name AS name,
+               LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid
+        FROM dbo.Client c
+        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+        """ + (" AND c.ID = :cid" if client_id is not None else ""),
+        {"mid": manager_id, "cid": client_id},
+    )
+
+
 def clients_overview_for_manager(manager_id: int, as_of: str, window_days: int = 365) -> list[dict]:
     """Manager's client book + light commercial stats for the cockpit «Мої клієнти» view: identity,
     contacts, NetUID (the console recommendation/agreement routes are NetUID-keyed), last order date,

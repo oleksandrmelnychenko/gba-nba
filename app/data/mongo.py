@@ -35,6 +35,10 @@ def tasks() -> Collection:
     return get_db()["tasks"]
 
 
+def seller_contact_events() -> Collection:
+    return get_db()["seller_contact_events"]
+
+
 def task_events() -> Collection:
     return get_db()["task_events"]
 
@@ -49,6 +53,15 @@ def generation_runs() -> Collection:
 
 def ensure_indexes() -> None:
     """Idempotent index creation — matches the access patterns in the master plan."""
+    # Durable contact history has no TTL and is not touched by AI lifecycle cleanup.
+    seller_contact_events().create_index(
+        [("manager_id", ASCENDING), ("client_id", ASCENDING), ("at", DESCENDING), ("sort_id", DESCENDING)],
+        name="ix_contact_client_history",
+    )
+    seller_contact_events().create_index(
+        [("manager_id", ASCENDING), ("at", DESCENDING), ("sort_id", DESCENDING)],
+        name="ix_contact_latest",
+    )
     t = tasks()
     t.create_index([("task_key", ASCENDING)], unique=True, name="uq_task_key")
     t.create_index([("manager_id", ASCENDING), ("status", ASCENDING), ("priority", DESCENDING)],

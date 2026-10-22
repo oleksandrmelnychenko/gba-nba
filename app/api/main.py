@@ -24,7 +24,8 @@ from app.core.money import cents, decimal_value
 from app.data import mongo, signals_repository
 from app.data.db import get_engine
 from app.domain.models import Contact, Explanation, Outcome, Task, TaskStatus, TaskType, Urgency
-from app.services import lifecycle
+from app.domain.seller_contacts import ContactBucket, ContactCreate
+from app.services import lifecycle, seller_contacts
 
 log = get_logger("api")
 settings = get_settings()
@@ -430,6 +431,55 @@ def cockpit_clients(manager_net_uid: str, as_of_date: date | None = None) -> dic
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("cockpit_clients_failed", manager_id=manager_id, error=str(exc))
         raise HTTPException(status_code=500, detail="cockpit_clients_failed") from exc
+
+
+def _owned_contact_client(manager_id: int, client_id: int) -> dict:
+    rows = signals_repository.contact_book_for_manager(manager_id, client_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="client_not_in_manager_book")
+    return rows[0]
+
+
+@app.get("/cockpit/contacts")
+def cockpit_contacts(
+    manager_net_uid: str,
+    bucket: ContactBucket = "all",
+    search: Annotated[str, Query(max_length=200)] = "",
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+) -> dict:
+    manager_id = _resolve_manager(manager_net_uid)
+    book = signals_repository.contact_book_for_manager(manager_id)
+    return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
+            **seller_contacts.queue(manager_id, [int(row["client_id"]) for row in book],
+                                    bucket, search.strip(), offset, limit)}
+
+
+@app.get("/cockpit/contacts/history")
+def cockpit_contacts_history(
+    manager_net_uid: str,
+    client_id: Annotated[int, Query(gt=0)],
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+) -> dict:
+    manager_id = _resolve_manager(manager_net_uid)
+    _owned_contact_client(manager_id, client_id)
+    return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
+            **seller_contacts.history(manager_id, client_id, offset, limit)}
+
+
+@app.post("/cockpit/contacts")
+def cockpit_contact_create(manager_net_uid: str, req: ContactCreate) -> dict:
+    manager_id = _resolve_manager(manager_net_uid)
+    client = _owned_contact_client(manager_id, req.client_id)
+    manager_name = signals_repository.manager_names([manager_id]).get(manager_id, str(manager_id))
+    try:
+        event = seller_contacts.create(manager_id, manager_name, client, req)
+    except seller_contacts.ContactConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid), "event": event}
 
 
 @app.post("/cockpit/status")

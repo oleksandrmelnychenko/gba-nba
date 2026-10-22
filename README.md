@@ -50,3 +50,30 @@ The dev database reconciliation is read-only:
 ```bash
 make integration
 ```
+
+## Seller contact history
+
+`GET/POST /cockpit/contacts` and `GET /cockpit/contacts/history` accept the existing
+internal `manager_net_uid` identity. Writes and history require the client's current,
+nondeleted `MainManagerID` to match that user; head roles do not bypass ownership.
+The queue also filters to this current client book. Previous managers' contact events
+remain stored, but are not exposed to the new manager by this version.
+
+Contact records use a separate `seller_contact_events` Mongo collection with **no TTL**.
+AI regeneration, expiry and task cleanup do not delete contacts or complete tasks.
+The queue selects the latest event per client in Mongo, filters/searches that set, and
+returns paged rows plus full bucket counts. Commitments come first in date order;
+unscheduled contacts follow. Today uses the Kyiv calendar, including DST boundaries.
+
+A write requires a nonzero `event_id` UUID and explicit nullable `next_contact_at` and
+`next_action` keys. Both must be present together or both null; an action cannot be blank.
+Timestamps require an explicit offset and are normalized to UTC milliseconds. A new
+commitment must be in the future. Retrying the same manager/event UUID and payload
+returns the original event even after its deadline; a different payload returns 409.
+The deterministic Mongo `_id` enforces this even if secondary index setup fails.
+The server records contact time and client/manager identity; callers cannot backdate it.
+
+`tests/test_seller_contacts.py` uses an isolated mongomock fixture by default. For real
+Mongo pipeline checks, set `TEST_CONTACTS_MONGO_URI` **only to a disposable test Mongo**:
+the tests drop `contacts_fixture_20261022.seller_contact_events` before and after each
+case. Never point this option at a shared or business database.

@@ -289,3 +289,87 @@ def test_unknown_manager_and_invalid_detail_scope(fixture):
     client, _, _ = fixture
     assert client.get("/cockpit/workday", params={"manager_net_uid": str(uuid4())}).status_code == 404
     assert details(client, scope="generated").status_code == 422
+
+
+def test_contact_proposal_next_kyiv_day_retry_and_transfer_journey(fixture, monkeypatch):
+    client, book, db = fixture
+    clock = datetime(2026, 10, 22, 6, tzinfo=UTC)  # 09:00 Kyiv
+    monkeypatch.setattr(workday, "_now", lambda: clock)
+    monkeypatch.setattr(seller_contacts, "_now", lambda: clock)
+
+    def post(body, uid=UID):
+        return client.post("/cockpit/contacts", params={"manager_net_uid": uid}, json=body)
+
+    first = {"event_id": str(uuid4()), "client_id": 1, "result": "reached", "note": "Уточнили потребу",
+             "next_contact_at": "2026-10-22T13:00:00+03:00", "next_action": "Підготувати пропозицію"}
+    assert post(first).status_code == 200
+    assert queue(client)["counts"]["today"] == 1
+    clock += timedelta(hours=4)
+    proposal = {"event_id": str(uuid4()), "client_id": 1, "result": "proposal",
+                "note": "Надіслали пропозицію; очікуємо рішення",
+                "next_contact_at": "2026-10-23T09:00:00+03:00", "next_action": "Уточнити рішення клієнта"}
+    accepted = post(proposal)
+    assert accepted.status_code == 200
+    original_event = accepted.json()["event"]
+    # Simulate a response lost after the durable insert: retry must return the original event.
+    assert post(proposal).json()["event"] == original_event
+    page = queue(client)
+    assert page["counts"]["upcoming"] == page["total"] == 1
+    assert page["rows"][0]["latest_contact"]["result"] == "proposal"
+    assert page["rows"][0]["task_count"] == 0
+    assert page["rows"][0]["due_at"] == "2026-10-23T06:00:00Z"
+    clock = datetime(2026, 10, 22, 21, tzinfo=UTC)  # exactly next Kyiv midnight
+    assert queue(client)["counts"]["today"] == 1
+    clock = datetime(2026, 10, 23, 21, tzinfo=UTC)  # following midnight, deadline is overdue
+    assert queue(client)["counts"]["overdue"] == 1
+    assert post(proposal).json()["event"] == original_event  # old deadline cannot invalidate replay
+    assert db.seller_contact_events.count_documents({}) == 2
+    book[1]["manager_id"] = 3
+    assert post(proposal).status_code == 404
+    assert queue(client)["total"] == 0
+    transferred = queue(client, uid=OTHER_UID)
+    assert transferred["rows"][0]["latest_contact"]["manager_id"] == 1
+    followup = {**proposal, "event_id": str(uuid4()), "result": "reached",
+                "next_contact_at": "2026-10-26T09:00:00+02:00", "next_action": "Повторний контакт"}
+    assert post(followup, OTHER_UID).status_code == 200
+    history = client.get("/cockpit/contacts/history",
+                         params={"manager_net_uid": OTHER_UID, "client_id": 1}).json()
+    assert history["total"] == 3
+    assert [event["manager_id"] for event in history["events"]] == [3, 1, 1]
+    assert history["events"][1] == original_event
+    assert queue(client, uid=OTHER_UID)["rows"][0]["latest_contact"]["manager_id"] == 3
+    assert db.tasks.count_documents({}) == 0
+
+
+def test_primary_task_is_independent_of_union_output_order(fixture, monkeypatch):
+    client, _, db = fixture
+    task(db, "z-ai", urgency="critical", ev_score=99999)
+    task(db, "a-manual", task_type="manual", urgency="low")
+    contact(db, due=NOW)
+    collection = db.tasks
+    aggregate = collection.aggregate
+
+    def shuffled_union(pipeline, **kwargs):
+        stages = list(pipeline)
+        union_index = next(index for index, stage in enumerate(stages) if "$unionWith" in stage)
+        # Force a legal but adversarial union order: contact first, then AI ahead of manual.
+        stages.insert(union_index + 1, {"$sort": {"_kind": -1, "task_key": -1}})
+        return aggregate(stages, **kwargs)
+
+    monkeypatch.setattr(collection, "aggregate", shuffled_union)
+    monkeypatch.setattr(mongo, "tasks", lambda: collection)
+    row = queue(client)["rows"][0]
+    assert row["primary_task"]["task_key"] == "a-manual"
+    assert row["latest_contact"] is not None and row["task_count"] == 2
+
+
+def test_missing_legacy_manual_client_id_normalized_without_read_write(fixture):
+    client, _, db = fixture
+    task(db, "legacy", task_type="manual", client_name="")
+    db.tasks.update_one({"task_key": "legacy"}, {"$unset": {"client_id": ""}})
+    row = queue(client)["rows"][0]
+    assert row["key"] == "task:legacy" and row["client_id"] is None
+    assert row["primary_task"]["client_id"] is None
+    page = details(client, "task:legacy").json()
+    assert page["tasks"][0]["client_id"] is None
+    assert "client_id" not in db.tasks.find_one({"task_key": "legacy"})

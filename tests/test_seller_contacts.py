@@ -130,9 +130,12 @@ def test_current_ownership_for_write_history_and_queue_no_head_bypass(fixture):
     assert post(client, body).status_code == 404  # replay also checks current ownership
     assert get_history(client).status_code == 404
     assert get_queue(client).json()["total"] == 0
-    assert get_history(client, uid=HEAD_UID).json()["events"] == []
+    transferred = get_history(client, uid=HEAD_UID).json()
+    assert transferred["manager_id"] == 3
+    assert transferred["events"][0]["manager_id"] == 1
+    assert transferred["total"] == 1
     assert post(client, payload(), HEAD_UID).status_code == 200
-    assert get_history(client, uid=HEAD_UID).json()["total"] == 1
+    assert get_history(client, uid=HEAD_UID).json()["total"] == 2
     del book[1]
     assert get_history(client, uid=HEAD_UID).status_code == 404
 

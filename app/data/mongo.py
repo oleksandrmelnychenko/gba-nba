@@ -62,6 +62,11 @@ def ensure_indexes() -> None:
         [("manager_id", ASCENDING), ("at", DESCENDING), ("sort_id", DESCENDING)],
         name="ix_contact_latest",
     )
+    # Current owner reads the complete client history, retaining original authors on transfer.
+    seller_contact_events().create_index(
+        [("client_id", ASCENDING), ("at", DESCENDING), ("sort_id", DESCENDING)],
+        name="ix_contact_client_timeline",
+    )
     t = tasks()
     t.create_index([("task_key", ASCENDING)], unique=True, name="uq_task_key")
     t.create_index([("manager_id", ASCENDING), ("status", ASCENDING), ("priority", DESCENDING)],

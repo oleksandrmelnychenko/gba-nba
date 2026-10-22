@@ -97,7 +97,7 @@ def queue(manager_id: int, client_ids: list[int], bucket: ContactBucket,
         "unscheduled": {"next_contact_at": None},
     }
     pipeline = [
-        {"$match": {"manager_id": manager_id, "client_id": {"$in": client_ids}}},
+        {"$match": {"client_id": {"$in": client_ids}}},
         {"$sort": {"at": -1, "sort_id": -1}},
         {"$group": {"_id": "$client_id", "event": {"$first": "$$ROOT"}}},
         {"$replaceRoot": {"newRoot": "$event"}},
@@ -123,7 +123,7 @@ def queue(manager_id: int, client_ids: list[int], bucket: ContactBucket,
 
 def history(manager_id: int, client_id: int, offset: int, limit: int) -> dict:
     result = next(iter(mongo.seller_contact_events().aggregate([
-        {"$match": {"manager_id": manager_id, "client_id": client_id}},
+        {"$match": {"client_id": client_id}},
         {"$facet": {
             "total": [{"$count": "value"}],
             "events": [{"$sort": {"at": -1, "sort_id": -1}}, {"$skip": offset}, {"$limit": limit}],

@@ -25,7 +25,7 @@ from app.data import mongo, signals_repository
 from app.data.db import get_engine
 from app.domain.models import Contact, Explanation, Outcome, Task, TaskStatus, TaskType, Urgency
 from app.domain.seller_contacts import ContactBucket, ContactCreate
-from app.services import lifecycle, seller_contacts
+from app.services import lifecycle, seller_contacts, workday
 
 log = get_logger("api")
 settings = get_settings()
@@ -438,6 +438,41 @@ def _owned_contact_client(manager_id: int, client_id: int) -> dict:
     if not rows:
         raise HTTPException(status_code=404, detail="client_not_in_manager_book")
     return rows[0]
+
+
+@app.get("/cockpit/workday")
+def cockpit_workday(
+    manager_net_uid: str,
+    bucket: workday.WorkdayBucket = "all",
+    search: Annotated[str, Query(max_length=200)] = "",
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+) -> dict:
+    manager_id = _resolve_manager(manager_net_uid)
+    book = signals_repository.contact_book_for_manager(manager_id)
+    manager_name = signals_repository.manager_names([manager_id]).get(manager_id, str(manager_id))
+    return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
+            **workday.queue(manager_id, manager_name, book, bucket, search.strip(), offset, limit)}
+
+
+@app.get("/cockpit/workday/tasks")
+def cockpit_workday_tasks(
+    manager_net_uid: str,
+    key: Annotated[str, Query(min_length=1, max_length=505, pattern=r"^(client:[1-9][0-9]*|task:.+)$")],
+    scope: workday.TaskScope = "active",
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 20,
+) -> dict:
+    if key.startswith("client:") and int(key.split(":", 1)[1]) > 2147483647:
+        raise HTTPException(status_code=422, detail="invalid_client_id")
+    manager_id = _resolve_manager(manager_net_uid)
+    book = signals_repository.contact_book_for_manager(manager_id)
+    try:
+        page = workday.task_page(manager_id, [int(row["client_id"]) for row in book],
+                                 key, scope, offset, limit)
+    except workday.WorkdayScopeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid), **page}
 
 
 @app.get("/cockpit/contacts")

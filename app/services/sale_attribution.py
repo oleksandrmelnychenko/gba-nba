@@ -1,6 +1,6 @@
 """Explicit exclusive sale links; immutable attribution, current documentary evidence."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -85,6 +85,22 @@ def link(manager_id, manager_name, task, req: LinkRequest):
         contact = contacts[0]
     now = datetime.now(UTC)
     now = now.replace(microsecond=now.microsecond // 1000 * 1000)
+    previous = task.get("updated_at")
+    if previous is not None:
+        previous = previous.replace(tzinfo=previous.tzinfo or UTC)
+        now = max(now, previous + timedelta(milliseconds=1))
+    # Linearize the ownership decision with assignment CAS. If assignment won while SQL
+    # was being read, reject. If this wins, a later assignment cannot rewrite this receipt.
+    accepted = mongo.tasks().update_one(
+        {"task_key": task["task_key"], "manager_id": manager_id,
+         "updated_at": task.get("updated_at"), "status": task["status"]},
+        {"$set": {"updated_at": now}})
+    if accepted.matched_count != 1:
+        # A concurrent identical link may already own the sale; retain exact retry semantics.
+        existing = collection().find_one({"_id": identity})
+        if existing is not None:
+            return replay(existing)
+        raise LinkConflict("task_changed_or_reassigned")
     row = {
         "_id": identity,
         **expected,

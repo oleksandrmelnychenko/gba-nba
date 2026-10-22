@@ -206,6 +206,10 @@ class TaskNotFoundError(TransitionError):
     pass
 
 
+class TaskConflictError(TransitionError):
+    pass
+
+
 def upsert_generated(task: Task) -> str:
     """Idempotent generation. If a task with this task_key already exists AND is still active,
     we refresh its computed fields (priority/payload/reason/contact/etc.) but PRESERVE the
@@ -339,16 +343,31 @@ def create_manual(task: Task, created_by: int) -> dict:
     return doc
 
 
+def _mutation_time(previous: datetime | None) -> datetime:
+    # Mongo persists milliseconds. Keep assignment CAS revisions strictly increasing even
+    # when two accepted user writes fall in the same millisecond or the clock steps back.
+    now = _now()
+    now = now.replace(microsecond=(now.microsecond // 1000) * 1000)
+    return max(now, _as_aware(previous) + timedelta(milliseconds=1)) if previous else now
+
+
 def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = None,
-                  outcome: Outcome | None = None, snooze_until: datetime | None = None) -> dict:
-    doc = mongo.tasks().find_one({"task_key": task_key})
+                  outcome: Outcome | None = None, snooze_until: datetime | None = None,
+                  *, expected_manager_id: int | None = None,
+                  expected_updated_at: datetime | None = None) -> dict:
+    selector = {"task_key": task_key}
+    if expected_manager_id is not None:
+        selector.update(manager_id=expected_manager_id, updated_at=expected_updated_at)
+    doc = mongo.tasks().find_one(selector)
     if not doc:
+        if expected_manager_id is not None:
+            raise TaskConflictError("task_changed_or_reassigned")
         raise TaskNotFoundError(f"task not found: {task_key}")
     current = TaskStatus(doc["status"])
     if to not in ALLOWED_TRANSITIONS.get(current, set()):
         raise TransitionError(f"illegal transition {current.value} -> {to.value}")
 
-    now = _now()
+    now = _mutation_time(doc.get("updated_at"))
     change = {"from": current.value, "to": to.value, "at": now, "by": by}
     if reason:
         change["reason"] = reason
@@ -376,10 +395,10 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
         update["$set"]["resolved_at"] = now
 
     updated = mongo.tasks().find_one_and_update(
-        {"task_key": task_key, "status": current.value}, update,
+        {**selector, "status": current.value, "updated_at": doc.get("updated_at")}, update,
         return_document=ReturnDocument.AFTER)
     if updated is None:
-        raise TransitionError(f"conflict: {task_key} changed underneath {current.value}")
+        raise TaskConflictError(f"conflict: {task_key} changed underneath {current.value}")
     _event(task_key, f"status:{to.value}", by=by, reason=reason)
 
     # DISMISS → mute (client, type) so regeneration doesn't re-spam (anti-spam rule)
@@ -388,16 +407,23 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
     return updated
 
 
-def add_note(task_key: str, author_id: int, text: str, author_name: str | None = None) -> dict:
-    now = _now()
+def add_note(task_key: str, author_id: int, text: str, author_name: str | None = None,
+             *, expected_manager_id: int | None = None,
+             expected_updated_at: datetime | None = None) -> dict:
+    now = _mutation_time(expected_updated_at)
     note = {"author_id": author_id, "text": text, "created_at": now}
     if author_name:
         note["author_name"] = author_name
+    selector = {"task_key": task_key}
+    if expected_manager_id is not None:
+        selector.update(manager_id=expected_manager_id, updated_at=expected_updated_at)
     updated = mongo.tasks().find_one_and_update(
-        {"task_key": task_key},
+        selector,
         {"$push": {"notes": note}, "$set": {"updated_at": now}},
         return_document=ReturnDocument.AFTER)
     if not updated:
+        if expected_manager_id is not None:
+            raise TaskConflictError("task_changed_or_reassigned")
         raise TaskNotFoundError(f"task not found: {task_key}")
     _event(task_key, "note", by=author_id, reason=text[:120])
     return updated

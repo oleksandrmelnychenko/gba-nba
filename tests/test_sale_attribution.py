@@ -241,3 +241,47 @@ def test_same_client_multiple_offers_do_not_create_implicit_attribution(env):
     assert candidate["total"] == 1 and db.explicit_sale_attributions.count_documents({}) == 0
     assert post(client).status_code == 200
     assert post(client, task="task-b").status_code == 409
+
+
+
+def test_assignment_during_source_read_rejects_old_owner_credit(env, monkeypatch):
+    from app.services import task_delegation
+    client, db, _, _ = env
+    stamp = datetime.now(UTC).replace(microsecond=0)
+    db.tasks.update_one({"task_key": "task-a"}, {"$set": {"updated_at": stamp}})
+    monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
+    original = service.source.facts
+    def facts_then_assign(ids):
+        result = original(ids)
+        task_delegation.assign(3, task_delegation.AssignmentRequest(task_key="task-a",
+            expected_manager_id=1, expected_updated_at=stamp, manager_id=2,
+            clarification="Continue with new manager"))
+        return result
+    monkeypatch.setattr(service.source, "facts", facts_then_assign)
+    response = post(client)
+    assert response.status_code == 409, response.text
+    assert db.explicit_sale_attributions.count_documents({}) == 0
+    assert db.tasks.find_one({"task_key": "task-a"})["manager_id"] == 2
+
+
+def test_link_linearized_before_assignment_keeps_original_credit_and_retry(env, monkeypatch):
+    from app.services import task_delegation
+    client, db, _, _ = env
+    monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
+    collection = db.explicit_sale_attributions
+    monkeypatch.setattr(service, "collection", lambda: collection)
+    original = collection.insert_one
+    def assign_before_insert(row):
+        accepted = db.tasks.find_one({"task_key": "task-a"})
+        task_delegation.assign(3, task_delegation.AssignmentRequest(task_key="task-a",
+            expected_manager_id=1, expected_updated_at=accepted["updated_at"], manager_id=2,
+            clarification="Continue after accepted link"))
+        return original(row)
+    monkeypatch.setattr(collection, "insert_one", assign_before_insert)
+    response = post(client)
+    assert response.status_code == 200, response.text
+    link = response.json()["link"]
+    assert link["manager_id"] == 1
+    assert db.tasks.find_one({"task_key": "task-a"})["manager_id"] == 2
+    assert post(client).json() == response.json()
+    assert db.explicit_sale_attributions.count_documents({}) == 1

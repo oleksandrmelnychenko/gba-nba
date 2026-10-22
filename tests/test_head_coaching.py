@@ -116,3 +116,82 @@ def test_status_filter_does_not_hide_contact_commitments(fixture):
     result = client.get("/cockpit/head/coaching", params={"manager_net_uid": HEAD, "status": "open", "bucket": "without_next_contact"}).json()
     assert result["counts"]["workload"] == 0
     assert result["total"] == 251
+
+
+@pytest.mark.parametrize("route,payload", [
+    ("status", {"to": "done"}), ("notes", {"text": "Old owner note"}),
+])
+def test_assignment_after_route_ownership_check_rejects_former_owner(fixture, monkeypatch, route, payload):
+    from app.services import lifecycle
+    client, db, _ = fixture
+    task(db, manager_id=2)
+    original = lifecycle.get_task
+    def read_then_assign(key):
+        snapshot = original(key)
+        task_delegation.assign(9, task_delegation.AssignmentRequest(
+            task_key=key, expected_manager_id=2, expected_updated_at=NOW,
+            manager_id=1, clarification="New assignee"))
+        return snapshot
+    monkeypatch.setattr(lifecycle, "get_task", read_then_assign)
+    response = client.post("/cockpit/"+route, params={"manager_net_uid": SELLER},
+                           json={"task_key": "one", **payload})
+    assert response.status_code == 409, response.text
+    row = db.tasks.find_one({"task_key": "one"})
+    assert row["manager_id"] == 1 and row["status"] == "open"
+    assert all(note["text"] != "Old owner note" for note in row.get("notes", []))
+    assert db.task_events.count_documents({}) == 0
+
+
+def test_assignment_between_lifecycle_read_and_status_write_is_cas_guarded(fixture, monkeypatch):
+    from app.domain.models import TaskStatus
+    from app.services import lifecycle
+    _, db, _ = fixture
+    task(db, manager_id=2)
+    collection = db.tasks
+    monkeypatch.setattr(mongo, "tasks", lambda: collection)
+    original = collection.find_one_and_update
+    def assign_before_write(selector, update, **kwargs):
+        if update.get("$set", {}).get("status") == "done":
+            task_delegation.assign(9, task_delegation.AssignmentRequest(
+                task_key="one", expected_manager_id=2, expected_updated_at=NOW,
+                manager_id=1, clarification="Concurrent assignment"))
+        return original(selector, update, **kwargs)
+    monkeypatch.setattr(collection, "find_one_and_update", assign_before_write)
+    with pytest.raises(lifecycle.TaskConflictError):
+        lifecycle.change_status("one", TaskStatus.DONE, 2,
+                                expected_manager_id=2, expected_updated_at=NOW)
+    assert db.tasks.find_one()["status"] == "open"
+    assert db.tasks.find_one()["manager_id"] == 1
+
+
+def test_head_override_and_assignment_clarification_are_visible_to_assignee(fixture):
+    client, db, _ = fixture
+    previous = {"author_id": 1, "text": "Original promise", "created_at": NOW}
+    task(db, notes=[previous])
+    assert assign(client).status_code == 200
+    result = client.get("/cockpit/workday/tasks", params={"manager_net_uid": SELLER,
+        "key": "client:1", "scope": "active"})
+    assert result.status_code == 200, result.text
+    row = result.json()["tasks"][0]
+    assert [note["text"] for note in row["notes"]] == [
+        "Original promise", "Призначення / уточнення: Call today"]
+    assert row["notes"][-1]["author_id"] == 9
+    assert row["notes"][-1]["author_name"] == "Manager 9"
+    # Authenticated head can still act on another manager's manual task.
+    assert client.post("/cockpit/notes", params={"manager_net_uid": HEAD},
+                       json={"task_key": "one", "text": "Head follow-up"}).status_code == 200
+    assert client.post("/cockpit/status", params={"manager_net_uid": HEAD},
+                       json={"task_key": "one", "to": "done"}).status_code == 200
+
+
+
+def test_scoped_notes_advance_revision_with_frozen_clock(fixture, monkeypatch):
+    from app.services import lifecycle
+    _, db, _ = fixture
+    task(db)
+    monkeypatch.setattr(lifecycle, "_now", lambda: NOW)
+    row = lifecycle.add_note("one", 1, "First", expected_manager_id=1, expected_updated_at=NOW)
+    assert row["updated_at"] == NOW + timedelta(milliseconds=1)
+    with pytest.raises(lifecycle.TaskConflictError):
+        lifecycle.add_note("one", 1, "Stale", expected_manager_id=1, expected_updated_at=NOW)
+    assert [entry["text"] for entry in db.tasks.find_one()["notes"]] == ["First"]

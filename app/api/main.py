@@ -561,10 +561,14 @@ def cockpit_status(manager_net_uid: str, req: CockpitStatusRequest) -> dict:
         outcome = Outcome(sold=bool(req.sold), amount=req.amount)
     try:
         doc = lifecycle.change_status(req.task_key, req.to, by=manager_id, reason=req.reason,
-                                      outcome=outcome, snooze_until=req.snooze_until)
+                                      outcome=outcome, snooze_until=req.snooze_until,
+                                      expected_manager_id=task["manager_id"],
+                                      expected_updated_at=task.get("updated_at"))
         doc["_id"] = str(doc["_id"])
         doc["manager_net_uid"] = canonical_net_uid
         return doc
+    except lifecycle.TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except lifecycle.TransitionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -581,7 +585,11 @@ def cockpit_notes(manager_net_uid: str, req: CockpitNoteRequest) -> dict:
         raise HTTPException(status_code=403, detail="forbidden")
     author_name = signals_repository.manager_names([manager_id]).get(manager_id)
     try:
-        doc = lifecycle.add_note(req.task_key, manager_id, req.text, author_name=author_name)
+        doc = lifecycle.add_note(req.task_key, manager_id, req.text, author_name=author_name,
+                                 expected_manager_id=task["manager_id"],
+                                 expected_updated_at=task.get("updated_at"))
+    except lifecycle.TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except lifecycle.TaskNotFoundError as exc:
         # Race with sweep_expired: the task passed the ownership check above but was
         # purged before the note landed — a 404, not a 500.

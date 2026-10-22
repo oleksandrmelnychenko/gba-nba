@@ -46,12 +46,15 @@ def assign(head_id: int, request: AssignmentRequest) -> dict:
     change = {"id": str(uuid4()), "from": request.expected_manager_id, "to": request.manager_id,
               "at": now, "by": head_id, "source": "head_task_only",
               "clarification": request.clarification}
+    note = {"author_id": head_id,
+            "author_name": signals_repository.manager_names([head_id]).get(head_id, str(head_id)),
+            "created_at": now, "text": "Призначення / уточнення: " + request.clarification}
     task = mongo.tasks().find_one_and_update(
         {"task_key": request.task_key, "manager_id": request.expected_manager_id,
          "updated_at": request.expected_updated_at, "status": {"$in": ACTIVE}},
         {"$set": {"manager_id": request.manager_id, "updated_at": now,
                   "assignment_mode": "head_task_only"},
-         "$push": {"assignment_history": change}},
+         "$push": {"assignment_history": change, "notes": note}},
         return_document=ReturnDocument.AFTER)
     if task is None:
         raise AssignmentConflict("task_changed_or_closed")

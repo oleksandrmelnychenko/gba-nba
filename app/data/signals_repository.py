@@ -416,7 +416,7 @@ _EUR_VALUE_CTE = """
         SELECT TOP(1) ID AS eur_id FROM dbo.Currency WHERE Deleted = 0 AND Code = 'EUR'
     ),
     rws AS (
-        SELECT {extra_select}c.ID AS client_id,
+        SELECT {extra_select}c.ID AS client_id, d.ID AS debt_id,
                CAST(CASE
                    WHEN ISNULL(a.CurrencyID, 2) = eur.eur_id THEN CAST(d.Total AS decimal(30,14))
                    WHEN er.rate IS NOT NULL THEN CAST(d.Total AS decimal(30,14)) / er.rate
@@ -493,6 +493,7 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, max_age_days: int = 3
         _EUR_VALUE_CTE.format(extra_select="", manager_filter="AND c.MainManagerID = :mid")
         + """
         SELECT client_id,
+               STRING_AGG(CAST(debt_id AS varchar(max)), ',') AS debt_ids,
                SUM(eur_value) AS overdue_amount,
                MAX(overdue_days) AS max_overdue_days,
                MAX(days_past_terms) AS max_days_past_terms,

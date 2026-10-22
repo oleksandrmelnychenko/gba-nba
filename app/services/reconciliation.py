@@ -31,7 +31,11 @@ def _products(task) -> list[str]:
 def _baseline(task, facts: dict) -> dict:
     kind = task["task_type"]
     if kind == TaskType.DEBT_FOLLOWUP:
-        return {"debts": {key: value for key, value in facts["debts"].items() if _positive(value)}}
+        # Identity must be the exact actionable documents behind this advice. An unrelated
+        # not-yet-due or aged-out balance must not keep a paid collection call alive.
+        ids = {str(value) for value in task.get("payload", {}).get("debt", {}).get("debt_ids", [])}
+        return {"debts": {key: value for key, value in facts["debts"].items()
+                          if key in ids and _positive(value)}}
     ids = _products(task)
     return {"orders": {key: value for key, value in facts["orders"].items() if not ids or key in ids},
             "returns": {key: value for key, value in facts.get("returns", {}).items()
@@ -51,7 +55,13 @@ def _cycle(kind: str, baseline: dict) -> str | None:
 
 def _newer(current: dict, prior: dict | None, since) -> bool:
     if prior:
-        return (current["purchased_at"], current["order_id"]) > (prior["purchased_at"], prior["order_id"])
+        if current["order_id"] == prior["order_id"]:
+            return False  # corrected document dates are not a second purchase
+        current_day = date.fromisoformat(current["purchased_at"][:10])
+        prior_day = date.fromisoformat(prior["purchased_at"][:10])
+        # No durable per-row timezone provenance exists for this mixed imported/native
+        # source. Same-day timestamp ordering cannot safely prove a later purchase.
+        return current_day > prior_day
     if since is None:
         return False
     if isinstance(since, str):
@@ -168,13 +178,18 @@ def prepare(manager_id: int, candidates: list, as_of: str) -> tuple[list, dict]:
         if source["manager_id"] != task["manager_id"]:
             owner = source["manager_id"]
             result = mongo.tasks().update_one(
-                {"_id": task["_id"], "manager_id": task["manager_id"], "status": task["status"]},
+                {"_id": task["_id"], "manager_id": task["manager_id"], "status": task["status"],
+                 "updated_at": task.get("updated_at")},
                 {"$set": {"manager_id": owner, "updated_at": now},
                  "$push": {"assignment_history": {"from": task["manager_id"], "to": owner,
                                                     "at": now, "source": "Client.MainManagerID"}}})
             if result.modified_count:
                 task.update(manager_id=owner, updated_at=now)
                 stats["reassigned"] += 1
+            else:
+                # A seller changed this task after our read. Never resolve/copy its stale
+                # commitment; retry from a fresh snapshot on the next generation.
+                continue
         if task["task_type"] == TaskType.MANUAL:
             continue
         evidence = _resolution(task, source)
@@ -217,6 +232,14 @@ def prepare(manager_id: int, candidates: list, as_of: str) -> tuple[list, dict]:
                 continue
             candidate.task_key = previous["task_key"]
             candidate.source_baseline = previous.get("source_baseline") or {}
+            if source:
+                # A refreshed suggestion may add products/documents. Capture their current
+                # facts now; purchases predating this addition cannot resolve new advice.
+                fresh = _baseline(candidate.model_dump(), source)
+                candidate.source_baseline = {
+                    name: {**values, **candidate.source_baseline.get(name, {})}
+                    for name, values in fresh.items()
+                }
         elif source:
             candidate.source_baseline = _baseline(candidate.model_dump(), source)
             cycle = _cycle(candidate.task_type, candidate.source_baseline)

@@ -33,3 +33,23 @@ after interrupted follow-up copying. A disposable SQL Server database exercised 
 it was removed afterward. No DEV/QA business rows were modified.
 
 Evidence: /private/dashboard-reconcile-1416-20261022/{tests.log,sql-acceptance.log,sql_acceptance.py}.
+
+
+### Independent review evidence (2026-10-22)
+
+- Current DEV sales since 2025 contain 227,531 valid imported sale lines with all three
+  Sale/Order/OrderItem deletion flags false, plus 49 imported lines in another order status.
+  Four deleted valid lines belong to native sales. The stale calibration claim that imported
+  lines are mostly deleted does not describe the current database. Deletion predicates remain.
+- Collection advice carries the exact debt IDs returned by its existing overdue/window filter.
+  Other client balances do not enter that advice's baseline. Legacy advice without document IDs
+  remains unverified until an identified candidate supplies them. Read-only execution verified
+  140 distinct advised debt IDs across 40 clients for one current manager.
+- Refreshes capture facts for newly suggested products/debts; prior purchases cannot retroactively
+  settle newly added suggestions. Old document identities remain until explicitly settled.
+- Changing an existing order's date is not another purchase. Mixed imported/native timestamps
+  have no durable per-row clock provenance, so same-day ordering is deliberately unverified.
+  This may defer same-day resolution; it never invents UTC timestamps. Same-day cycle support
+  requires authoritative source timestamp provenance and remains open.
+- Reassignment uses an updated-at compare-and-swap; a concurrent seller edit defers reconciliation.
+  Stale generation cannot move an already transferred task back to the previous owner.

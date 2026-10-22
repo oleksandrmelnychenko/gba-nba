@@ -21,7 +21,7 @@ def db(monkeypatch):
 
 def task(key="old", kind=TaskType.REORDER_DUE, manager=1):
     return Task(task_key=key, client_id=10, manager_id=manager, task_type=kind, title="Call", reason="Due",
-                payload={"products": [{"product_id": 7, "elapsed_days": 15}]},
+                payload={"products": [{"product_id": 7, "elapsed_days": 15}], "debt": {"debt_ids": [501]}},
                 due_date=datetime.now(UTC) + timedelta(days=2))
 
 
@@ -240,3 +240,102 @@ def test_legacy_purchase_dates_are_conservative_and_public_evidence_is_date_only
     _, stats = reconciliation.prepare(1, [], "2026-10-23")
     evidence = db.tasks.find_one({"task_key": "legacy"})["source_evidence"]["orders"]["7"]
     assert evidence == {"order_id": 102, "purchased_on": "2026-10-23", "date_basis": "source_document_date"}
+
+
+def test_unrelated_debt_does_not_block_settlement_of_advised_documents(db, monkeypatch):
+    source = facts(monkeypatch, debts={"501": "50", "502": "200"})
+    rows, _ = persist(task(kind=TaskType.DEBT_FOLLOWUP))
+    assert rows[0].source_baseline == {"debts": {"501": "50"}}
+    source[10]["debts"]["501"] = "0"
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 1
+    assert db.tasks.find_one({"task_key": rows[0].task_key})["source_evidence"]["debts"] == {"501": "0"}
+
+
+def test_legacy_debt_without_identified_documents_stays_unknown(db, monkeypatch):
+    source = facts(monkeypatch, debts={"501": "50"})
+    legacy = task(kind=TaskType.DEBT_FOLLOWUP)
+    legacy.payload.pop("debt")
+    rows, _ = persist(legacy)
+    source[10]["debts"]["501"] = "0"
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 0
+    assert db.tasks.find_one({"task_key": rows[0].task_key})["status"] == "open"
+
+
+def test_document_date_correction_is_not_new_purchase():
+    assert not reconciliation._newer(order(100, "2026-10-20T12:00:00"), order(100), None)
+
+
+def test_mixed_source_same_day_times_cannot_prove_later_purchase():
+    # Imported 12:00 Kyiv actually precedes native 10:00 UTC, despite lexical ordering.
+    assert not reconciliation._newer(order(101, "2026-10-01T12:00:00"), order(100, "2026-10-01T10:00:00"), None)
+
+
+def test_reassignment_does_not_erase_concurrent_commitment_before_resolution(db, monkeypatch):
+    source = facts(monkeypatch, debts={"501": "50"})
+    rows, _ = persist(task(kind=TaskType.DEBT_FOLLOWUP))
+    key = rows[0].task_key
+    lifecycle.change_status(key, TaskStatus.IN_PROGRESS, by=1)
+    source[10]["manager_id"] = 2
+    source[10]["debts"]["501"] = "0"
+    original = db.tasks.update_one
+    deadline = datetime.now(UTC) + timedelta(days=10)
+    def racing_update(query, update, *args, **kwargs):
+        if "assignment_history" in update.get("$push", {}):
+            original({"task_key": key}, {"$set": {"due_date": deadline, "updated_at": datetime.now(UTC) + timedelta(seconds=2)}})
+        return original(query, update, *args, **kwargs)
+    monkeypatch.setattr(db.tasks, "update_one", racing_update)
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 0 and stats["reassigned"] == 0
+    assert db.tasks.find_one({"task_key": key})["due_date"].date() == deadline.date()
+    assert db.tasks.count_documents({"origin": "seller_commitment"}) == 0
+
+
+def test_refreshed_debt_advice_tracks_new_document_in_same_active_task(db, monkeypatch):
+    source = facts(monkeypatch, debts={"501": "50", "502": "200"})
+    first, _ = persist(task(kind=TaskType.DEBT_FOLLOWUP))
+    expanded = task(kind=TaskType.DEBT_FOLLOWUP)
+    expanded.payload["debt"]["debt_ids"] = [501, 502]
+    second, _ = persist(expanded)
+    assert first[0].task_key == second[0].task_key
+    source[10]["debts"]["501"] = "0"
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 0
+    source[10]["debts"]["502"] = "0"
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 1
+
+
+def test_refresh_adds_baseline_for_new_product_without_retroactive_resolution(db, monkeypatch):
+    facts(monkeypatch, orders={"7": order(), "8": order(200, "2026-10-15T12:00:00")})
+    rows, _ = persist(task())
+    key = rows[0].task_key
+    db.tasks.update_one({"task_key": key}, {"$set": {"generated_at": datetime(2026, 10, 2, tzinfo=UTC)}})
+    fresh = task()
+    fresh.payload["products"] = [{"product_id": 8, "elapsed_days": 1}]
+    persist(fresh)
+    _, stats = reconciliation.prepare(1, [], "2026-10-17")
+    assert stats["superseded"] == 0
+    assert db.tasks.find_one({"task_key": key})["source_baseline"]["orders"]["8"]["order_id"] == 200
+
+
+def test_stale_generator_cannot_reassign_transferred_task_back(db, monkeypatch):
+    source = facts(monkeypatch, orders={"7": order()})
+    old, _ = persist(task())
+    stale_candidate = old[0]
+    source[10]["manager_id"] = 2
+    reconciliation.prepare(1, [], "2026-10-17")
+    lifecycle.upsert_generated(stale_candidate)
+    assert db.tasks.find_one({"task_key": stale_candidate.task_key})["manager_id"] == 2
+
+
+def test_debt_generator_preserves_exact_document_ids(monkeypatch):
+    from app.services.generators import debt_followup
+    monkeypatch.setattr(debt_followup.sig, "overdue_debts_for_manager", lambda *a, **kw: [{
+        "client_id": 10, "debt_ids": "501,503", "max_days_past_terms": 2,
+        "max_overdue_days": 12, "overdue_amount": 70, "debt_lines": 2}])
+    monkeypatch.setattr(debt_followup.sig, "contacts_for_clients", lambda ids: {})
+    monkeypatch.setattr(debt_followup.sig, "client_features", lambda ids, asof: {})
+    generated = debt_followup.generate(1, "2026-10-17", "2026-10")
+    assert generated[0].payload["debt"]["debt_ids"] == [501, 503]

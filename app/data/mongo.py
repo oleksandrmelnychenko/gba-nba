@@ -67,6 +67,10 @@ def ensure_indexes() -> None:
         [("client_id", ASCENDING), ("at", DESCENDING), ("sort_id", DESCENDING)],
         name="ix_contact_client_timeline",
     )
+    get_db()["explicit_sale_attributions"].create_index(
+        [("manager_id", ASCENDING), ("linked_at", DESCENDING)], name="ix_attribution_owner")
+    get_db()["explicit_sale_attributions"].create_index(
+        [("task_key", ASCENDING), ("linked_at", DESCENDING)], name="ix_attribution_task")
     t = tasks()
     t.create_index([("task_key", ASCENDING)], unique=True, name="uq_task_key")
     t.create_index([("manager_id", ASCENDING), ("status", ASCENDING), ("priority", DESCENDING)],

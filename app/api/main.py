@@ -1230,3 +1230,7 @@ def head_escalated(
         "count": len(items),
         "tasks": items,
     }
+
+
+from app.api.sale_attribution import router as sale_attribution_router
+app.include_router(sale_attribution_router)

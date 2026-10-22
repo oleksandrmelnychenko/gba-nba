@@ -78,3 +78,30 @@ def test_snoozed_manual_assignment_never_gets_expiry(task_store):
     assert lifecycle.wake_snoozed() == 1
     assert lifecycle.sweep_expired() == 0
     assert db.tasks.count_documents({"task_key": "manual"}) == 1
+
+
+@pytest.mark.parametrize("had_deadline", [False, True])
+def test_interleaved_refresh_never_overwrites_a_concurrently_assigned_deadline(
+    task_store, monkeypatch, had_deadline,
+):
+    db, clock = task_store
+    initial = clock[0] + timedelta(days=1) if had_deadline else None
+    lifecycle.upsert_generated(suggestion("reorder", initial))
+    winning_deadline = clock[0] + timedelta(days=2)
+    stale_refresh_deadline = clock[0] + timedelta(days=7)
+    original_find_one = db.tasks.find_one
+    interleaved = False
+
+    def interleave_after_read(*args, **kwargs):
+        nonlocal interleaved
+        snapshot = original_find_one(*args, **kwargs)
+        if not interleaved:
+            interleaved = True
+            # A second actor establishes/updates the commitment after B's stale read.
+            db.tasks.update_one({"task_key": "reorder"}, {"$set": {"due_date": winning_deadline}})
+        return snapshot
+
+    monkeypatch.setattr(db.tasks, "find_one", interleave_after_read)
+    lifecycle.upsert_generated(suggestion("reorder", stale_refresh_deadline))
+    assert interleaved
+    assert original_find_one({"task_key": "reorder"})["due_date"] == winning_deadline

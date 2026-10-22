@@ -242,9 +242,15 @@ def upsert_generated(task: Task) -> str:
     }
 
     if existing:
-        # A regenerated signal does not postpone the seller's existing commitment.
-        if existing.get("due_date") is not None:
-            computed["due_date"] = existing["due_date"]
+        # Never write a deadline read before a concurrent refresh or seller update.
+        # Fill a missing deadline atomically so only the first refresh establishes it.
+        due_date = computed.pop("due_date", None)
+        if due_date is not None:
+            mongo.tasks().update_one(
+                {"task_key": task.task_key, "due_date": None,
+                 "status": {"$in": [status.value for status in ACTIVE]}},
+                {"$set": {"due_date": due_date}},
+            )
         # refresh computed fields only; keep status/notes/history/snooze/outcome
         mongo.tasks().update_one({"task_key": task.task_key}, {"$set": computed})
         _event(task.task_key, "refresh", by="system")

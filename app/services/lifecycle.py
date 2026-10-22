@@ -250,15 +250,16 @@ def upsert_generated(task: Task) -> str:
         due_date = computed.pop("due_date", None)
         if due_date is not None:
             mongo.tasks().update_one(
-                {"task_key": task.task_key, "due_date": None,
+                {"task_key": task.task_key, "manager_id": task.manager_id, "due_date": None,
                  "status": {"$in": [status.value for status in ACTIVE]}},
                 {"$set": {"due_date": due_date}},
             )
         # refresh computed fields only; keep status/notes/history/snooze/outcome
-        mongo.tasks().update_one(
+        refreshed = mongo.tasks().update_one(
             {"task_key": task.task_key, "manager_id": task.manager_id,
              "status": {"$in": [status.value for status in ACTIVE]}}, {"$set": computed})
-        _event(task.task_key, "refresh", by="system")
+        if refreshed.matched_count:
+            _event(task.task_key, "refresh", by="system")
     else:
         doc = {
             "task_key": task.task_key,
@@ -280,10 +281,11 @@ def upsert_generated(task: Task) -> str:
             # scheduler): the other writer won the insert — fall through to the refresh
             # path instead of 500ing the whole generate run.
             computed.pop("due_date", None)  # retain the winning insert's commitment
-            mongo.tasks().update_one(
+            refreshed = mongo.tasks().update_one(
                 {"task_key": task.task_key, "manager_id": task.manager_id,
                  "status": {"$in": [status.value for status in ACTIVE]}}, {"$set": computed})
-            _event(task.task_key, "refresh", by="system")
+            if refreshed.matched_count:
+                _event(task.task_key, "refresh", by="system")
 
             return task.task_key
         _event(task.task_key, "generated", by="system")

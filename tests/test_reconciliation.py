@@ -326,8 +326,13 @@ def test_stale_generator_cannot_reassign_transferred_task_back(db, monkeypatch):
     stale_candidate = old[0]
     source[10]["manager_id"] = 2
     reconciliation.prepare(1, [], "2026-10-17")
+    db.tasks.update_one({"task_key": stale_candidate.task_key}, {"$unset": {"due_date": ""}})
+    events_before = db.events.count_documents({})
     lifecycle.upsert_generated(stale_candidate)
-    assert db.tasks.find_one({"task_key": stale_candidate.task_key})["manager_id"] == 2
+    actual = db.tasks.find_one({"task_key": stale_candidate.task_key})
+    assert actual["manager_id"] == 2
+    assert actual.get("due_date") is None
+    assert db.events.count_documents({}) == events_before
 
 
 def test_debt_generator_preserves_exact_document_ids(monkeypatch):

@@ -635,6 +635,8 @@ _debt_dash_state: dict = {
 
 _EMPTY_DEBT_DASH = {
     "value_at_risk_eur": 0.0,
+    "debt_unknown_date_count": 0,
+    "debt_unknown_date_eur": 0.0,
     "debt_unknown_terms_count": 0,
     "debt_unknown_terms_eur": 0.0,
     "debt_aging": [
@@ -709,6 +711,8 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
         "urgency_mix": counts["urgency_mix"],
         "value_at_risk_eur": debt["value_at_risk_eur"],
         "debt_aging": debt["debt_aging"],
+        "debt_unknown_date_count": debt.get("debt_unknown_date_count", 0),
+        "debt_unknown_date_eur": debt.get("debt_unknown_date_eur", 0.0),
         "debt_unknown_terms_count": debt.get("debt_unknown_terms_count", 0),
         "debt_unknown_terms_eur": debt.get("debt_unknown_terms_eur", 0.0),
         "completed_vs_open": counts["completed_vs_open"],
@@ -739,6 +743,8 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
                       "open_tasks": lifecycle.active_count(mid),
                       "critical": lifecycle.critical_active_count(mid),
                       "value_at_risk_eur": var,
+                      "debt_unknown_date_count": debt_by_manager.get(mid, {}).get("debt_unknown_date_count", 0),
+                      "debt_unknown_date_eur": debt_by_manager.get(mid, {}).get("debt_unknown_date_eur", 0.0),
                       "debt_unknown_terms_count": debt_by_manager.get(mid, {}).get("debt_unknown_terms_count", 0),
                       "debt_unknown_terms_eur": debt_by_manager.get(mid, {}).get("debt_unknown_terms_eur", 0.0)})
     return {"is_head": True, "requested_manager_net_uid": requested_net_uid,

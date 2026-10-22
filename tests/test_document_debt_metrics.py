@@ -7,7 +7,7 @@ from app.data.debt_snapshot import fold_documents
 
 
 def debt(key, amount, created, terms=30):
-    return {'debt_id': key, 'amount_eur': amount, 'obligation_at': datetime.fromisoformat(created), 'term_days': terms}
+    return {'debt_id': key, 'amount_eur': amount, 'obligation_at': datetime.fromisoformat(created), 'term_days': terms, 'obligation_date_basis': 'native_utc'}
 
 
 def test_each_document_uses_days_past_terms_instead_of_client_oldest_age():
@@ -67,3 +67,36 @@ def test_failed_refresh_never_returns_expired_same_day_financial_cache(monkeypat
         request = main._team_snapshot_cached
     with pytest.raises(ValueError, match='source unavailable'):
         request('2026-10-22', allow_stale=True)
+
+
+def test_imported_timestamp_requires_lineage_provenance():
+    row = debt(1, 100, '2026-10-21T21:30:00', 0)
+    row['obligation_date_basis'] = None
+    result = fold_documents([row], '2026-10-22')
+    assert result['value_at_risk_eur'] == 0
+    assert result['debt_unknown_date_count'] == 1
+    assert result['debt_unknown_date_eur'] == 100
+    row['obligation_date_basis'] = 'imported_lineage_utc'
+    assert fold_documents([row], '2026-10-22')['value_at_risk_eur'] == 0
+
+
+
+def test_unknown_dates_are_separate_from_unknown_terms_and_known_aging():
+    ambiguous = debt(1, 100, '2026-10-01T21:30:00', None)
+    ambiguous['obligation_date_basis'] = None
+    result = fold_documents([ambiguous, debt(2, 50, '2026-10-01T10:00:00', None),
+        debt(3, 20, '2026-10-01T10:00:00', 0)], '2026-10-22')
+    assert result['value_at_risk_eur'] == 20
+    assert result['debt_unknown_terms_count'] == 1
+    assert result['debt_unknown_terms_eur'] == 50
+    assert result['debt_unknown_date_count'] == 1
+    assert result['debt_unknown_date_eur'] == 100
+
+
+def test_verified_future_business_day_is_excluded_but_ambiguous_clock_is_visible():
+    future = debt(1, 100, '2026-10-22T22:00:00', 0)
+    ambiguous = {**future, 'debt_id': 2, 'obligation_date_basis': None}
+    result = fold_documents([future, ambiguous], '2026-10-22')
+    assert result['value_at_risk_eur'] == 0
+    assert result['debt_unknown_date_count'] == 1
+    assert result['debt_unknown_date_eur'] == 100

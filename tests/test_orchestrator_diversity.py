@@ -271,11 +271,12 @@ def test_critical_debt_reserve_is_total_active_allowance_not_per_run(mongo_db, m
     assert first["skipped_capped"] >= 0
     assert second["persisted"] == 0
     assert second["crit_debt_reserved"] == 0
-    assert second["skipped_capped"] == 10
+    assert second["skipped_capped"] == 5
+    assert second["refreshed"] == 5  # same need remains one task across the month boundary
     assert mongo_db["tasks"].count_documents({"manager_id": 1, "status": "open"}) == 5
 
 
-def test_reserve_never_decrements_an_uncounted_capacity_skip(monkeypatch):
+def test_reserve_never_decrements_an_uncounted_capacity_skip(monkeypatch, mongo_db):
     """A task can disappear between the standard pass and reserve pass (concurrent expiry sweep).
 
     It was refreshed, not counted as capacity-skipped, so reserve admission must not subtract one

@@ -16,7 +16,7 @@ from app.core import history
 from app.core.config import get_settings, require_generation_enabled
 from app.core.logging import get_logger
 from app.domain.models import TaskType, Urgency
-from app.services import lifecycle
+from app.services import lifecycle, reconciliation
 from app.services.generators import (
     churn_winback,
     cross_sell,
@@ -169,6 +169,8 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
             generators_failed += 1
             log.warning("generator_failed", generator=gen.__name__, manager_id=manager_id, error=str(exc))
 
+    candidates, reconciliation_stats = reconciliation.prepare(manager_id, candidates, as_of)
+
     # pace coupling: behind monthly target -> lift revenue (shipped) / debt (paid) task priority.
     # Graceful: if targets/DB are unavailable, generation proceeds without the boost.
     try:
@@ -282,6 +284,6 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
              "generators_total": len(_GENERATORS), "generators_failed": generators_failed,
              "by_type": {tt.value: n for tt, n in per_type.items()},
-             **coverage.metadata(), **counters}
+             **coverage.metadata(), **counters, **reconciliation_stats}
     log.info("generation_done", **stats)
     return stats

@@ -13,7 +13,7 @@ from app.services import lifecycle, seller_contacts
 WorkdayBucket = Literal["all", "overdue", "today", "in_progress", "upcoming", "unscheduled"]
 TaskScope = Literal["active", "history"]
 ACTIVE = ["open", "in_progress", "snoozed"]
-HISTORY = ["done", "dismissed", "orphaned"]
+HISTORY = ["done", "dismissed", "orphaned", "superseded"]
 BUCKETS = ["overdue", "today", "in_progress", "upcoming", "unscheduled"]
 NO_DUE = datetime(9999, 1, 1, tzinfo=UTC)
 

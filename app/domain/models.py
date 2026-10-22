@@ -25,6 +25,7 @@ class TaskStatus(StrEnum):
     DONE = "done"
     SNOOZED = "snoozed"
     DISMISSED = "dismissed"
+    SUPERSEDED = "superseded"  # confirmed source evidence; system-only
     ORPHANED = "orphaned"       # system-only: client row vanished from dbo.Client (re-mint/wipe)
 
 
@@ -43,10 +44,11 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.SNOOZED: {TaskStatus.OPEN, TaskStatus.DISMISSED},
     TaskStatus.DONE: set(),         # terminal
     TaskStatus.DISMISSED: set(),    # terminal
+    TaskStatus.SUPERSEDED: set(),
     TaskStatus.ORPHANED: set(),     # terminal; entered only by the system sweep, never via the API
 }
 
-TERMINAL = {TaskStatus.DONE, TaskStatus.DISMISSED, TaskStatus.ORPHANED}
+TERMINAL = {TaskStatus.DONE, TaskStatus.DISMISSED, TaskStatus.ORPHANED, TaskStatus.SUPERSEDED}
 ACTIVE = {TaskStatus.GENERATED, TaskStatus.OPEN, TaskStatus.IN_PROGRESS, TaskStatus.SNOOZED}
 
 
@@ -114,6 +116,7 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.GENERATED
     payload: dict = Field(default_factory=dict)
     signals: dict = Field(default_factory=dict)
+    source_baseline: dict = Field(default_factory=dict)
     explanation: Explanation = Field(default_factory=Explanation)
     contact: Contact = Field(default_factory=Contact)
     due_date: datetime | None = None

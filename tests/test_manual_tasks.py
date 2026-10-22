@@ -163,17 +163,17 @@ def test_sweep_expired_never_deletes_manual(client):
     assert lifecycle.get_task(ai_key) is None
 
 
-def test_sweep_orphaned_skips_manual(client, monkeypatch):
+def test_missing_clients_during_sync_preserve_ai_and_manual(client, monkeypatch):
     from app.data import signals_repository
     from app.services import lifecycle
     _create_manual(client, client_id=None)          # client_id=0 — no dbo.Client row by design
     ai_key = _seed_ai(1, "mgr:1|client:55|type:debt_followup|win:2026-06", client_id=55)
     monkeypatch.setattr(signals_repository, "existing_client_ids", lambda ids: set())
     orphaned = lifecycle.sweep_orphaned()
-    assert orphaned == 1
-    assert lifecycle.get_task(ai_key)["status"] == "orphaned"
+    assert orphaned == 0
+    assert lifecycle.get_task(ai_key)["status"] == "open"
     inbox = lifecycle.inbox(1)
-    assert [t["task_type"] for t in inbox] == ["manual"]
+    assert {t["task_type"] for t in inbox} == {"manual", "debt_followup"}
 
 
 def test_head_clients_gate_and_listing(client, monkeypatch):

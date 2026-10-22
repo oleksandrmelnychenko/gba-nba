@@ -234,6 +234,7 @@ def upsert_generated(task: Task) -> str:
         "urgency": task.urgency.value,
         "payload": task.payload,
         "signals": task.signals,
+        "source_baseline": task.source_baseline,
         "explanation": task.explanation.model_dump(),
         "contact": task.contact.model_dump(),
         "due_date": task.due_date,
@@ -316,6 +317,7 @@ def create_manual(task: Task, created_by: int) -> dict:
         "urgency": task.urgency.value,
         "payload": task.payload,
         "signals": task.signals,
+        "source_baseline": task.source_baseline,
         "explanation": task.explanation.model_dump(),
         "contact": task.contact.model_dump(),
         "due_date": task.due_date,
@@ -482,42 +484,12 @@ def sweep_expired() -> int:
 
 
 def sweep_orphaned() -> int:
-    """Terminal-close active tasks whose client_id no longer exists as a row in dbo.Client
-    (dev re-mint / data wipe): status -> ORPHANED with a reason, documents KEPT for audit (never
-    deleted). System-only transition — not reachable via the status API (no inbound edge in
-    ALLOWED_TRANSITIONS), applied directly like the other sweeps. Returns the number closed."""
-    from app.data import signals_repository
-    active_values = list(s.value for s in ACTIVE)
-    # Manual (head-assigned) tasks are exempt: they may legitimately carry client_id=0 (no client)
-    # and a head's direct order must not be closed by a data-wipe heuristic.
-    not_manual = {"task_type": {"$ne": TaskType.MANUAL.value}}
-    cids = [c for c in mongo.tasks().distinct(
-                "client_id", {"status": {"$in": active_values}, **not_manual})
-            if c is not None]
-    if not cids:
-        return 0
-    dead = sorted(set(cids) - signals_repository.existing_client_ids(cids))
-    if not dead:
-        return 0
-    now = _now()
-    reason = "client_id absent from dbo.Client (orphaned by data wipe/re-mint)"
-    orphaned = 0
-    cursor = mongo.tasks().find(
-        {"status": {"$in": active_values}, "client_id": {"$in": dead}, **not_manual},
-        {"task_key": 1, "status": 1, "client_id": 1})
-    for doc in cursor:
-        res = mongo.tasks().update_one(
-            {"_id": doc["_id"], "status": doc["status"]},
-            {"$set": {"status": TaskStatus.ORPHANED.value, "orphan_reason": reason,
-                      "updated_at": now, "resolved_at": now},
-             "$push": {"status_history": {"from": doc["status"], "to": TaskStatus.ORPHANED.value,
-                                          "at": now, "by": "system", "reason": reason}}})
-        if res.modified_count:
-            orphaned += 1
-            _event(doc["task_key"], "status:orphaned", by="system",
-                   reason=f"client {doc.get('client_id')} absent from dbo.Client")
-    log.info("orphan_sweep_done", orphaned=orphaned, dead_clients=len(dead))
-    return orphaned
+    """Missing client rows are not proof of deletion during a partial sync.
+
+    Retain history and commitments. Explicit current-owner changes are reconciled from
+    positive SQL evidence in reconciliation.prepare; absence never closes a task.
+    """
+    return 0
 
 
 def feedback_rejections(manager_id: int, window_days: int = 90) -> dict:
@@ -744,7 +716,8 @@ def _active_counts(manager_id: int, field: str) -> dict:
     caps against tasks ALREADY in the inbox (so on-demand re-runs can't exceed the daily caps)."""
     out: dict = {}
     for doc in mongo.tasks().find(
-            {"manager_id": manager_id, "status": {"$in": list(s.value for s in ACTIVE)}},
+            {"manager_id": manager_id, "status": {"$in": list(s.value for s in ACTIVE)},
+             "task_type": {"$ne": TaskType.MANUAL.value}},
             {field: 1}):
         key = doc.get(field)
         if key is not None:
@@ -817,6 +790,9 @@ def dashboard_counts(manager_id: int, as_of: str) -> dict:
          "resolved_at": {"$gte": month_start, "$lt": next_month}})
 
     return {
+        "ai_active": active_count(manager_id, exclude_manual=True),
+        "manual_backlog": mongo.tasks().count_documents({"manager_id": manager_id,
+            "task_type": TaskType.MANUAL.value, "status": {"$in": list(s.value for s in ACTIVE)}}),
         "task_type_mix": [{"type": tt, "count": n} for tt, n in sorted(type_mix.items())],
         "urgency_mix": [{"urgency": u, "count": urgency_mix[u]}
                         for u in ("critical", "high", "normal", "low")],

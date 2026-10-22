@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.api.sale_attribution import router as sale_attribution_router
 from app.core import history
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -1232,5 +1233,4 @@ def head_escalated(
     }
 
 
-from app.api.sale_attribution import router as sale_attribution_router
 app.include_router(sale_attribution_router)

@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.core.config import get_settings
+from app.core.config import get_settings, require_generation_enabled
 from app.core.logging import get_logger
 from app.services import worker
 
@@ -54,6 +54,7 @@ def _startup_catchup() -> None:
 
 
 def main() -> None:
+    require_generation_enabled()
     s = get_settings()
     tz = ZoneInfo(s.timezone)
     log.info("scheduler_starting", hour=s.daily_generate_hour, tz=s.timezone)

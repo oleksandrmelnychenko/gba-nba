@@ -13,7 +13,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.core import history
-from app.core.config import get_settings
+from app.core.config import get_settings, require_generation_enabled
 from app.core.logging import get_logger
 from app.domain.models import TaskType, Urgency
 from app.services import lifecycle
@@ -152,6 +152,7 @@ def _window_tag(as_of: str) -> str:
 
 
 def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
+    require_generation_enabled()
     s = get_settings()
     as_of = as_of or datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
     coverage = history.rolling_days(as_of, 365)

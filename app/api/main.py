@@ -98,8 +98,9 @@ async def lifespan(app: FastAPI):
         log.warning("mongo_index_setup_failed", error=str(exc))
     if not settings.internal_api_key:
         log.warning("internal_api_key_not_set", note="gba-nba running OPEN — set INTERNAL_API_KEY")
-    threading.Thread(target=_debt_dash_warmer, daemon=True, name="debt-dash-warmer").start()
-    threading.Thread(target=_team_snap_warmer, daemon=True, name="team-snap-warmer").start()
+    if settings.warmers_enabled:
+        threading.Thread(target=_debt_dash_warmer, daemon=True, name="debt-dash-warmer").start()
+        threading.Thread(target=_team_snap_warmer, daemon=True, name="team-snap-warmer").start()
     log.info("service_starting", service="gba-nba")
     yield
     mongo.close()
@@ -119,6 +120,12 @@ async def require_internal_key(request: Request, call_next):
             provided.encode("utf-8"), settings.internal_api_key.encode("utf-8")
         ):
             return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+    if request.url.path not in _OPEN_PATHS:
+        expected_environment = request.headers.get("X-GBA-Source-Environment")
+        if (expected_environment and expected_environment != settings.source_environment) or (
+            settings.source_environment == "qa" and expected_environment != "qa"
+        ):
+            return JSONResponse(status_code=409, content={"detail": "source_environment_mismatch"})
     return await call_next(request)
 
 
@@ -205,6 +212,12 @@ def _guard_generation(stats: dict) -> None:
     total = stats.get("generators_total", 0)
     if total and stats.get("generators_failed", 0) >= total:
         raise HTTPException(status_code=502, detail="generation_failed: all task generators errored")
+
+
+@app.get("/cockpit/source")
+def cockpit_source() -> dict:
+    from app.services.source_provenance import source_provenance
+    return source_provenance()
 
 
 @app.get("/health")
@@ -361,6 +374,8 @@ def generate(
     manager_id: int = Path(gt=0),
     as_of_date: date | None = None,
 ) -> dict:
+    if not settings.generation_enabled:
+        raise HTTPException(status_code=409, detail="generation_disabled_for_environment")
     from app.services import orchestrator
 
     # Resolve and validate outside the broad generation error boundary: a caller asking for a
@@ -568,6 +583,8 @@ def cockpit_notes(manager_net_uid: str, req: CockpitNoteRequest) -> dict:
 
 @app.post("/cockpit/generate")
 def cockpit_generate(manager_net_uid: str, as_of_date: date | None = None) -> dict:
+    if not settings.generation_enabled:
+        raise HTTPException(status_code=409, detail="generation_disabled_for_environment")
     from app.services import orchestrator
     manager_id = _resolve_manager(manager_net_uid)
     requested_as_of = _as_of(as_of_date)

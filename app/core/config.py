@@ -3,13 +3,27 @@ from __future__ import annotations
 
 from datetime import date
 from functools import lru_cache
+from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    source_environment: Literal["local", "shared", "dev", "qa"] = "shared"
+    generation_enabled: bool = True
+    warmers_enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_qa_isolation(self):
+        if self.source_environment == "qa":
+            if self.db_name != "ConcordDb_V5_QA" or self.mongo_db != "gba_nba_qa":
+                raise ValueError("QA NBA requires its own SQL database and Mongo namespace")
+            if self.generation_enabled:
+                raise ValueError("QA generation must remain disabled until downstream AI sources are isolated")
+        return self
 
     # MongoDB (task state)
     mongo_uri: str = Field(default="mongodb://127.0.0.1:27017", description="Set in .env")
@@ -108,3 +122,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def require_generation_enabled() -> None:
+    if not get_settings().generation_enabled:
+        raise RuntimeError("generation_disabled_for_environment")

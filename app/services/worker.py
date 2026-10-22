@@ -12,7 +12,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from app.clients import reco_client
-from app.core.config import get_settings
+from app.core.config import get_settings, require_generation_enabled
 from app.core.logging import get_logger
 from app.data import mongo
 from app.data import signals_repository as sig
@@ -24,6 +24,7 @@ log = get_logger("worker")
 def push_reco_feedback(window_days: int | None = None) -> dict:
     """Push NBA's negative cross_sell signals (dismissed / sold=False) to reco so it stops
     recommending those products to those clients. Best-effort per client; never raises."""
+    require_generation_enabled()
     window_days = window_days if window_days is not None else get_settings().feedback_window_days
     negs = lifecycle.cross_sell_negatives(window_days)
     clients = sent = products = 0
@@ -37,6 +38,7 @@ def push_reco_feedback(window_days: int | None = None) -> dict:
 
 
 def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bool = True) -> dict:
+    require_generation_enabled()
     as_of = as_of or datetime.now(ZoneInfo("Europe/Kyiv")).strftime("%Y-%m-%d")
     started = time.time()
     managers = sig.all_managers()

@@ -100,3 +100,22 @@ def test_verified_future_business_day_is_excluded_but_ambiguous_clock_is_visible
     assert result['value_at_risk_eur'] == 0
     assert result['debt_unknown_date_count'] == 1
     assert result['debt_unknown_date_eur'] == 100
+
+
+def test_changed_invoice_definition_rejects_fresh_old_target_cache(monkeypatch):
+    from app.api import main
+    import time
+    day = main._kyiv_today().isoformat()
+    old = {"team": "old_created_basis"}
+    new = {"team": "verified_invoice_basis"}
+    monkeypatch.setattr(main, "_team_snap_state", {
+        "at": time.monotonic(), "as_of": day,
+        "source_history_start": main.history.source_history_start().isoformat(),
+        "value": old,
+    })
+    calls = []
+    monkeypatch.setattr(main, "_build_team_snapshot", lambda key: calls.append(key) or new)
+    assert main._team_snapshot_cached(day) == new
+    assert main._team_snapshot_cached(day) == new
+    assert calls == [day]
+    assert main._team_snap_state["metric_version"] == main._TEAM_METRIC_VERSION

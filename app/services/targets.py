@@ -1,11 +1,7 @@
-"""Sales-target engine — «скільки МІНІМУМ продати».
+"""Historical reference from confirmed gross invoice documents and saved EUR payment documents.
 
-Sits ABOVE the task engine: computes each manager's monthly minimum from their own history
-(run-rate = average of the recent COMPLETED months), spreads it across the month's working days
-(Mon–Sat), and reports pace vs actual. Tracks TWO metrics: shipped (Order revenue, EUR) and paid
-(IncomePaymentOrder cash, EUR). The pace gap is what later boosts task urgency.
-
-All money in EUR. Pure date math is module-level (unit-testable without a DB).
+Current client book attribution; not an approved plan or a historical seller-credit ledger.
+The Mon–Sat calendar is an explicit scheduling assumption, not a verified holiday calendar.
 """
 from __future__ import annotations
 
@@ -119,6 +115,16 @@ def compute_target(manager_id: int, as_of: str | None = None,
 
     return {
         "manager_id": manager_id,
+        "metric_definitions": {
+            "version": 1,
+            "plan_basis": "historical_reference_not_approved_plan",
+            "scope": "current_client_book_current_document_revision",
+            "calendar": "monday_saturday_no_holidays",
+            "shipped_basis": "confirmed_invoice_gross_eur_by_verified_invoice_day",
+            "paid_basis": "saved_payment_eur_by_source_register_day",
+            "source_watermark": None,
+            "source_coverage": None,
+        },
         "month": current_month,
         "as_of": today.isoformat(),
         "working_days": wd,

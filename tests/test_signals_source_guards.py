@@ -22,13 +22,13 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 
-# Spine (dbo.[Order]/dbo.OrderItem) validity. dbo.Order/OrderItem are ~84% Deleted=1, so the old
-# `o.Deleted=0` / `oi.Deleted=0` filter kept only ~16% of sales — the whole feature + backfill
-# pipeline ran on a sliver. Sale validity is oi.IsValidForCurrentSale=1 (no Deleted on the spine).
-# These functions JOIN the Order/OrderItem spine for sales/reorder/churn/monetary signals.
+# Legacy signal guards below predate the current confirmed-invoice source.
+# monthly_shipped now uses canonical confirmed ownership plus Deleted=0, verified against
+# current imported lineage and real SQL fixtures in test_monthly_invoice_reference_sql.
+# Do not extend this historical guard to those source-backed documentary queries.
 _SALES_SPINE_FUNCS = [
     sig.ubiquitous_product_ids,
-    sig.client_monetary, sig.client_features, sig.monthly_shipped,
+    sig.client_monetary, sig.client_features,
     ds.client_features, ds.reorder_candidates, ds.churn_candidates, ds.active_clients,
     ds.label_reorder, ds.label_any_order, ds.label_buy_products,
 ]
@@ -95,7 +95,7 @@ def test_sales_spine_uses_validity_flag_not_deleted():
 # The hard exclusion must remain independent of the data-driven ubiquity threshold.
 
 # Turnover/feature queries that must hard-exclude the synthetic ids (in addition to ubiquity).
-_TURNOVER_FUNCS = [sig.client_monetary, sig.client_features, sig.monthly_shipped, ds.client_features]
+_TURNOVER_FUNCS = [sig.client_monetary, sig.client_features, ds.client_features]
 
 
 def test_synthetic_product_id_is_resolved_dynamically():

@@ -822,34 +822,32 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
 # --- sales-target engine: monthly shipped & paid per manager ---
 
 def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
-    """Per-month SHIPPED revenue (EUR) for a manager: SUM(OrderItem.Qty*PricePerItem) by Order month,
-    synthetic lines excluded. since/as_of are 'YYYY-MM-DD'. Returns {'YYYY-MM': amount}."""
+    """Compatibility name: gross confirmed invoice documents, NOT recognized shipment revenue.
+
+    Current document revisions and current client book; original line quantity (returns have
+    their own event, never rewrite the invoice month). Unknown invoice clock fails this metric.
+    """
     window = history.explicit_window(since, as_of)
-    excl = _excluded(window.as_of.isoformat())
-    params = {
-        "mid": manager_id,
-        "since": window.effective_start.isoformat(),
-        "asof": window.as_of.isoformat(),
-    }
-    not_in = ""
-    if excl:
-        eph, eparams = in_clause("x", sorted(excl))
-        not_in = f" AND oi.ProductID NOT IN {eph}"
-        params = {**params, **eparams}
-    rows = query(
-        f"""
-        SELECT FORMAT(o.Created, 'yyyy-MM') AS ym, SUM(oi.Qty * oi.PricePerItem) AS amt
-        FROM dbo.[Order] o
-        JOIN dbo.ClientAgreement ca ON ca.ID = o.ClientAgreementID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= :since AND o.Created < :asof
-              AND oi.ProductID IS NOT NULL{not_in}
-        GROUP BY FORMAT(o.Created, 'yyyy-MM')
-        """,
-        params,
-    )
-    return {r["ym"]: decimal_value(r["amt"]) for r in rows}
+    excluded = _excluded(window.as_of.isoformat())
+    params = {"mid": manager_id, "source_start": window.effective_start.isoformat(),
+              "asof": window.as_of.isoformat()}
+    predicate = ""
+    if excluded:
+        placeholders, values = in_clause("x", sorted(excluded))
+        params.update(values)
+        predicate = f" AND oi.ProductID NOT IN {placeholders}"
+    rows = query(retained_purchase_cte() + f"""
+        SELECT CONVERT(char(7),p.purchased_at,126) AS ym,
+               SUM(CAST(oi.Qty AS decimal(30,8))*oi.PricePerItem) AS amt,
+               SUM(CASE WHEN p.timestamp_basis IS NULL THEN 1 ELSE 0 END) AS missing_date
+        FROM purchase_orders p JOIN dbo.OrderItem oi ON oi.OrderID=p.order_id
+        WHERE oi.Deleted=0 AND oi.IsValidForCurrentSale=1 AND oi.ProductID IS NOT NULL
+              AND oi.Qty>0 {predicate}
+        GROUP BY CONVERT(char(7),p.purchased_at,126)
+    """, params)
+    if any(row["missing_date"] for row in rows):
+        raise ValueError("invoice_event_date_unverified")
+    return {row["ym"]: decimal_value(row["amt"]) for row in rows}
 
 
 def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:

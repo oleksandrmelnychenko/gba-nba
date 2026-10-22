@@ -828,6 +828,7 @@ def _guard_team_stats(manager_id: int, stats: dict) -> None:
 # snapshot (same warmer pattern as the debt dashboard above) so the poll and the first paint read
 # cached data. Explicit dates are current-only, so they share the same date-keyed cache safely.
 _TEAM_SNAP_TTL_S = 90.0
+_TEAM_METRIC_VERSION = "confirmed-invoice-gross-v2"
 _team_snap_lock = threading.Lock()
 _team_snap_compute_lock = threading.Lock()
 _team_snap_state: dict = {
@@ -913,6 +914,7 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
         same = (
             _team_snap_state["as_of"] == key
             and _team_snap_state.get("source_history_start") == source_start
+            and _team_snap_state.get("metric_version") == _TEAM_METRIC_VERSION
         )
         fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
         value = _team_snap_state["value"]
@@ -923,6 +925,7 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
             same = (
                 _team_snap_state["as_of"] == key
                 and _team_snap_state.get("source_history_start") == source_start
+                and _team_snap_state.get("metric_version") == _TEAM_METRIC_VERSION
             )
             fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
             if _team_snap_state["value"] is not None and fresh:
@@ -934,6 +937,7 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
                     "at": time.monotonic(),
                     "as_of": key,
                     "source_history_start": source_start,
+                    "metric_version": _TEAM_METRIC_VERSION,
                     "value": computed,
                 }
             )

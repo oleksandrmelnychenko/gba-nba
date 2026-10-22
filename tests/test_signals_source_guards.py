@@ -54,18 +54,9 @@ def test_overdue_debt_does_not_raw_sum_total():
         "no raw SUM over Debt.Total in any whitespace form"
 
 
-def test_monthly_paid_converts_amount_not_euroamount():
-    norm = _norm(_PAID_SRC)
-    assert "GetExchangedToEuroValue(p.Amount" in norm, \
-        "monthly_paid must convert the local Amount to EUR (EuroAmount is unreliable on this data)"
-
-
-def test_monthly_paid_does_not_trust_euroamount():
-    norm = _norm(_PAID_SRC)
-    assert "p.EuroAmount" not in norm, \
-        "p.EuroAmount is ~16-23x too high for UAH payments — must not be used"
-    assert "SUM(p.EuroAmount)" not in norm, \
-        "summing EuroAmount reintroduces the inflated-paid bug"
+# Payment conversion semantics are executed against fixture rows in
+# test_payment_target_filter.py. The former EuroAmount prohibition was based on
+# pre-fix sync data and is invalid after the current document-conversion sync.
 
 
 def test_overdue_debt_uses_parameterized_filters():

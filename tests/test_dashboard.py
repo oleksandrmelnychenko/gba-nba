@@ -63,7 +63,7 @@ def client(monkeypatch):
     monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
     monkeypatch.setattr(main.signals_repository, "debt_dashboard_for_manager",
                         lambda mid, as_of: _DEBT.get(mid, {"value_at_risk_eur": 0.0, "debt_aging": []}))
-    monkeypatch.setattr(main.signals_repository, "debt_dashboards_for_all_managers",
+    monkeypatch.setattr(main.debt_snapshot, "dashboards",
                         lambda as_of: dict(_DEBT))
     return TestClient(main.app)
 
@@ -101,6 +101,8 @@ def test_manager_dashboard_shape_and_mix(client):
         "urgency_mix",
         "value_at_risk_eur",
         "debt_aging",
+        "debt_unknown_terms_count",
+        "debt_unknown_terms_eur",
         "completed_vs_open",
         "source_history_start",
         "effective_start",
@@ -204,8 +206,8 @@ def test_debt_dashboard_cache_never_reuses_another_as_of(monkeypatch):
     })
     calls = []
     monkeypatch.setattr(
-        main.signals_repository,
-        "debt_dashboards_for_all_managers",
+        main.debt_snapshot,
+        "dashboards",
         lambda as_of: calls.append(as_of) or expected,
     )
 
@@ -239,7 +241,7 @@ def test_head_dashboard_shape(client):
         "history_complete",
     }
     teams = {t["manager_id"]: t for t in body["teams"]}
-    assert set(teams[1]) == {"manager_id", "open_tasks", "critical", "value_at_risk_eur"}
+    assert set(teams[1]) == {"manager_id", "open_tasks", "critical", "value_at_risk_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur"}
     assert teams[1]["open_tasks"] == 2
     assert teams[1]["critical"] == 1
     assert teams[1]["value_at_risk_eur"] == 1234.50

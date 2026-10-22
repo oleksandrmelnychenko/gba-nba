@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.metrics import METRICS
 from app.core.money import cents, decimal_value
-from app.data import mongo, signals_repository
+from app.data import debt_snapshot, mongo, signals_repository
 from app.data.db import get_engine
 from app.domain.models import Contact, Explanation, Outcome, Task, TaskStatus, TaskType, Urgency
 from app.domain.seller_contacts import ContactBucket, ContactCreate
@@ -622,9 +622,8 @@ def cockpit_target(manager_net_uid: str, as_of_date: date | None = None) -> dict
 
 # The all-managers debt aggregation is the dominant dashboard cost (~44s live — past the
 # gba-server 30s proxy timeout, so uncached the head charts are effectively broken).
-# Cache it in-process per as_of; the single-manager dashboard slices the same result
-# (per-manager DTOs are exactly equal — same rows, same fold). Compute is serialized so
-# concurrent misses wait for one build instead of stacking 44s queries.
+# Cache the current unpaid-document stock per as_of; manager dashboards slice the same result.
+# Compute is serialized so concurrent misses wait for one build.
 _DEBT_DASH_TTL_S = 600.0
 _debt_dash_lock = threading.Lock()
 _debt_dash_state: dict = {
@@ -636,6 +635,8 @@ _debt_dash_state: dict = {
 
 _EMPTY_DEBT_DASH = {
     "value_at_risk_eur": 0.0,
+    "debt_unknown_terms_count": 0,
+    "debt_unknown_terms_eur": 0.0,
     "debt_aging": [
         {"bucket": "0-30", "amount_eur": 0.0, "count": 0},
         {"bucket": "31-60", "amount_eur": 0.0, "count": 0},
@@ -649,9 +650,9 @@ _debt_dash_compute_lock = threading.Lock()
 
 
 def _debt_dashboards_cached(as_of: str, *, allow_stale: bool = True) -> dict[int, dict]:
-    """Stale-while-revalidate: requests use cached data for the same as_of (the
-    background warmer refreshes every ~9 min) and NEVER wait out the ~44-70s
-    recompute. Inline compute happens only when that as_of has no cached value."""
+    """Current debt cache has a hard ten-minute age limit, including when its warmer fails.
+    Expired values are never returned as current financial amounts; refresh errors propagate.
+    allow_stale remains accepted for existing warmer calls but cannot bypass this limit."""
     source_start = history.source_history_start().isoformat()
     with _debt_dash_lock:
         same_as_of = (
@@ -660,7 +661,7 @@ def _debt_dashboards_cached(as_of: str, *, allow_stale: bool = True) -> dict[int
         )
         fresh = same_as_of and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
         values = _debt_dash_state["values"]
-        if fresh or (allow_stale and same_as_of and values):
+        if fresh:
             return values
     with _debt_dash_compute_lock:
         with _debt_dash_lock:
@@ -669,9 +670,9 @@ def _debt_dashboards_cached(as_of: str, *, allow_stale: bool = True) -> dict[int
                 and _debt_dash_state.get("source_history_start") == source_start
             )
             fresh = same_as_of and time.monotonic() - _debt_dash_state["at"] < _DEBT_DASH_TTL_S
-            if _debt_dash_state["values"] and (fresh or (allow_stale and same_as_of)):
+            if fresh:
                 return _debt_dash_state["values"]
-        computed = signals_repository.debt_dashboards_for_all_managers(as_of)
+        computed = debt_snapshot.dashboards(as_of)
         with _debt_dash_lock:
             _debt_dash_state.update(
                 {
@@ -708,6 +709,8 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
         "urgency_mix": counts["urgency_mix"],
         "value_at_risk_eur": debt["value_at_risk_eur"],
         "debt_aging": debt["debt_aging"],
+        "debt_unknown_terms_count": debt.get("debt_unknown_terms_count", 0),
+        "debt_unknown_terms_eur": debt.get("debt_unknown_terms_eur", 0.0),
         "completed_vs_open": counts["completed_vs_open"],
     }
 
@@ -735,7 +738,9 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
         teams.append({"manager_id": mid,
                       "open_tasks": lifecycle.active_count(mid),
                       "critical": lifecycle.critical_active_count(mid),
-                      "value_at_risk_eur": var})
+                      "value_at_risk_eur": var,
+                      "debt_unknown_terms_count": debt_by_manager.get(mid, {}).get("debt_unknown_terms_count", 0),
+                      "debt_unknown_terms_eur": debt_by_manager.get(mid, {}).get("debt_unknown_terms_eur", 0.0)})
     return {"is_head": True, "requested_manager_net_uid": requested_net_uid,
             "as_of": as_of, **coverage.metadata(), "teams": teams,
             "escalated_count": lifecycle.escalated_count(),
@@ -878,8 +883,8 @@ def _build_team_snapshot(as_of_str: str) -> dict:
 
 
 def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True) -> dict:
-    """Stale-while-revalidate snapshot for the DEFAULT (as_of=today) head views; the background
-    warmer refreshes every ~80s so requests virtually never pay the compute."""
+    """Current team snapshot with a hard ninety-second age limit.
+    A failed warmer cannot keep serving yesterday's computation as current all day."""
     key = as_of or _kyiv_today().isoformat()
     source_start = history.source_history_start().isoformat()
     with _team_snap_lock:
@@ -889,7 +894,7 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
         )
         fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
         value = _team_snap_state["value"]
-        if value is not None and (fresh or (allow_stale and same)):
+        if value is not None and fresh:
             return value
     with _team_snap_compute_lock:
         with _team_snap_lock:
@@ -898,7 +903,7 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
                 and _team_snap_state.get("source_history_start") == source_start
             )
             fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
-            if _team_snap_state["value"] is not None and (fresh or (allow_stale and same)):
+            if _team_snap_state["value"] is not None and fresh:
                 return _team_snap_state["value"]
         computed = _build_team_snapshot(key)
         with _team_snap_lock:

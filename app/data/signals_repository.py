@@ -843,16 +843,17 @@ def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, Decima
 def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
     """Per-month PAID cash (EUR) for a manager, by FromDate month, via ClientID->manager.
 
-    NB: use FromDate (actual payment date), NOT Created (which is the bulk-sync insert date — all
-    history was loaded in one batch). EuroAmount is NOT reliably EUR on this data (UAH payments
-    have EuroAmount ≈ the local amount, ~16-23× too high), so convert the local Amount to EUR with
-    dbo.GetExchangedToEuroValue(Amount, CurrencyID, FromDate) — IncomePaymentOrder carries both.
+    FromDate is the payment date; Created may be the bulk import timestamp. Use the persisted
+    document EuroAmount: current sync preserves its document FX/settlement conversion. Revaluing
+    it through today's rate tables changes the historical cash result. Reject missing conversion.
     """
     window = history.explicit_window(since, as_of)
     rows = query(
         """
         SELECT FORMAT(p.FromDate, 'yyyy-MM') AS ym,
-               SUM(dbo.GetExchangedToEuroValue(p.Amount, p.CurrencyID, p.FromDate)) AS amt
+               SUM(p.EuroAmount) AS amt,
+               SUM(CASE WHEN p.Amount <> 0 AND (p.EuroAmount IS NULL OR p.EuroAmount = 0
+                    OR SIGN(p.Amount) <> SIGN(p.EuroAmount)) THEN 1 ELSE 0 END) AS missing_conversion
         FROM dbo.IncomePaymentOrder p
         JOIN dbo.Client c ON c.ID = p.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
         WHERE p.Deleted = 0 AND p.IsCanceled = 0
@@ -865,4 +866,6 @@ def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
             "asof": window.as_of.isoformat(),
         },
     )
+    if any(r['missing_conversion'] for r in rows):
+        raise ValueError('payment_eur_conversion_missing')
     return {r["ym"]: decimal_value(r["amt"]) for r in rows}

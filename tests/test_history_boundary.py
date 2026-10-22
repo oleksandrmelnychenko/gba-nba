@@ -156,7 +156,7 @@ def test_monthly_series_clamp_since_without_inventing_dense_months(monkeypatch):
 
     def _query(sql, params=None):
         calls.append((sql, dict(params or {})))
-        return [{"ym": "2025-01", "amt": "12.34"}]
+        return [{"ym": "2025-01", "amt": "12.34", "missing_conversion": 0}]
 
     monkeypatch.setattr(sig, "query", _query)
     monkeypatch.setattr(sig, "_excluded", lambda as_of: frozenset())

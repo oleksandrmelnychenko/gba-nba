@@ -160,7 +160,8 @@ def _inbox_sort_key(doc: dict) -> tuple:
             _URGENCY_RANK.get(doc.get("urgency"), 9),
             -_ranking_score(doc),
             _TYPE_RANK.get(doc.get("task_type"), 9),
-            -_float_score(doc.get("priority")))
+            -_float_score(doc.get("priority")),
+            str(doc.get("task_key") or ""))
 
 
 def _now() -> datetime:
@@ -241,6 +242,9 @@ def upsert_generated(task: Task) -> str:
     }
 
     if existing:
+        # A regenerated signal does not postpone the seller's existing commitment.
+        if existing.get("due_date") is not None:
+            computed["due_date"] = existing["due_date"]
         # refresh computed fields only; keep status/notes/history/snooze/outcome
         mongo.tasks().update_one({"task_key": task.task_key}, {"$set": computed})
         _event(task.task_key, "refresh", by="system")
@@ -264,6 +268,7 @@ def upsert_generated(task: Task) -> str:
             # TOCTOU with a concurrent generation run (manager double-click vs the 09:00
             # scheduler): the other writer won the insert — fall through to the refresh
             # path instead of 500ing the whole generate run.
+            computed.pop("due_date", None)  # retain the winning insert's commitment
             mongo.tasks().update_one({"task_key": task.task_key}, {"$set": computed})
             _event(task.task_key, "refresh", by="system")
 
@@ -342,7 +347,9 @@ def change_status(task_key: str, to: TaskStatus, by: int, reason: str | None = N
         wake = snooze_until or (now + timedelta(days=1))
         update["$set"]["snooze_until"] = wake
         update["$set"]["expires_at"] = (
-            max(_as_aware(wake), now) + timedelta(days=get_settings().task_ttl_days))
+            None if doc.get("task_type") == TaskType.MANUAL.value
+            else max(_as_aware(wake), now) + timedelta(days=get_settings().task_ttl_days)
+        )
     if to == TaskStatus.IN_PROGRESS and doc.get("in_progress_since") is None:
         # denormalized work-started stamp: set once, never overwritten on later transitions
         # (records when work began; may remain set on done so the board can show duration).
@@ -380,10 +387,19 @@ def add_note(task_key: str, author_id: int, text: str, author_name: str | None =
     return updated
 
 
-def inbox(manager_id: int, limit: int = 50, statuses: list[str] | None = None) -> list[dict]:
-    """Manager's active task queue (the cockpit query). Ordered by urgency band, then EV score,
-    then business tier tie-breaker — see _inbox_sort_key. SNOOZED tasks whose snooze_until has
-    passed are surfaced as OPEN-eligible."""
+def inbox(manager_id: int, limit: int = 50, statuses: list[str] | None = None,
+          offset: int = 0) -> list[dict]:
+    """Compatibility list view of a manager's active task page."""
+    return inbox_page(manager_id, limit=limit, statuses=statuses, offset=offset)["tasks"]
+
+
+def inbox_page(manager_id: int, limit: int = 50, statuses: list[str] | None = None,
+               offset: int = 0) -> dict:
+    """One stable ordered page and its total from the same matching task set.
+
+    Manual assignments, urgency, expected EUR and task_key provide deterministic ordering.
+    SNOOZED tasks whose snooze_until has passed are surfaced as OPEN-eligible.
+    """
     now = _now()
     statuses = statuses or [TaskStatus.OPEN.value, TaskStatus.IN_PROGRESS.value]
     query = {
@@ -399,7 +415,9 @@ def inbox(manager_id: int, limit: int = 50, statuses: list[str] | None = None) -
     docs = list(mongo.tasks().find(query))
     _hydrate_ranking_fields(docs, persist=False)
     docs.sort(key=_inbox_sort_key)
-    return docs[:max(0, limit)]
+    start = max(0, offset)
+    return {"tasks": docs[start:start + max(0, limit)], "total": len(docs),
+            "offset": start, "limit": max(0, limit)}
 
 
 def wake_snoozed() -> int:
@@ -437,11 +455,14 @@ def sweep_sla(escalate_to: int | None = None) -> dict:
 
 
 def sweep_expired() -> int:
-    """Delete stale never-actioned tasks (ACTIVE past expires_at) so the inbox doesn't accumulate
-    cruft. Only active tasks are purged — DONE/DISMISSED are kept for KPI/audit (a blanket Mongo TTL
-    index would wrongly drop completed tasks the monthly KPI needs)."""
+    """Purge only untouched, expired AI suggestions; preserve seller commitments and history."""
     res = mongo.tasks().delete_many(
-        {"status": {"$in": list(s.value for s in ACTIVE)}, "expires_at": {"$lt": _now()}})
+        {"status": {"$in": [TaskStatus.GENERATED.value, TaskStatus.OPEN.value]},
+         "task_type": {"$ne": TaskType.MANUAL.value},
+         "in_progress_since": None,
+         "status_history": {"$not": {"$elemMatch": {"to": TaskStatus.SNOOZED.value}}},
+         "$or": [{"notes": {"$exists": False}}, {"notes": []}],
+         "expires_at": {"$lt": _now()}})
     return res.deleted_count
 
 

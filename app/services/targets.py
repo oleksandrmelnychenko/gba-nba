@@ -34,17 +34,24 @@ def working_days_elapsed(as_of: date) -> int:
 
 
 def run_rate(series: dict[str, object], current_month: str, n: int = 3) -> Decimal:
-    """Average of the n most-recent COMPLETED months (current partial month excluded).
+    """Average the last n completed, fully source-covered calendar months.
 
-    This is the conservative 'minimum' floor: you've recently been selling this much, at minimum
-    keep it up. Returns 0.0 if there's no completed history yet.
+    Missing rows inside known source coverage mean zero activity. Months before the source
+    boundary, including its partial first month, are unknown and never enter the denominator.
     """
-    completed = sorted(k for k in series if k < current_month)
-    recent = completed[-n:]
-    if not recent:
+    if n <= 0:
+        raise ValueError("trailing months must be positive")
+    month = date.fromisoformat(f"{current_month}-01")
+    source_start = history.source_history_start()
+    completed = []
+    for _ in range(n):
+        month = (month - timedelta(days=1)).replace(day=1)
+        if month >= source_start:
+            completed.append(month.strftime("%Y-%m"))
+    if not completed:
         return Decimal("0")
-    total = sum((decimal_value(series[key]) for key in recent), start=Decimal("0"))
-    return total / Decimal(len(recent))
+    total = sum((decimal_value(series.get(key, 0)) for key in completed), start=Decimal("0"))
+    return total / Decimal(len(completed))
 
 
 def _pace_status(actual: Decimal, expected: Decimal) -> str:
@@ -97,7 +104,7 @@ def compute_target(manager_id: int, as_of: str | None = None,
     current_month = today.strftime("%Y-%m")
 
     first_of_month = today.replace(day=1)
-    since = (first_of_month - timedelta(days=1)).replace(day=1)
+    since = first_of_month
     for _ in range(trailing_months):  # step back trailing_months whole months
         since = (since - timedelta(days=1)).replace(day=1)
     since_str = since.isoformat()

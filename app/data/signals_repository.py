@@ -841,7 +841,8 @@ def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
                SUM(dbo.GetExchangedToEuroValue(p.Amount, p.CurrencyID, p.FromDate)) AS amt
         FROM dbo.IncomePaymentOrder p
         JOIN dbo.Client c ON c.ID = p.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
-        WHERE p.Deleted = 0 AND p.FromDate >= :since AND p.FromDate < :asof
+        WHERE p.Deleted = 0 AND p.IsCanceled = 0
+              AND p.FromDate >= :since AND p.FromDate < :asof
         GROUP BY FORMAT(p.FromDate, 'yyyy-MM')
         """,
         {

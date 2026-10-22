@@ -31,6 +31,9 @@ def client(monkeypatch):
     from app.api import main
     monkeypatch.setattr(main.signals_repository, "manager_id_for_netuid",
                         lambda nu: _NETUID_MAP.get(nu))
+    monkeypatch.setattr(main.signals_repository, "manager_names",
+                        lambda ids: {mid: f"Manager {mid}" for mid in ids})
+    monkeypatch.setattr(main.signals_repository, "is_head_of_sales", lambda uid: False)
     return TestClient(main.app)
 
 
@@ -237,3 +240,23 @@ def test_internal_key_required_when_configured(client, monkeypatch):
     assert client.get("/health").status_code == 200
     # the global gate also covers the legacy endpoints (no header -> 401)
     assert client.get("/tasks/manager/1").status_code == 401
+
+
+def test_inbox_paginates_all_tasks_with_stable_ties_and_owner_scoped_total(client):
+    # Reverse insertion ensures ties are ordered by stable task identity, not Mongo insertion.
+    for number in reversed(range(55)):
+        _seed(1, f"task:{number:03}")
+    _seed(2, "foreign")
+    params = {"manager_net_uid": MGR_UID, "limit": 50}
+    first = client.get("/cockpit/inbox", params=params).json()
+    second = client.get("/cockpit/inbox", params={**params, "offset": 50}).json()
+    assert (first["total"], first["count"], first["offset"], first["limit"]) == (55, 50, 0, 50)
+    assert (second["total"], second["count"], second["offset"], second["limit"]) == (55, 5, 50, 50)
+    assert [task["task_key"] for task in first["tasks"] + second["tasks"]] == [
+        f"task:{number:03}" for number in range(55)
+    ]
+    beyond = client.get("/cockpit/inbox", params={**params, "offset": 100}).json()
+    assert beyond["total"] == 55
+    assert beyond["count"] == 0
+    assert beyond["tasks"] == []
+    assert client.get("/cockpit/inbox", params={**params, "offset": -1}).status_code == 422

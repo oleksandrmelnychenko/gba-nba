@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 
 from app.services import targets
 
@@ -17,8 +18,8 @@ def test_run_rate_uses_completed_months_only():
     series = {"2026-03": 120.0, "2026-04": 222.0, "2026-05": 246.0, "2026-06": 40.0}
     # current partial month (2026-06) excluded; avg of Mar/Apr/May
     assert targets.run_rate(series, "2026-06", 3) == (120 + 222 + 246) / 3
-    # fewer completed than n -> average what exists
-    assert targets.run_rate({"2026-05": 200.0}, "2026-06", 3) == 200.0
+    # covered calendar months without rows have zero activity
+    assert targets.run_rate({"2026-05": 200.0}, "2026-06", 3) == Decimal(200) / 3
     assert targets.run_rate({}, "2026-06", 3) == 0.0
 
 
@@ -32,7 +33,7 @@ def test_compute_target_shape_and_pace(monkeypatch):
     assert out["working_days"] == 26
     assert out["working_days_elapsed"] == 7
     assert out["source_history_start"] == "2025-01-01"
-    assert out["effective_start"] == "2026-02-01"
+    assert out["effective_start"] == "2026-03-01"
     assert out["history_complete"] is True
     sh = out["shipped"]
     assert sh["target"] == round((120 + 222 + 246) / 3, 2)   # 196.0
@@ -52,3 +53,33 @@ def test_pace_status_bands():
 def sig_module():
     from app.data import signals_repository
     return signals_repository
+
+
+def test_run_rate_does_not_substitute_older_active_month_for_zero_month():
+    series = {"2026-06": 300, "2026-07": 100, "2026-09": 100, "2026-10": 500}
+    assert targets.run_rate(series, "2026-10", 3) == Decimal(200) / 3
+
+
+def test_run_rate_excludes_unknown_and_partial_source_months(monkeypatch):
+    monkeypatch.setattr(targets.history, "source_history_start", lambda: date(2025, 1, 15))
+    # January is partial/unknown; February is fully covered but has zero activity.
+    assert targets.run_rate({"2025-01": 900, "2025-03": 100}, "2025-04", 3) == 50
+    assert targets.run_rate({"2025-01": 900}, "2025-02", 3) == 0
+
+
+def test_run_rate_handles_year_boundary_and_short_covered_history(monkeypatch):
+    monkeypatch.setattr(targets.history, "source_history_start", lambda: date(2025, 12, 1))
+    assert targets.run_rate({"2025-11": 900, "2025-12": 100}, "2026-02", 3) == 50
+
+
+def test_compute_target_fetches_exact_calendar_window(monkeypatch):
+    calls = []
+    def series(mid, since, asof):
+        calls.append((mid, since, asof))
+        return {"2026-07": 100, "2026-09": 100}
+    monkeypatch.setattr(sig_module(), "monthly_shipped", series)
+    monkeypatch.setattr(sig_module(), "monthly_paid", series)
+    result = targets.compute_target(7, "2026-10-22", trailing_months=3)
+    assert calls == [(7, "2026-07-01", "2026-10-23")] * 2
+    assert result["shipped"]["target"] == 66.67
+    assert result["paid"]["target"] == 66.67

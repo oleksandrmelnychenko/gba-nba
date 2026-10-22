@@ -383,14 +383,16 @@ def cockpit_inbox(
     manager_net_uid: str,
     limit: int = Query(default=50, ge=1, le=200),
     status: str | None = Query(default=None, max_length=300),
+    offset: int = Query(default=0, ge=0),
 ) -> dict:
     manager_id = _resolve_manager(manager_net_uid)
     statuses = [s.strip() for s in status.split(",") if s.strip()] if status else None
-    items = lifecycle.inbox(manager_id, limit=limit, statuses=statuses)
+    page = lifecycle.inbox_page(manager_id, limit=limit, statuses=statuses, offset=offset)
+    items = page["tasks"]
     for it in items:
         it["_id"] = str(it["_id"])
     return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
-            "count": len(items), "tasks": items}
+            "count": len(items), **page}
 
 
 @app.get("/cockpit/count")

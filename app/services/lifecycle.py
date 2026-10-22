@@ -6,6 +6,8 @@ Every mutation also appends an immutable record to task_events.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -421,9 +423,16 @@ def inbox_page(manager_id: int, limit: int = 50, statuses: list[str] | None = No
     docs = list(mongo.tasks().find(query))
     _hydrate_ranking_fields(docs, persist=False)
     docs.sort(key=_inbox_sort_key)
+    # Cover the full ordered set, not just count/page keys. A same-count replacement or
+    # reprioritization between requests must invalidate a multi-page client collection.
+    # Canonical JSON includes persisted task state and hydrated ranking fields; no request-time
+    # defaults enter the digest. Datetimes/ObjectIds use their stable string representations.
+    revision = hashlib.sha256(
+        json.dumps(docs, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
     start = max(0, offset)
     return {"tasks": docs[start:start + max(0, limit)], "total": len(docs),
-            "offset": start, "limit": max(0, limit)}
+            "offset": start, "limit": max(0, limit), "revision": revision}
 
 
 def wake_snoozed() -> int:

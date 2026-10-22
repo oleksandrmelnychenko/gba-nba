@@ -252,6 +252,9 @@ def test_inbox_paginates_all_tasks_with_stable_ties_and_owner_scoped_total(clien
     second = client.get("/cockpit/inbox", params={**params, "offset": 50}).json()
     assert (first["total"], first["count"], first["offset"], first["limit"]) == (55, 50, 0, 50)
     assert (second["total"], second["count"], second["offset"], second["limit"]) == (55, 5, 50, 50)
+    assert first["revision"] == second["revision"]
+    assert len(first["revision"]) == 64
+    assert all(character in "0123456789abcdef" for character in first["revision"])
     assert [task["task_key"] for task in first["tasks"] + second["tasks"]] == [
         f"task:{number:03}" for number in range(55)
     ]
@@ -260,3 +263,36 @@ def test_inbox_paginates_all_tasks_with_stable_ties_and_owner_scoped_total(clien
     assert beyond["count"] == 0
     assert beyond["tasks"] == []
     assert client.get("/cockpit/inbox", params={**params, "offset": -1}).status_code == 422
+
+
+def test_inbox_revision_changes_for_same_count_replacement_between_pages(client):
+    from app.data import mongo
+    for key in ("a", "b", "c", "d"):
+        _seed(1, key)
+    params = {"manager_net_uid": MGR_UID, "limit": 2}
+    first = client.get("/cockpit/inbox", params=params).json()
+    assert [task["task_key"] for task in first["tasks"]] == ["a", "b"]
+    mongo.tasks().delete_one({"task_key": "a"})
+    _seed(1, "e")
+    second = client.get("/cockpit/inbox", params={**params, "offset": 2}).json()
+    assert [task["task_key"] for task in second["tasks"]] == ["d", "e"]
+    assert first["total"] == second["total"] == 4
+    assert first["revision"] != second["revision"]
+
+
+def test_inbox_revision_covers_reordering_and_non_page_state(client):
+    from app.data import mongo
+    for key in ("a", "b", "c"):
+        _seed(1, key)
+    params = {"manager_net_uid": MGR_UID, "limit": 1}
+    original = client.get("/cockpit/inbox", params=params).json()
+    # Alter rank without touching updated_at; digest must cover actual sorting fields.
+    mongo.tasks().update_one({"task_key": "c"}, {"$set": {"urgency": "critical"}})
+    reranked = client.get("/cockpit/inbox", params=params).json()
+    assert reranked["tasks"][0]["task_key"] == "c"
+    assert original["revision"] != reranked["revision"]
+    # Even a note on a task outside the returned page changes the full-set revision.
+    mongo.tasks().update_one({"task_key": "b"}, {"$set": {"notes": [{"text": "Call tomorrow"}]}})
+    changed = client.get("/cockpit/inbox", params=params).json()
+    assert changed["tasks"] == reranked["tasks"]
+    assert changed["revision"] != reranked["revision"]

@@ -182,8 +182,16 @@ def prepare(manager_id: int, candidates: list, as_of: str) -> tuple[list, dict]:
     # Repair an interrupted post-resolution commitment copy before doing further work.
     for pending in mongo.tasks().find({"manager_id": manager_id, "status": "superseded",
                                        "commitment_reconciliation_pending": True}):
-        previous_status = pending.get("status_history", [{}])[-1].get("from", "open")
-        _preserve_commitment({**pending, "status": previous_status}, datetime.now(UTC))
+        transitions = pending.get("status_history", [])
+        previous_status = transitions[-1].get("from", "open") if transitions else "open"
+        # Reconstruct the active snapshot used by the normal post-CAS copy. Resolution
+        # bookkeeping belongs to the historical AI advice, never to its live manual follow-up.
+        original = {key: value for key, value in pending.items()
+                    if key not in ("resolved_at", "source_evidence", "commitment_reconciliation_pending")}
+        original["status"] = previous_status
+        original["status_history"] = (transitions[:-1] if transitions
+                                      and transitions[-1].get("to") == "superseded" else transitions)
+        _preserve_commitment(original, datetime.now(UTC))
         mongo.tasks().update_one({"_id": pending["_id"]},
                                  {"$unset": {"commitment_reconciliation_pending": ""}})
     scope = {"status": {"$in": _ACTIVE}, "$or": [

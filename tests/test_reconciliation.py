@@ -214,11 +214,15 @@ def test_concurrent_seller_update_prevents_stale_resolution_and_commitment_copy(
     assert db.tasks.find_one({"task_key": key})["notes"][0]["text"] == "Updated after snapshot"
 
 
-def test_interrupted_commitment_copy_repairs_on_next_run(db, monkeypatch):
+@pytest.mark.parametrize("status", [TaskStatus.IN_PROGRESS, TaskStatus.SNOOZED])
+def test_interrupted_commitment_copy_repairs_on_next_run(db, monkeypatch, status):
     source = facts(monkeypatch, debts={"501": "12"})
     rows, _ = persist(task(kind=TaskType.DEBT_FOLLOWUP))
     key = rows[0].task_key
-    lifecycle.change_status(key, TaskStatus.IN_PROGRESS, by=1)
+    deadline = datetime.now(UTC) + timedelta(days=2)
+    lifecycle.add_note(key, 1, "Existing agreed follow-up")
+    lifecycle.change_status(key, status, by=1, snooze_until=deadline)
+    before = db.tasks.find_one({"task_key": key})
     source[10]["debts"]["501"] = "0"
     original = reconciliation._preserve_commitment
     def interrupted(*args):
@@ -231,6 +235,17 @@ def test_interrupted_commitment_copy_repairs_on_next_run(db, monkeypatch):
     reconciliation.prepare(1, [], "2026-10-17")
     assert db.tasks.count_documents({"source_task_key": key}) == 1
     assert "commitment_reconciliation_pending" not in db.tasks.find_one({"task_key": key})
+
+    copied = db.tasks.find_one({"source_task_key": key})
+    assert copied["status"] == status.value and copied["task_type"] == "manual"
+    assert copied["notes"] == before["notes"] and copied["status_history"] == before["status_history"]
+    assert copied["snooze_until"] == before["snooze_until"]
+    assert copied["expires_at"] is None
+    assert all(field not in copied for field in (
+        "resolved_at", "source_evidence", "commitment_reconciliation_pending"))
+    assert db.tasks.find_one({"task_key": key})["source_evidence"]["kind"] == "debt_settled"
+    reconciliation.prepare(1, [], "2026-10-17")
+    assert db.tasks.count_documents({"source_task_key": key}) == 1
 
 
 def test_legacy_purchase_dates_are_conservative_and_public_evidence_is_date_only(db, monkeypatch):

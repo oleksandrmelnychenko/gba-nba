@@ -9,6 +9,7 @@ import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from app.core.logging import get_logger
 from app.data import mongo, reconciliation_repository
@@ -55,8 +56,10 @@ def _newer(current: dict, prior: dict | None, since) -> bool:
         return False
     if isinstance(since, str):
         since = datetime.fromisoformat(since)
-    purchased = datetime.fromisoformat(current["purchased_at"])
-    return purchased.replace(tzinfo=UTC) > since.replace(tzinfo=UTC)
+    # Imported Order.Created is a source document wall clock, not reliably UTC.
+    # A legacy task with no baseline can only be resolved by a strictly later document day.
+    generated_day = since.replace(tzinfo=since.tzinfo or UTC).astimezone(ZoneInfo("Europe/Kyiv")).date()
+    return date.fromisoformat(current["purchased_at"][:10]) > generated_day
 
 
 def _resolution(task: dict, facts: dict) -> dict | None:
@@ -113,6 +116,11 @@ def _preserve_commitment(task: dict, now: datetime) -> None:
 
 
 def _supersede(task: dict, evidence: dict, now: datetime) -> bool:
+    if evidence.get("orders"):
+        evidence = {**evidence, "orders": {pid: {
+            "order_id": row["order_id"], "purchased_on": row["purchased_at"][:10],
+            "date_basis": "source_document_date",
+        } for pid, row in evidence["orders"].items()}}
     result = mongo.tasks().update_one(
         {"_id": task["_id"], "status": task["status"], "manager_id": task["manager_id"],
          "updated_at": task.get("updated_at")},

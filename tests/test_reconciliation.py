@@ -226,3 +226,17 @@ def test_interrupted_commitment_copy_repairs_on_next_run(db, monkeypatch):
     reconciliation.prepare(1, [], "2026-10-17")
     assert db.tasks.count_documents({"source_task_key": key}) == 1
     assert "commitment_reconciliation_pending" not in db.tasks.find_one({"task_key": key})
+
+
+def test_legacy_purchase_dates_are_conservative_and_public_evidence_is_date_only(db, monkeypatch):
+    facts(monkeypatch, orders={"7": order(101, "2026-10-22T23:59:00")})
+    lifecycle.upsert_generated(task("legacy"))
+    # UTC generation on previous date can already be the same Kyiv business day.
+    db.tasks.update_one({"task_key": "legacy"}, {"$set": {
+        "generated_at": datetime(2026, 10, 21, 22, tzinfo=UTC)}})
+    _, stats = reconciliation.prepare(1, [], "2026-10-22")
+    assert stats["superseded"] == 0
+    facts(monkeypatch, orders={"7": order(102, "2026-10-23T12:00:00")})
+    _, stats = reconciliation.prepare(1, [], "2026-10-23")
+    evidence = db.tasks.find_one({"task_key": "legacy"})["source_evidence"]["orders"]["7"]
+    assert evidence == {"order_id": 102, "purchased_on": "2026-10-23", "date_basis": "source_document_date"}

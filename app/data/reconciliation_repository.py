@@ -3,10 +3,11 @@
 Small client batches only. Zero balances are deliberately included, deleted/missing rows are
 not evidence. Orders with no remaining purchased quantity cannot resolve a sales suggestion.
 """
-from datetime import date, timedelta
+from datetime import UTC, date, timedelta
 
 from app.core import history
 from app.data.db import in_clause, query
+from app.data.purchase_history import retained_purchase_cte
 
 
 def source_facts(client_ids: list[int], as_of: str) -> dict[int, dict]:
@@ -29,42 +30,29 @@ def source_facts(client_ids: list[int], as_of: str) -> dict[int, dict]:
             WHERE cid.ClientID IN {clause} AND cid.Deleted = 0
                   AND d.Created < :end
         """, params)
-        orders = query(f"""
-            WITH purchases AS (
-                SELECT ca.ClientID AS client_id, oi.ProductID AS product_id,
-                       o.ID AS order_id, o.Created AS purchased_at,
-                       SUM(oi.Qty - ISNULL(oi.ReturnedQty, 0)) AS quantity
-                FROM dbo.ClientAgreement ca
-                JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Deleted = 0
-                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.Deleted = 0
-                WHERE ca.ClientID IN {clause} AND ca.Deleted = 0
-                      AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-                      AND o.Created >= :start AND o.Created < :end
-                GROUP BY ca.ClientID, oi.ProductID, o.ID, o.Created
-                HAVING SUM(oi.Qty - ISNULL(oi.ReturnedQty, 0)) > 0
-            ), ranked AS (
+        purchase_cte = retained_purchase_cte(f"c.ID IN {clause}", "start", "end")
+        orders = query(purchase_cte + """
+            , ranked AS (
                 SELECT *, ROW_NUMBER() OVER (
                     PARTITION BY client_id, product_id ORDER BY purchased_at DESC, order_id DESC
-                ) AS rn FROM purchases
+                ) AS rn FROM retained_purchases
             )
-            SELECT client_id, product_id, order_id, purchased_at, quantity
+            SELECT client_id, product_id, order_id, purchased_at, quantity,
+                   timestamp_basis, purchased_at_utc
             FROM ranked WHERE rn = 1
         """, params)
-        returns = query(f"""
-            WITH returned AS (
-                SELECT ca.ClientID AS client_id, oi.ProductID AS product_id,
-                       o.ID AS order_id, SUM(oi.ReturnedQty) AS returned_quantity,
+        returns = query(purchase_cte + """
+            , returned AS (
+                SELECT p.client_id, oi.ProductID AS product_id,
+                       p.order_id, SUM(oi.ReturnedQty) AS returned_quantity,
                        MAX(oi.Updated) AS returned_at,
-                       ROW_NUMBER() OVER (PARTITION BY ca.ClientID, oi.ProductID
-                           ORDER BY MAX(oi.Updated) DESC, o.ID DESC) AS rn
-                FROM dbo.ClientAgreement ca
-                JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID AND o.Deleted = 0
-                JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.Deleted = 0
-                WHERE ca.ClientID IN {clause} AND ca.Deleted = 0
-                      AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
-                      AND oi.ReturnedQty > 0 AND oi.Updated < :end
-                      AND o.Created >= :start AND o.Created < :end
-                GROUP BY ca.ClientID, oi.ProductID, o.ID
+                       ROW_NUMBER() OVER (PARTITION BY p.client_id, oi.ProductID
+                           ORDER BY MAX(oi.Updated) DESC, p.order_id DESC) AS rn
+                FROM purchase_orders p
+                JOIN dbo.OrderItem oi ON oi.OrderID = p.order_id AND oi.Deleted = 0
+                WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL
+                      AND oi.ReturnedQty > 0 AND oi.ReturnedQty <= oi.Qty AND oi.Updated < :end
+                GROUP BY p.client_id, oi.ProductID, p.order_id
             )
             SELECT client_id, product_id, order_id, returned_quantity, returned_at
             FROM returned WHERE rn = 1
@@ -80,6 +68,9 @@ def source_facts(client_ids: list[int], as_of: str) -> dict[int, dict]:
                 result[int(row["client_id"])]["orders"][str(row["product_id"])] = {
                     "order_id": int(row["order_id"]),
                     "purchased_at": row["purchased_at"].isoformat(),
+                    "timestamp_basis": row["timestamp_basis"],
+                    "purchased_at_utc": (row["purchased_at_utc"].replace(tzinfo=UTC).isoformat()
+                                         if row["purchased_at_utc"] is not None else None),
                 }
         for row in returns:
             if int(row["client_id"]) in result:

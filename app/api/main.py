@@ -716,6 +716,9 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
         "debt_unknown_terms_count": debt.get("debt_unknown_terms_count", 0),
         "debt_unknown_terms_eur": debt.get("debt_unknown_terms_eur", 0.0),
         "completed_vs_open": counts["completed_vs_open"],
+        "ai_active": counts["ai_active"],
+        "manual_backlog": counts["manual_backlog"],
+        "active_total": counts["active_total"],
     }
 
 
@@ -739,8 +742,11 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
     for mid in signals_repository.all_managers():
         var = debt_by_manager.get(mid, {}).get("value_at_risk_eur", 0.0)
         total_var += decimal_value(var)
+        workload = lifecycle.active_workload_counts(mid)
         teams.append({"manager_id": mid,
-                      "open_tasks": lifecycle.active_count(mid),
+                      "open_tasks": workload["active_total"],
+                      "ai_active": workload["ai_active"],
+                      "manual_backlog": workload["manual_backlog"],
                       "critical": lifecycle.critical_active_count(mid),
                       "value_at_risk_eur": var,
                       "debt_unknown_date_count": debt_by_manager.get(mid, {}).get("debt_unknown_date_count", 0),

@@ -53,23 +53,46 @@ def _cycle(kind: str, baseline: dict) -> str | None:
     return hashlib.sha256(json.dumps([kind, identity, returns], sort_keys=True).encode()).hexdigest()[:24]
 
 
+def _verified_purchase_time(order: dict) -> datetime | None:
+    if order.get("timestamp_basis") not in ("native_utc", "imported_lineage_utc"):
+        return None
+    value = order.get("purchased_at_utc")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _purchase_day(order: dict) -> date:
+    verified = _verified_purchase_time(order)
+    return (verified.astimezone(ZoneInfo("Europe/Kyiv")).date() if verified is not None
+            else date.fromisoformat(order["purchased_at"][:10]))
+
+
 def _newer(current: dict, prior: dict | None, since) -> bool:
-    if prior:
-        if current["order_id"] == prior["order_id"]:
-            return False  # corrected document dates are not a second purchase
-        current_day = date.fromisoformat(current["purchased_at"][:10])
-        prior_day = date.fromisoformat(prior["purchased_at"][:10])
-        # No durable per-row timezone provenance exists for this mixed imported/native
-        # source. Same-day timestamp ordering cannot safely prove a later purchase.
-        return current_day > prior_day
-    if since is None:
-        return False
+    if prior and current["order_id"] == prior["order_id"]:
+        return False  # corrected document dates are not a second purchase
+    verified_current = _verified_purchase_time(current)
+    verified_prior = _verified_purchase_time(prior) if prior else None
+    if verified_current is not None and verified_prior is not None:
+        return verified_current > verified_prior
     if isinstance(since, str):
         since = datetime.fromisoformat(since)
-    # Imported Order.Created is a source document wall clock, not reliably UTC.
-    # A legacy task with no baseline can only be resolved by a strictly later document day.
-    generated_day = since.replace(tzinfo=since.tzinfo or UTC).astimezone(ZoneInfo("Europe/Kyiv")).date()
-    return date.fromisoformat(current["purchased_at"][:10]) > generated_day
+    if since is not None:
+        # Mongo generated_at is an actual UTC instant. A newly verified purchase after
+        # that instant proves resolution even when the old legacy baseline lacks a clock.
+        generated_at = since.replace(tzinfo=since.tzinfo or UTC).astimezone(UTC)
+        if verified_current is not None:
+            return verified_current > generated_at
+        generated_day = generated_at.astimezone(ZoneInfo("Europe/Kyiv")).date()
+        return _purchase_day(current) > generated_day and (
+            not prior or _purchase_day(current) > _purchase_day(prior))
+    # No generation instant and no trustworthy clocks: adjacent calendar dates could
+    # straddle a UTC/local midnight. Only a strictly separated day is positive evidence.
+    return bool(prior and _purchase_day(current) > _purchase_day(prior) + timedelta(days=1))
 
 
 def _resolution(task: dict, facts: dict) -> dict | None:
@@ -103,32 +126,39 @@ def _candidate_already_satisfied(candidate, facts: dict, as_of: str) -> bool:
         # including today's order, is stronger evidence than that stale candidate.
         return bool(products) and all(
             str(p["product_id"]) in facts["orders"] and p.get("elapsed_days") is not None and
-            date.fromisoformat(facts["orders"][str(p["product_id"])]["purchased_at"][:10]) >
+            _purchase_day(facts["orders"][str(p["product_id"])]) >
             date.fromisoformat(as_of) - timedelta(days=int(p["elapsed_days"])) for p in products)
     if candidate.task_type == TaskType.CHURN_WINBACK:
-        return any(order["purchased_at"][:10] >= as_of for order in facts["orders"].values())
+        return any(_purchase_day(order) >= date.fromisoformat(as_of) for order in facts["orders"].values())
     return False
 
 
 def _preserve_commitment(task: dict, now: datetime) -> None:
     # Notes remain on the historical advice. Explicit work/snooze state also retains a live
     # follow-up independently of the AI quota. Contact-event deadlines already live separately.
-    if task["status"] not in ("in_progress", "snoozed") and not task.get("in_progress_since"):
+    was_scheduled = any(change.get("to") == "snoozed" for change in task.get("status_history", []))
+    if (task["status"] not in ("in_progress", "snoozed")
+            and not task.get("in_progress_since") and not was_scheduled):
         return
+    followup_status = "open"
+    if task["status"] == "snoozed":
+        followup_status = "snoozed"
+    elif task.get("in_progress_since") or task["status"] == "in_progress":
+        followup_status = "in_progress"
     key = "commitment|" + task["task_key"]
     document = {field: value for field, value in task.items() if field != "_id"}
     document.update(task_key=key, task_type="manual", origin="seller_commitment",
                     title="Наступний контакт: " + (task.get("client_name") or str(task["client_id"])),
                     reason="Збережене домовлене продовження після оновлення AI-поради",
                     source_task_key=task["task_key"], expires_at=None, updated_at=now,
-                    status="snoozed" if task["status"] == "snoozed" else "in_progress")
+                    status=followup_status)
     mongo.tasks().update_one({"task_key": key}, {"$setOnInsert": document}, upsert=True)
 
 
 def _supersede(task: dict, evidence: dict, now: datetime) -> bool:
     if evidence.get("orders"):
         evidence = {**evidence, "orders": {pid: {
-            "order_id": row["order_id"], "purchased_on": row["purchased_at"][:10],
+            "order_id": row["order_id"], "purchased_on": _purchase_day(row).isoformat(),
             "date_basis": "source_document_date",
         } for pid, row in evidence["orders"].items()}}
     result = mongo.tasks().update_one(

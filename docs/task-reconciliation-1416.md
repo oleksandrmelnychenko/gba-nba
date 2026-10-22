@@ -18,22 +18,33 @@ business database is introduced.
   are superseded with an explicit link to the retained advice.
 * Notes, deadlines, source evidence and status history are preserved. Explicit snoozed or
   in-progress work becomes a separately identified manual follow-up when its AI suggestion is
-  superseded. Interrupted follow-up copies are retried on the next reconciliation. Seller contact
+  superseded. An agreed snooze that has already woken becomes an open manual follow-up; it does
+  not lose its commitment merely because its current status is open. Interrupted follow-up copies are retried on the next reconciliation. Seller contact
   events and their next-contact dates remain untouched and follow the current client book.
-* Manual tasks are excluded from both global and per-client AI quotas. Dashboard count payloads
-  expose ai_active and manual_backlog separately. Superseded advice is available in workday history.
+* Manual tasks are excluded from global, per-client and per-type AI quotas. Dashboard payloads
+  expose `ai_active` and `manual_backlog` for ALL active states, including deferred snoozed tasks.
+  Manager `active_total` is their sum; each head row's `open_tasks` is the same sum. The manager's
+  existing `completed_vs_open.open` chart remains the visible inbox count, so it may be smaller.
+  Superseded advice is available in workday history.
 * Reconciliation occurs on an already-authorized generation run, including runs with zero
   candidates; deploying this code does not run generation. Source errors are reported separately
   from unverified client IDs. No claim is made that source absence proves a completed full sync.
 
-Validation (2026-10-22): 231 tests passed, 34 skipped. New fixtures cover settlement, missing debt,
-placed order, full/partial returns, a second reorder cycle in one month, month rollover, transfer,
-generator/source failures, manual quota, legacy duplicates, concurrent seller changes and recovery
-after interrupted follow-up copying. A disposable SQL Server database exercised the actual selectors;
-it was removed afterward. No DEV/QA business rows were modified.
+Validation (2026-10-22): hermetic full generator→reconciler→quota→Mongo fixtures use the actual
+debt and reorder generators with source I/O replaced. They cover payment, purchase, full return,
+second cycle, transfer, generator/source failure, month rollover and manual backlog above both
+AI caps. Separate HTTP contract fixtures verify manager/head counts, including deferred tasks.
+Actual SQL Server session-local #table fixtures validate source selection and timestamp provenance;
+no fixture writes reach business tables, and rollback removes the temporary fixtures.
 
-Evidence: /private/dashboard-reconcile-1416-20261022/{tests.log,sql-acceptance.log,sql_acceptance.py}.
+Commands:
 
+```sh
+python -m pytest -q
+NBA_SQL_FIXTURE_ENV_FILE=/path/to/dev-reader.env python -m pytest tests/test_purchase_history_sql.py -q
+```
+
+The SQL fixture refuses a non-DEV database or a login with INSERT permission on that database.
 
 ### Independent review evidence (2026-10-22)
 
@@ -47,9 +58,19 @@ Evidence: /private/dashboard-reconcile-1416-20261022/{tests.log,sql-acceptance.l
   140 distinct advised debt IDs across 40 clients for one current manager.
 - Refreshes capture facts for newly suggested products/debts; prior purchases cannot retroactively
   settle newly added suggestions. Old document identities remain until explicitly settled.
-- Changing an existing order's date is not another purchase. Mixed imported/native timestamps
-  have no durable per-row clock provenance, so same-day ordering is deliberately unverified.
-  This may defer same-day resolution; it never invents UTC timestamps. Same-day cycle support
-  requires authoritative source timestamp provenance and remains open.
+- Changing an existing order's date is not another purchase. Same-day resolution requires verified
+  UTC instants from the native confirmed invoice or a unique imported source identity/date that
+  matches Sale.Created. Unverified clocks retain conservative date-only handling; no UTC is guessed.
+- Source audit on the largest manager found 21,384 unique source-covered sale document dates, all
+  matching Sale.Created but only three matching Order.Created. Therefore the shared purchase spine
+  uses the confirmed invoice/source event, never draft creation. `purchased_at` is the verified
+  Kyiv wall clock (or raw unknown sale clock); `purchased_at_utc` exists only when verified.
+  The reader excludes deleted/merged inputs, editable drafts, invalid lines and fully returned stock.
+  The output merge document counts once, and ambiguous multiple sale bindings do not multiply rows.
 - Reassignment uses an updated-at compare-and-swap; a concurrent seller edit defers reconciliation.
   Stale generation cannot move an already transferred task back to the previous owner.
+
+Remaining release acceptance: integrate the additive nullable C# / console contract, deploy DEV/QA,
+and verify visible counts and same-day source evidence. This backend commit alone does not close
+BUG-1416. Unknown legacy source clocks and missing source identities intentionally remain unknown;
+no sync repair, new worker or production rollout is included.

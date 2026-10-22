@@ -767,6 +767,21 @@ def _active_inbox_query(manager_id: int) -> dict:
     }
 
 
+def active_workload_counts(manager_id: int) -> dict:
+    """Full active backlog, including deferred tasks; separate from today's visible inbox.
+
+    One cursor establishes a consistent split. Manual head assignments and preserved seller
+    commitments are equally manual, and never consume the generated AI capacity.
+    """
+    counts = {"ai_active": 0, "manual_backlog": 0}
+    for task in mongo.tasks().find(
+            {"manager_id": manager_id, "status": {"$in": [status.value for status in ACTIVE]}},
+            {"task_type": 1}):
+        name = "manual_backlog" if task.get("task_type") == TaskType.MANUAL.value else "ai_active"
+        counts[name] += 1
+    return {**counts, "active_total": sum(counts.values())}
+
+
 def dashboard_counts(manager_id: int, as_of: str) -> dict:
     """Chart-ready counts for a manager dashboard, computed from the SAME task store the cockpit
     inbox/count use — no separate scoring. Returns:
@@ -796,9 +811,7 @@ def dashboard_counts(manager_id: int, as_of: str) -> dict:
          "resolved_at": {"$gte": month_start, "$lt": next_month}})
 
     return {
-        "ai_active": active_count(manager_id, exclude_manual=True),
-        "manual_backlog": mongo.tasks().count_documents({"manager_id": manager_id,
-            "task_type": TaskType.MANUAL.value, "status": {"$in": list(s.value for s in ACTIVE)}}),
+        **active_workload_counts(manager_id),
         "task_type_mix": [{"type": tt, "count": n} for tt, n in sorted(type_mix.items())],
         "urgency_mix": [{"urgency": u, "count": urgency_mix[u]}
                         for u in ("critical", "high", "normal", "low")],

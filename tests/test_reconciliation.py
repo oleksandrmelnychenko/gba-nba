@@ -29,6 +29,11 @@ def order(identifier=100, when="2026-10-01T12:00:00"):
     return {"order_id": identifier, "purchased_at": when}
 
 
+def verified_order(identifier=100, when="2026-10-01T12:00:00"):
+    return {**order(identifier, when), "timestamp_basis": "native_utc",
+            "purchased_at_utc": when + "+00:00"}
+
+
 def facts(monkeypatch, *, owner=1, debts=None, orders=None):
     value = {10: {"manager_id": owner, "debts": debts or {}, "orders": orders or {}}}
     monkeypatch.setattr(reconciliation_repository, "source_facts", lambda ids, asof: value)
@@ -74,10 +79,10 @@ def test_missing_debt_is_not_paid_and_empty_generator_cannot_close(db, monkeypat
 
 
 def test_purchase_supersedes_old_advice_and_second_cycle_in_same_month_is_distinct(db, monkeypatch):
-    source = facts(monkeypatch, orders={"7": order()})
+    source = facts(monkeypatch, orders={"7": verified_order()})
     first, _ = persist(task())
     key = first[0].task_key
-    source[10]["orders"]["7"] = order(101, "2026-10-17T11:00:00")
+    source[10]["orders"]["7"] = verified_order(101, "2026-10-17T11:00:00")
     # Generator still reflects yesterday; don't create another call immediately after purchase.
     stale, stats = persist(task("monthly-old"), "2026-10-17")
     assert stale == [] and stats["superseded"] == 1
@@ -174,14 +179,14 @@ def test_generator_failure_does_not_mean_absence(db, monkeypatch):
 
 
 def test_full_return_after_purchase_allows_renewed_need_without_resurrecting_history(db, monkeypatch):
-    source = facts(monkeypatch, orders={"7": order()})
+    source = facts(monkeypatch, orders={"7": verified_order()})
     first, _ = persist(task())
-    source[10]["orders"]["7"] = order(101, "2026-10-17T11:00:00")
+    source[10]["orders"]["7"] = verified_order(101, "2026-10-17T11:00:00")
     reconciliation.prepare(1, [], "2026-10-17")
     assert db.tasks.find_one({"task_key": first[0].task_key})["status"] == "superseded"
     # That purchase is returned completely: the retained-purchase frontier goes back,
     # but positive return evidence gives the renewed need a new, stable identity.
-    source[10]["orders"]["7"] = order()
+    source[10]["orders"]["7"] = verified_order()
     source[10]["returns"] = {"7": {"order_id": 101, "quantity": "20",
                                       "returned_at": "2026-10-18T12:00:00"}}
     candidate = task("returned")
@@ -344,3 +349,38 @@ def test_debt_generator_preserves_exact_document_ids(monkeypatch):
     monkeypatch.setattr(debt_followup.sig, "client_features", lambda ids, asof: {})
     generated = debt_followup.generate(1, "2026-10-17", "2026-10")
     assert generated[0].payload["debt"]["debt_ids"] == [501, 503]
+
+
+def test_same_day_purchase_requires_verified_clock_and_distinct_document():
+    prior = verified_order(100, "2026-10-22T09:00:00")
+    actual = verified_order(101, "2026-10-22T10:00:00")
+    assert reconciliation._newer(actual, prior, datetime(2026, 10, 22, 9, 30, tzinfo=UTC))
+    assert not reconciliation._newer(verified_order(100, "2026-10-22T10:00:00"), prior, None)
+    unknown = order(102, "2026-10-22T23:59:00")
+    assert not reconciliation._newer(unknown, prior, datetime(2026, 10, 22, 9, 30, tzinfo=UTC))
+
+
+def test_verified_same_day_purchase_can_resolve_legacy_baseline_after_generation():
+    actual = verified_order(101, "2026-10-22T10:00:00")
+    assert reconciliation._newer(actual, order(100), datetime(2026, 10, 22, 9, tzinfo=UTC))
+    assert not reconciliation._newer(actual, order(100), datetime(2026, 10, 22, 11, tzinfo=UTC))
+
+
+def test_verified_purchase_day_uses_kyiv_calendar():
+    assert str(reconciliation._purchase_day(verified_order(100, "2026-10-21T22:00:00"))) == '2026-10-22'
+
+
+def test_awakened_scheduled_followup_survives_source_resolution_as_open_manual(db, monkeypatch):
+    source = facts(monkeypatch, debts={"501": "50"})
+    rows, _ = persist(task(kind=TaskType.DEBT_FOLLOWUP))
+    key = rows[0].task_key
+    lifecycle.change_status(key, TaskStatus.SNOOZED, by=1,
+                            snooze_until=datetime.now(UTC) + timedelta(days=1))
+    db.tasks.update_one({'task_key': key}, {'$set': {'snooze_until': datetime.now(UTC) - timedelta(days=1)}})
+    lifecycle.wake_snoozed()
+    assert db.tasks.find_one({'task_key': key})['status'] == 'open'
+    source[10]['debts']['501'] = '0'
+    reconciliation.prepare(1, [], '2026-10-22')
+    followup = db.tasks.find_one({'source_task_key': key})
+    assert followup['task_type'] == 'manual' and followup['status'] == 'open'
+    assert followup['expires_at'] is None

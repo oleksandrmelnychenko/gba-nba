@@ -5,11 +5,13 @@ unknown. purchased_at_utc is populated ONLY with positive timestamp provenance. 
 creation is retained separately and never substituted for the confirmed purchase event.
 Callers supply internal SQL fragments/bound parameter names, never request text as scope_sql.
 """
+
 import re
 
 
-def retained_purchase_cte(scope_sql: str = "c.MainManagerID = :mid",
-                          start_param: str = "source_start", end_param: str = "asof") -> str:
+def retained_purchase_cte(
+    scope_sql: str = "c.MainManagerID = :mid", start_param: str = "source_start", end_param: str = "asof"
+) -> str:
     for name in (start_param, end_param):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError("Invalid internal purchase boundary parameter")
@@ -57,7 +59,8 @@ def retained_purchase_cte(scope_sql: str = "c.MainManagerID = :mid",
         SELECT p.client_id, oi.ProductID AS product_id, p.order_id, p.purchased_at,
                p.raw_order_created, p.timestamp_basis, p.purchased_at_utc,
                SUM(CAST(oi.Qty - COALESCE(oi.ReturnedQty, 0) AS decimal(30, 8))) AS quantity,
-               SUM(CAST(oi.Qty - COALESCE(oi.ReturnedQty, 0) AS decimal(30, 8)) * oi.PricePerItem) AS turnover_eur
+               SUM(CAST(oi.Qty - COALESCE(oi.ReturnedQty, 0) AS decimal(30, 8))
+                   * oi.PricePerItem) AS turnover_eur
         FROM purchase_orders p
         JOIN dbo.OrderItem oi ON oi.OrderID = p.order_id AND oi.Deleted = 0
         WHERE oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL AND oi.Qty > 0

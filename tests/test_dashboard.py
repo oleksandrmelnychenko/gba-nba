@@ -106,6 +106,9 @@ def test_manager_dashboard_shape_and_mix(client):
         "debt_unknown_terms_count",
         "debt_unknown_terms_eur",
         "completed_vs_open",
+        "active_total",
+        "ai_active",
+        "manual_backlog",
         "source_history_start",
         "effective_start",
         "history_complete",
@@ -182,6 +185,7 @@ def test_manager_dashboard_passes_resolved_kyiv_date_to_task_month(client, monke
             "task_type_mix": [],
             "urgency_mix": [],
             "completed_vs_open": [],
+            "active_total": 0, "ai_active": 0, "manual_backlog": 0,
         },
     )
     monkeypatch.setattr(main, "_debt_dashboards_cached", lambda as_of: {})
@@ -243,7 +247,7 @@ def test_head_dashboard_shape(client):
         "history_complete",
     }
     teams = {t["manager_id"]: t for t in body["teams"]}
-    assert set(teams[1]) == {"manager_id", "open_tasks", "critical", "value_at_risk_eur", "debt_unknown_date_count", "debt_unknown_date_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur"}
+    assert set(teams[1]) == {"manager_id", "open_tasks", "ai_active", "manual_backlog", "critical", "value_at_risk_eur", "debt_unknown_date_count", "debt_unknown_date_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur"}
     assert teams[1]["open_tasks"] == 2
     assert teams[1]["critical"] == 1
     assert teams[1]["value_at_risk_eur"] == 1234.50
@@ -302,3 +306,33 @@ def test_debt_dashboard_aging_buckets(monkeypatch):
     assert aging["31-60"] == {"bucket": "31-60", "amount_eur": 50.0, "count": 1}
     assert aging["61-90"] == {"bucket": "61-90", "amount_eur": 75.0, "count": 1}
     assert aging["90+"] == {"bucket": "90+", "amount_eur": 1000.0, "count": 1}
+
+
+def test_workload_split_includes_deferred_commitments_without_changing_visible_inbox(client):
+    from app.services import lifecycle
+    _seed(1, "visible-ai")
+    _seed(1, "deferred-ai")
+    _seed(1, "head-manual", task_type=TaskType.MANUAL)
+    _seed(1, "seller-commitment", task_type=TaskType.MANUAL)
+    _seed(2, "other-manual", task_type=TaskType.MANUAL)
+    _seed(1, "closed-manual", task_type=TaskType.MANUAL)
+    lifecycle.change_status("closed-manual", TaskStatus.DISMISSED, by=1)
+    deadline = datetime.now(UTC) + timedelta(days=5)
+    for key in ("deferred-ai", "seller-commitment"):
+        lifecycle.change_status(key, TaskStatus.SNOOZED, by=1, snooze_until=deadline)
+    manager = client.get("/cockpit/dashboard", params={"manager_net_uid": MGR_UID}).json()
+    head = client.get("/cockpit/head/dashboard", params={"manager_net_uid": HEAD_UID}).json()
+    assert {key: manager[key] for key in ("ai_active", "manual_backlog", "active_total")} == {
+        "ai_active": 2, "manual_backlog": 2, "active_total": 4}
+    assert next(row['count'] for row in manager['completed_vs_open'] if row['status'] == 'open') == 2
+    team = next(row for row in head['teams'] if row['manager_id'] == 1)
+    assert team['open_tasks'] == team['ai_active'] + team['manual_backlog'] == 4
+    assert team['ai_active'] == manager['ai_active']
+    assert team['manual_backlog'] == manager['manual_backlog']
+
+
+def test_empty_workload_is_explicit_zero_on_both_dashboard_contracts(client):
+    manager = client.get("/cockpit/dashboard", params={"manager_net_uid": MGR_UID}).json()
+    head = client.get("/cockpit/head/dashboard", params={"manager_net_uid": HEAD_UID}).json()
+    assert all(manager[key] == 0 for key in ("active_total", "ai_active", "manual_backlog"))
+    assert all(row['ai_active'] == row['manual_backlog'] == row['open_tasks'] == 0 for row in head['teams'])

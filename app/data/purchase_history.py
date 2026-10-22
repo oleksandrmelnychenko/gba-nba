@@ -10,12 +10,13 @@ import re
 
 
 def retained_purchase_cte(
-    scope_sql: str = "c.MainManagerID = :mid", start_param: str = "source_start", end_param: str = "asof"
+    scope_sql: str = "c.MainManagerID = :mid", start_param: str = "source_start", end_param: str = "asof",
+    *, materialize_orders: bool = False
 ) -> str:
     for name in (start_param, end_param):
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ValueError("Invalid internal purchase boundary parameter")
-    return f"""
+    sql = f"""
     WITH purchase_candidates AS (
         SELECT c.ID AS client_id, o.ID AS order_id, o.Created AS raw_order_created,
                CASE WHEN sale.imported = 0 THEN sale.invoice_at
@@ -70,3 +71,13 @@ def retained_purchase_cte(
         HAVING SUM(oi.Qty - COALESCE(oi.ReturnedQty, 0)) > 0
     )
     """
+
+    if materialize_orders:
+        # Evaluate timezone/lineage once per purchase order before the product-row join.
+        # Connection-local temp data is rolled back when db.query closes its connection;
+        # the defensive drop also supports a caller reusing a connection after failure.
+        sql = "SET NOCOUNT ON; DROP TABLE IF EXISTS #repeat_purchase_orders; " + sql.replace(
+            "), retained_purchases AS (",
+            ") SELECT * INTO #repeat_purchase_orders FROM purchase_orders; WITH retained_purchases AS (",
+        ).replace("FROM purchase_orders p", "FROM #repeat_purchase_orders p")
+    return sql

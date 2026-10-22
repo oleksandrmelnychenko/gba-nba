@@ -399,3 +399,12 @@ def test_awakened_scheduled_followup_survives_source_resolution_as_open_manual(d
     followup = db.tasks.find_one({'source_task_key': key})
     assert followup['task_type'] == 'manual' and followup['status'] == 'open'
     assert followup['expires_at'] is None
+
+
+def test_head_task_assignment_survives_client_owner_reconciliation(db, monkeypatch):
+    facts(monkeypatch, owner=1, orders={"7": order()})
+    lifecycle.create_manual(task("delegated", kind=TaskType.MANUAL, manager=2), created_by=9)
+    db.tasks.update_one({"task_key": "delegated"}, {"$set": {"assignment_mode": "head_task_only"}})
+    _, stats = reconciliation.prepare(2, [], "2026-10-22")
+    assert stats["reassigned"] == 0
+    assert db.tasks.find_one({"task_key": "delegated"})["manager_id"] == 2

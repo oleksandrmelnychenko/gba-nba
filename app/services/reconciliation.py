@@ -213,7 +213,7 @@ def prepare(manager_id: int, candidates: list, as_of: str) -> tuple[list, dict]:
         source = facts.get(task.get("client_id"))
         if source is None:
             continue
-        if source["manager_id"] != task["manager_id"]:
+        if source["manager_id"] != task["manager_id"] and task.get("assignment_mode") != "head_task_only":
             owner = source["manager_id"]
             result = mongo.tasks().update_one(
                 {"_id": task["_id"], "manager_id": task["manager_id"], "status": task["status"],

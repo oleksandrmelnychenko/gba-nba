@@ -603,7 +603,7 @@ def team_tasks(statuses: list[str], manager_ids: list[int] | None = None, urgenc
         "_rank_score": {"$ifNull": ["$ev_score", "$priority"]},
     }
     sort_stage = {"_u_rank": 1, "_ip_present": 1, "in_progress_since": 1,
-                  "_rank_score": -1, "priority": -1}
+                  "_rank_score": -1, "priority": -1, "task_key": 1}
     projection = {f: 1 for f in _TEAM_BOARD_FIELDS}
     projection["_id"] = 0
 

@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.sale_attribution import router as sale_attribution_router
+from app.api.head_coaching import router as head_coaching_router
 from app.core import history
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -26,7 +27,7 @@ from app.data import debt_snapshot, mongo, signals_repository
 from app.data.db import get_engine
 from app.domain.models import Contact, Explanation, Outcome, Task, TaskStatus, TaskType, Urgency
 from app.domain.seller_contacts import ContactBucket, ContactCreate
-from app.services import lifecycle, repeat_sales, seller_contacts, workday
+from app.services import lifecycle, repeat_sales, seller_contacts, task_delegation, workday
 
 log = get_logger("api")
 settings = get_settings()
@@ -458,7 +459,7 @@ def cockpit_clients(
 
 
 def _owned_contact_client(manager_id: int, client_id: int) -> dict:
-    rows = signals_repository.contact_book_for_manager(manager_id, client_id)
+    rows = task_delegation.contact_book(manager_id, client_id)
     if not rows:
         raise HTTPException(status_code=404, detail="client_not_in_manager_book")
     return rows[0]
@@ -473,7 +474,7 @@ def cockpit_workday(
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
 ) -> dict:
     manager_id = _resolve_manager(manager_net_uid)
-    book = signals_repository.contact_book_for_manager(manager_id)
+    book = task_delegation.contact_book(manager_id)
     manager_name = signals_repository.manager_names([manager_id]).get(manager_id, str(manager_id))
     return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
             **workday.queue(manager_id, manager_name, book, bucket, search.strip(), offset, limit)}
@@ -490,7 +491,7 @@ def cockpit_workday_tasks(
     if key.startswith("client:") and int(key.split(":", 1)[1]) > 2147483647:
         raise HTTPException(status_code=422, detail="invalid_client_id")
     manager_id = _resolve_manager(manager_net_uid)
-    book = signals_repository.contact_book_for_manager(manager_id)
+    book = task_delegation.contact_book(manager_id)
     try:
         page = workday.task_page(manager_id, [int(row["client_id"]) for row in book],
                                  key, scope, offset, limit)
@@ -508,7 +509,7 @@ def cockpit_contacts(
     limit: Annotated[int, Query(ge=1, le=200)] = 20,
 ) -> dict:
     manager_id = _resolve_manager(manager_net_uid)
-    book = signals_repository.contact_book_for_manager(manager_id)
+    book = task_delegation.contact_book(manager_id)
     return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
             **seller_contacts.queue(manager_id, [int(row["client_id"]) for row in book],
                                     bucket, search.strip(), offset, limit)}
@@ -1234,3 +1235,5 @@ def head_escalated(
 
 
 app.include_router(sale_attribution_router)
+
+app.include_router(head_coaching_router)

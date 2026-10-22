@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.data import sale_attribution_repository as source
 from app.data import signals_repository
-from app.services import lifecycle
+from app.services import lifecycle, task_delegation
 from app.services import sale_attribution as service
 
 router = APIRouter()
@@ -24,7 +24,7 @@ def owned_task(mid, key):
     task = lifecycle.get_task(key)
     if not task or task.get("manager_id") != mid or not task.get("client_id"):
         raise HTTPException(404, "task_not_owned")
-    if not signals_repository.contact_book_for_manager(mid, task["client_id"]):
+    if not task_delegation.contact_book(mid, task["client_id"]):
         raise HTTPException(404, "client_not_in_manager_book")
     return task
 

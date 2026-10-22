@@ -148,9 +148,9 @@ def test_history_scope_is_own_terminal_tasks_with_notes(fixture):
     task(db, "foreign", manager_id=3, status="done")
     assert details(client).json()["total"] == 1
     page = details(client, scope="history", limit=2).json()
-    assert page["total"] == 3 and len(page["tasks"]) == 2
+    assert page["total"] == len(workday.HISTORY) and len(page["tasks"]) == 2
     assert page["tasks"][0]["notes"][0]["created_at"].endswith("Z")
-    assert details(client, scope="history", offset=2).json()["count"] == 1
+    assert details(client, scope="history", offset=2).json()["count"] == len(workday.HISTORY) - 2
 
 
 def test_contact_history_follows_current_owner_without_rewriting_authors(fixture):

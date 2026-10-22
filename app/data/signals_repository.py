@@ -358,7 +358,8 @@ def contacts_for_clients(client_ids: list[int]) -> dict[int, dict]:
     rows = query(
         f"""
         SELECT c.ID AS client_id, c.FullName AS full_name, c.Name AS name,
-               c.MobileNumber AS phone, c.EmailAddress AS email
+               c.MobileNumber AS phone, c.EmailAddress AS email,
+               LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid
         FROM dbo.Client c WHERE c.Deleted = 0 AND c.ID IN {ph}
         """,
         params,
@@ -590,7 +591,7 @@ def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int 
             params.update(extra)
     # Window ranks count each order only once across its product rows, so the entire book,
     # repeat cycles and churn use one scan of the same retained source snapshot.
-    sql = retained_purchase_cte() + f"""
+    sql = retained_purchase_cte(materialize_orders=True) + f"""
         , ranked AS (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY client_id, product_id ORDER BY purchased_at DESC, order_id DESC) AS rn,
@@ -666,7 +667,7 @@ def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int 
                   AND st.Deleted = 0 AND st.ForDefective = 0
         ) stock
         WHERE c.Deleted = 0 AND c.MainManagerID = :mid
-    """ + ("" if include_book else " AND x.product_id IS NOT NULL") + " ORDER BY c.ID, x.product_id"
+    """ + ("" if include_book else " AND x.product_id IS NOT NULL") + " ORDER BY c.ID, x.product_id; DROP TABLE #repeat_purchase_orders;"
     return query(sql, params)
 
 

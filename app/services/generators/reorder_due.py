@@ -8,10 +8,11 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
+from app.core import history
 from app.core.config import get_settings
 from app.data import signals_repository as sig
 from app.domain.models import Contact, Explanation, Task, TaskType
-from app.services import scoring
+from app.services import repeat_sales, scoring
 
 TYPE = TaskType.REORDER_DUE
 _MAX_PRODUCTS_PER_TASK = 5
@@ -74,6 +75,12 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             "source": "reorder",
         } for it in top]
 
+        coverage = history.rolling_days(as_of, 365)
+        for product, source in zip(products, top, strict=True):
+            if source.get("last_buy") is not None:
+                product.update(repeat_sales.product_evidence(
+                    source, coverage.as_of, coverage.history_complete))
+
         lead_name = names.get(int(lead["product_id"]), f"товар {lead['product_id']}")
         tasks.append(Task(
             task_key=f"mgr:{manager_id}|client:{cid}|type:{TYPE.value}|win:{window_tag}",
@@ -84,7 +91,8 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
                    + (f" (+{len(top) - 1} позицій)" if len(top) > 1 else ""),
             priority=prio, p_outcome=p_out, expected_value=ev, ev_score=ev_score,
             urgency=scoring.urgency_band(u_band),
-            payload={"products": products},
+            payload={"products": products, "history_start": history.source_history_start().isoformat(),
+                     "history_complete": coverage.history_complete, "date_basis": "source_document_date"},
             signals={"elapsed_days": float(lead["elapsed_days"]),
                      "cycle_days": float(lead["cycle_days"] or 0),
                      "overdue_ratio": float(lead["_overdue_ratio"]),

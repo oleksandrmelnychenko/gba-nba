@@ -25,7 +25,7 @@ from app.data import debt_snapshot, mongo, signals_repository
 from app.data.db import get_engine
 from app.domain.models import Contact, Explanation, Outcome, Task, TaskStatus, TaskType, Urgency
 from app.domain.seller_contacts import ContactBucket, ContactCreate
-from app.services import lifecycle, seller_contacts, workday
+from app.services import lifecycle, repeat_sales, seller_contacts, workday
 
 log = get_logger("api")
 settings = get_settings()
@@ -421,7 +421,13 @@ def cockpit_count(manager_net_uid: str) -> dict:
 
 
 @app.get("/cockpit/clients")
-def cockpit_clients(manager_net_uid: str, as_of_date: date | None = None) -> dict:
+def cockpit_clients(
+    manager_net_uid: str, as_of_date: date | None = None,
+    segment: repeat_sales.ClientSegment = "all",
+    search: Annotated[str, Query(max_length=200)] = "",
+    offset: Annotated[int, Query(ge=0, le=1000000)] = 0,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict:
     """The manager's client book with light commercial stats + overdue debt — the cockpit
     «Мої клієнти» view. Recommendations hydrate per client in the console via the existing
     NetUID-keyed gba-server routes; this endpoint supplies the book and the NetUIDs."""
@@ -429,7 +435,7 @@ def cockpit_clients(manager_net_uid: str, as_of_date: date | None = None) -> dic
     resolved_as_of = _resolved_as_of(as_of_date)
     started = time.time()
     try:
-        rows = signals_repository.clients_overview_for_manager(manager_id, resolved_as_of)
+        rows, products, churn = repeat_sales.read_snapshot(manager_id, resolved_as_of)
         debts = {
             int(d["client_id"]): d
             for d in signals_repository.overdue_debts_for_manager(manager_id, resolved_as_of)
@@ -439,9 +445,11 @@ def cockpit_clients(manager_net_uid: str, as_of_date: date | None = None) -> dic
             r["overdue_eur"] = cents(debt["overdue_amount"]) if debt else 0.0
             r["max_days_past_terms"] = int(debt["max_days_past_terms"]) if debt else 0
             r["turnover_eur"] = cents(r.get("turnover_eur") or 0)
+        page = repeat_sales.enrich_and_page(manager_id, resolved_as_of, rows, segment=segment,
+                                            search=search, offset=offset, limit=limit, facts=(products, churn))
         METRICS.record_request((time.time() - started) * 1000)
         return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
-                "as_of": resolved_as_of, "count": len(rows), "clients": rows}
+                "as_of": resolved_as_of, **page}
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("cockpit_clients_failed", manager_id=manager_id, error=str(exc))

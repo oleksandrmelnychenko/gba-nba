@@ -45,6 +45,7 @@ def test_reorder_due_bundles_per_client(monkeypatch):
         {"client_id": 10, "product_id": 100, "n_orders": 5, "cycle_days": 30.0, "elapsed_days": 60},
         {"client_id": 10, "product_id": 101, "n_orders": 4, "cycle_days": 20.0, "elapsed_days": 50},
     ]
+    rows[0].update(last_buy="2026-04-01", last_quantity=4, available_qty=0)
     monkeypatch.setattr(reorder_due.sig, "reorder_candidates_for_manager",
                         lambda mid, as_of, min_cycle_days, max_overdue_mult: rows)
     monkeypatch.setattr(
@@ -63,6 +64,10 @@ def test_reorder_due_bundles_per_client(monkeypatch):
     t = tasks[0]
     assert t.task_key == "mgr:1|client:10|type:reorder_due|win:2026-06"
     assert len(t.payload["products"]) == 2
+    evidence = next(p for p in t.payload["products"] if p["product_id"] == 100)
+    assert evidence["last_purchase_on"] == "2026-04-01" and evidence["last_quantity"] == 4
+    assert evidence["availability_status"] == "out_of_stock"
+    assert t.payload["date_basis"] == "source_document_date"
     assert t.priority == round(100.0 * t.p_outcome, 2) and t.p_outcome > 0
 
 

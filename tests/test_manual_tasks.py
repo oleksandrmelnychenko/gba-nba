@@ -192,6 +192,9 @@ def test_head_clients_gate_and_listing(client, monkeypatch):
 
 def test_cockpit_clients_merges_debt(client, monkeypatch):
     from app.api import main
+    monkeypatch.setattr(main.signals_repository, "repeat_products_for_manager", lambda *a, **k: [])
+    monkeypatch.setattr(main.signals_repository, "churn_candidates_for_manager", lambda *a: [])
+    monkeypatch.setattr(main.signals_repository, "_excluded", lambda *a: frozenset())
     monkeypatch.setattr(
         main.signals_repository, "clients_overview_for_manager",
         lambda mid, as_of: [
@@ -202,6 +205,9 @@ def test_cockpit_clients_merges_debt(client, monkeypatch):
              "phone": None, "email": None, "last_order": None, "orders_cnt": 0,
              "turnover_eur": 0},
         ])
+    monkeypatch.setattr(main.repeat_sales, "read_snapshot",
+                        lambda mid, as_of: (main.signals_repository.clients_overview_for_manager(mid, as_of),
+                                            [], set()))
     monkeypatch.setattr(
         main.signals_repository, "overdue_debts_for_manager",
         lambda mid, as_of: [{"client_id": 10, "overdue_amount": 500.129,

@@ -20,6 +20,7 @@ from app.core import history
 from app.core.config import get_settings
 from app.core.money import cents, cents_decimal, decimal_value
 from app.data.db import in_clause, query
+from app.data.purchase_history import retained_purchase_cte
 
 
 @lru_cache(maxsize=64)
@@ -237,41 +238,21 @@ def manager_names(manager_ids: list[int]) -> dict[int, str]:
 
 def new_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 90,
                             max_orders: int = 0) -> list[dict]:
-    """Recently-created clients with factual order counts over all available source history."""
+    """Clients with few retained purchases; never infer acquisition date from Client.Created."""
     created_window = history.rolling_days(as_of, recent_days)
     purchase_window = history.factual_window(as_of)
-    return query(
-        """
-        WITH cand AS (
-            SELECT c.ID, c.FullName, c.Name, c.MobileNumber, c.EmailAddress, c.Created
-            FROM dbo.Client c
-            WHERE c.Deleted = 0 AND c.MainManagerID = :mid
-                  AND c.Created >= :created_start AND c.Created < :asof
-        ),
-        oc AS (
-            SELECT ca.ClientID AS cid, COUNT(DISTINCT oi.OrderID) AS n
-            FROM dbo.ClientAgreement ca
-            JOIN cand ON cand.ID = ca.ClientID
-            LEFT JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= :source_start AND o.Created < :asof
-            LEFT JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-            GROUP BY ca.ClientID
-        )
-        SELECT cand.ID AS client_id, cand.FullName AS full_name, cand.Name AS name,
-               cand.MobileNumber AS phone, cand.EmailAddress AS email,
-               DATEDIFF(day, cand.Created, :asof) AS days_since_created,
-               ISNULL(oc.n, 0) AS n_orders
-        FROM cand LEFT JOIN oc ON oc.cid = cand.ID
-        WHERE ISNULL(oc.n, 0) <= :maxord
-        """,
-        {
-            "mid": manager_id,
-            "asof": created_window.as_of.isoformat(),
-            "created_start": created_window.effective_start.isoformat(),
-            "source_start": purchase_window.effective_start.isoformat(),
-            "maxord": max_orders,
-        },
-    )
+    # Client.Created is a sync timestamp, not evidence of a genuinely new customer.
+    return query(retained_purchase_cte() + """
+        SELECT c.ID AS client_id, c.FullName AS full_name, c.Name AS name,
+               c.MobileNumber AS phone, c.EmailAddress AS email,
+               NULL AS days_since_created, COUNT(DISTINCT p.order_id) AS n_orders
+        FROM dbo.Client c LEFT JOIN retained_purchases p ON p.client_id = c.ID
+        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+        GROUP BY c.ID, c.FullName, c.Name, c.MobileNumber, c.EmailAddress
+        HAVING COUNT(DISTINCT p.order_id) <= :maxord
+        """, {"mid": manager_id, "asof": created_window.as_of.isoformat(),
+              "created_start": created_window.effective_start.isoformat(),
+              "source_start": purchase_window.effective_start.isoformat(), "maxord": max_orders})
 
 
 def all_managers() -> list[int]:
@@ -314,53 +295,35 @@ def contact_book_for_manager(manager_id: int, client_id: int | None = None) -> l
 
 
 def clients_overview_for_manager(manager_id: int, as_of: str, window_days: int = 365) -> list[dict]:
-    """Manager's client book + light commercial stats for the cockpit «Мої клієнти» view: identity,
-    contacts, NetUID (the console recommendation/agreement routes are NetUID-keyed), last order date,
-    distinct orders and EUR turnover over the trailing window. Turnover mirrors client_monetary
-    (IsValidForCurrentSale + synthetic/ubiquity exclusion) so the number matches every other signal."""
+    """Owned client book; turnover and last purchase share the retained-invoice grain."""
     window = history.rolling_days(as_of, window_days)
-    excl = _excluded(window.as_of.isoformat())
-    not_in = ""
-    params: dict = {
-        "mid": manager_id,
-        "asof": window.as_of.isoformat(),
-        "start": window.effective_start.isoformat(),
-    }
-    if excl:
-        eph, eparams = in_clause("x", sorted(excl))
-        not_in = f" AND oi.ProductID NOT IN {eph}"
-        params.update(eparams)
-    return query(
-        f"""
-        SELECT c.ID AS client_id,
-               LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid,
-               c.Name AS name, c.FullName AS full_name,
-               c.MobileNumber AS phone, c.EmailAddress AS email,
-               ord.last_order AS last_order,
-               ISNULL(ord.orders_cnt, 0) AS orders_cnt,
-               ISNULL(rev.turnover_eur, 0) AS turnover_eur
-        FROM dbo.Client c
-        OUTER APPLY (
-            SELECT MAX(o.Created) AS last_order, COUNT(DISTINCT o.ID) AS orders_cnt
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= :start AND o.Created < :asof
-            WHERE ca.ClientID = c.ID
-        ) ord
-        OUTER APPLY (
-            SELECT SUM(oi.Qty * oi.PricePerItem) AS turnover_eur
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= :start AND o.Created < :asof
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-                 AND oi.IsValidForCurrentSale = 1 AND oi.ProductID IS NOT NULL{not_in}
-            WHERE ca.ClientID = c.ID
-        ) rev
+    params = {"mid": manager_id, "asof": window.as_of.isoformat(),
+              "source_start": history.source_history_start().isoformat(),
+              "start": window.effective_start.isoformat()}
+    excluded = _excluded(as_of)
+    predicate = ""
+    if excluded:
+        placeholders, extra = in_clause("x", sorted(excluded))
+        predicate = f" WHERE product_id NOT IN {placeholders}"
+        params.update(extra)
+    return query(retained_purchase_cte() + f"""
+        , commercial AS (SELECT * FROM retained_purchases {predicate}),
+        stats AS (
+            SELECT client_id, MAX(purchased_at) AS last_order,
+                   COUNT(DISTINCT order_id) AS retained_orders_cnt,
+                   COUNT(DISTINCT CASE WHEN purchased_at >= :start THEN order_id END) AS orders_cnt,
+                   SUM(CASE WHEN purchased_at >= :start THEN turnover_eur ELSE 0 END) AS turnover_eur
+            FROM commercial GROUP BY client_id
+        )
+        SELECT c.ID AS client_id, LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid,
+               c.Name AS name, c.FullName AS full_name, c.MobileNumber AS phone, c.EmailAddress AS email,
+               s.last_order, COALESCE(s.orders_cnt, 0) AS orders_cnt,
+               COALESCE(s.retained_orders_cnt, 0) AS retained_orders_cnt,
+               COALESCE(s.turnover_eur, 0) AS turnover_eur
+        FROM dbo.Client c LEFT JOIN stats s ON s.client_id = c.ID
         WHERE c.Deleted = 0 AND c.MainManagerID = :mid
-        ORDER BY ISNULL(rev.turnover_eur, 0) DESC, c.Name
-        """,
-        params,
-    )
+        ORDER BY COALESCE(s.turnover_eur, 0) DESC, c.Name, c.ID
+    """, params)
 
 
 def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 120,
@@ -370,16 +333,10 @@ def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 1
     data this is ~20% of a manager's book, so it cuts reco HTTP calls 4-5x vs. all clients."""
     window = history.rolling_days(as_of, recent_days)
     return query(
-        """
-        WITH act AS (
-            SELECT ca.ClientID AS cid
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= :start AND o.Created < :asof
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-            JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
-            GROUP BY ca.ClientID
-            HAVING COUNT(DISTINCT o.ID) >= :minord
+        retained_purchase_cte(start_param="start") + """
+        , act AS (
+            SELECT client_id AS cid FROM retained_purchases
+            GROUP BY client_id HAVING COUNT(DISTINCT order_id) >= :minord
         )
         SELECT c.ID AS client_id, c.FullName AS full_name, c.Name AS name,
                c.MobileNumber AS phone, c.EmailAddress AS email
@@ -606,60 +563,120 @@ def debt_dashboard_for_manager(manager_id: int, as_of: str) -> dict:
 
 # --- reorder_due signal ---
 
-def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,
-                                   min_cycle_days: int = 7, max_overdue_mult: float = 3.0) -> list[dict]:
-    """Per client×product: purchase cycle vs elapsed days. Flags products 'due to reorder'.
+def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,
+                                min_cycle_days: int = 7, *, include_day: bool = False,
+                                include_book: bool = False) -> list[dict]:
+    """Same retained purchase cycle for generation and the client screen, before due filtering.
 
-    cycle = avg gap between orders of that product (span / (n-1)), floored at min_cycle_days;
-    elapsed = days since last buy. Returns rows where cycle <= elapsed <= max_overdue_mult*cycle.
-    The min floor suppresses burst-buyers (raw cycle ~1-2d) that would flag as perpetually
-    'critical' (~11% of pairs on real data). The max ceiling drops abandoned products: on real
-    data the mean overdue ratio is ~11x, i.e. products a client stopped buying long ago — those
-    are churn, not a reorder nudge, so they're excluded here (and the urgency band stays meaningful).
+    Only the selected screen day is inclusive; scheduled generation keeps its exclusive cutoff.
+    Evidence is compact (three latest documents) while counts/cycles use the entire source window.
+    Stock is current free availability across active non-defective warehouses, not an agreement quote.
     """
     window = history.factual_window(as_of)
-    return query(
-        """
-        WITH per_product AS (
-            SELECT ca.ClientID AS client_id, oi.ProductID AS product_id,
-                   COUNT(DISTINCT o.ID) AS n_orders,
-                   MIN(o.Created) AS first_buy,
-                   MAX(o.Created) AS last_buy
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND o.Created >= :source_start AND o.Created < :asof
-                  AND oi.ProductID IS NOT NULL
-                  AND c.Deleted = 0 AND c.MainManagerID = :mid
-            GROUP BY ca.ClientID, oi.ProductID
-            HAVING COUNT(DISTINCT o.ID) >= :minp
-        ),
-        cyc AS (
-            SELECT client_id, product_id, n_orders,
-                   DATEDIFF(day, last_buy, :asof) AS elapsed_days,
-                   CASE WHEN DATEDIFF(day, first_buy, last_buy) * 1.0 / NULLIF(n_orders - 1, 0) < :mincyc
-                        THEN :mincyc * 1.0
-                        ELSE DATEDIFF(day, first_buy, last_buy) * 1.0 / NULLIF(n_orders - 1, 0)
-                   END AS cycle_days
-            FROM per_product
-            WHERE DATEDIFF(day, first_buy, last_buy) > 0
+    end = window.as_of + timedelta(days=1) if include_day else window.as_of
+    recent = history.rolling_days(end, 90)
+    baseline = history.rolling_days(end, 365)
+    params = {"mid": manager_id, "asof": end.isoformat(), "cycle_asof": as_of,
+              "source_start": window.effective_start.isoformat(), "minp": min_purchases,
+              "mincyc": min_cycle_days, "maxmult": get_settings().reorder_max_overdue_mult,
+              "recent_start": recent.effective_start.isoformat(),
+              "baseline_start": baseline.effective_start.isoformat()}
+    predicate = "1 = 1"
+    if include_book:
+        excluded = _excluded(as_of)
+        if excluded:
+            placeholders, extra = in_clause("x", sorted(excluded))
+            predicate = f"product_id NOT IN {placeholders}"
+            params.update(extra)
+    # Window ranks count each order only once across its product rows, so the entire book,
+    # repeat cycles and churn use one scan of the same retained source snapshot.
+    sql = retained_purchase_cte() + f"""
+        , ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY client_id, product_id ORDER BY purchased_at DESC, order_id DESC) AS rn,
+                ROW_NUMBER() OVER (PARTITION BY client_id, order_id ORDER BY product_id) AS order_rn
+            FROM retained_purchases
+        ), stats AS (
+            SELECT client_id, product_id, COUNT(*) AS n_orders,
+                   MIN(purchased_at) AS first_buy, MAX(purchased_at) AS last_buy,
+                   MAX(CASE WHEN rn = 1 THEN quantity END) AS last_quantity,
+                   MAX(CASE WHEN rn = 2 THEN purchased_at END) AS previous_buy,
+                   MAX(CASE WHEN rn = 3 THEN purchased_at END) AS third_buy,
+                   SUM(CASE WHEN order_rn = 1 THEN 1 ELSE 0 END) AS retained_component,
+                   SUM(CASE WHEN order_rn = 1 AND purchased_at >= :recent_start THEN 1 ELSE 0 END)
+                       AS recent_component,
+                   SUM(CASE WHEN order_rn = 1 AND purchased_at >= :baseline_start
+                                 AND purchased_at < :recent_start THEN 1 ELSE 0 END) AS prior_component,
+                   SUM(CASE WHEN purchased_at >= :baseline_start AND {predicate}
+                            THEN turnover_eur ELSE 0 END) AS turnover_component
+            FROM ranked GROUP BY client_id, product_id
+        ), book_stats AS (
+            SELECT *, SUM(retained_component) OVER (PARTITION BY client_id) AS retained_orders_cnt,
+                   SUM(recent_component) OVER (PARTITION BY client_id) AS recent_orders,
+                   SUM(prior_component) OVER (PARTITION BY client_id) AS prior_orders,
+                   SUM(turnover_component) OVER (PARTITION BY client_id) AS turnover_eur,
+                   MAX(last_buy) OVER (PARTITION BY client_id) AS last_order
+            FROM stats
+        ), cycles AS (
+            SELECT *, DATEDIFF(day, last_buy, :cycle_asof) AS elapsed_days,
+                   CASE WHEN n_orders >= :minp AND DATEDIFF(day, first_buy, last_buy) > 0
+                        THEN CASE WHEN DATEDIFF(day, first_buy, last_buy) * 1.0 / (n_orders - 1) < :mincyc
+                                  THEN :mincyc * 1.0
+                                  ELSE DATEDIFF(day, first_buy, last_buy) * 1.0 / (n_orders - 1) END
+                        END AS cycle_days
+            FROM book_stats
+        ), eligible AS (
+            SELECT *, CASE WHEN elapsed_days >= cycle_days AND elapsed_days <= cycle_days * :maxmult
+                                AND {predicate} THEN 1 ELSE 0 END AS is_due
+            FROM cycles
+        ), evidence AS (
+            SELECT *,
+                   SUM(CASE WHEN is_due = 1 AND elapsed_days = CEILING(cycle_days) THEN 1 ELSE 0 END)
+                       OVER (PARTITION BY client_id) AS reorder_due_count,
+                   SUM(CASE WHEN is_due = 1 AND elapsed_days > CEILING(cycle_days) THEN 1 ELSE 0 END)
+                       OVER (PARTITION BY client_id) AS reorder_overdue_count,
+                   MAX(CASE WHEN is_due = 1 THEN DATEADD(day,
+                       CONVERT(int, CEILING(cycle_days * FLOOR(elapsed_days / cycle_days))),
+                       CONVERT(date, last_buy)) END) OVER (PARTITION BY client_id) AS cooldown_cycle_start,
+                   ROW_NUMBER() OVER (PARTITION BY client_id ORDER BY is_due DESC,
+                       elapsed_days / NULLIF(cycle_days, 0) DESC, product_id ASC) AS evidence_rank
+            FROM eligible
         )
-        SELECT client_id, product_id, n_orders, cycle_days, elapsed_days
-        FROM cyc
-        WHERE elapsed_days >= cycle_days
-              AND elapsed_days <= cycle_days * :maxmult
-        """,
-        {
-            "mid": manager_id,
-            "asof": window.as_of.isoformat(),
-            "source_start": window.effective_start.isoformat(),
-            "minp": min_purchases,
-            "mincyc": min_cycle_days,
-            "maxmult": max_overdue_mult,
-        },
-    )
+        SELECT c.ID AS client_id, LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid,
+               c.Name AS name, c.FullName AS full_name, c.MobileNumber AS phone, c.EmailAddress AS email,
+               x.product_id, x.n_orders, x.first_buy, x.last_buy, x.last_quantity,
+               x.previous_buy, x.third_buy,
+               COALESCE(x.retained_orders_cnt, 0) AS retained_orders_cnt,
+               COALESCE(x.recent_orders, 0) AS recent_orders, COALESCE(x.prior_orders, 0) AS prior_orders,
+               COALESCE(x.recent_orders + x.prior_orders, 0) AS orders_cnt,
+               COALESCE(x.turnover_eur, 0) AS turnover_eur, x.last_order,
+               x.elapsed_days, x.cycle_days,
+               COALESCE(x.reorder_due_count, 0) AS reorder_due_count,
+               COALESCE(x.reorder_overdue_count, 0) AS reorder_overdue_count,
+               x.cooldown_cycle_start,
+               p.Name AS product_name, LOWER(CONVERT(varchar(36), p.NetUID)) AS product_net_uid,
+               CASE WHEN p.ID IS NULL THEN NULL ELSE COALESCE(stock.available_qty, 0) END AS available_qty
+        FROM dbo.Client c LEFT JOIN evidence x ON x.client_id = c.ID
+             {"AND x.evidence_rank <= 5" if include_book else ""}
+        LEFT JOIN dbo.Product p ON p.ID = x.product_id AND p.Deleted = 0
+        OUTER APPLY (
+            SELECT SUM(CASE WHEN pa.Amount > 0 THEN pa.Amount ELSE 0 END) AS available_qty
+            FROM dbo.ProductAvailability pa JOIN dbo.Storage st ON st.ID = pa.StorageID
+            WHERE pa.ProductID = x.product_id AND pa.Deleted = 0
+                  AND st.Deleted = 0 AND st.ForDefective = 0
+        ) stock
+        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+    """ + ("" if include_book else " AND x.product_id IS NOT NULL") + " ORDER BY c.ID, x.product_id"
+    return query(sql, params)
+
+
+def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,
+                                   min_cycle_days: int = 7, max_overdue_mult: float = 3.0) -> list[dict]:
+    """Existing average-gap/minimum-cycle policy, shared verbatim with the client evidence."""
+    return [row for row in repeat_products_for_manager(manager_id, as_of, min_purchases, min_cycle_days)
+            if row["cycle_days"] is not None
+            and float(row["cycle_days"]) <= row["elapsed_days"]
+            <= float(row["cycle_days"]) * max_overdue_mult]
 
 
 def product_names(product_ids: list[int]) -> dict[int, str]:
@@ -691,15 +708,9 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
     if recent_span_days <= 0 or prior_span_days <= 0:
         return []
     return query(
-        """
-        WITH client_orders AS (
-            SELECT DISTINCT ca.ClientID AS client_id, o.ID AS order_id, o.Created AS dt
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-            JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Created >= :start AND o.Created < :asof
-                  AND c.Deleted = 0 AND c.MainManagerID = :mid
+        retained_purchase_cte(start_param="start") + """
+        , client_orders AS (
+            SELECT DISTINCT client_id, order_id, purchased_at AS dt FROM retained_purchases
         ),
         agg AS (
             SELECT client_id,

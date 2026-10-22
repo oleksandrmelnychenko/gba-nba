@@ -27,8 +27,7 @@ def _norm(s: str) -> str:
 # pipeline ran on a sliver. Sale validity is oi.IsValidForCurrentSale=1 (no Deleted on the spine).
 # These functions JOIN the Order/OrderItem spine for sales/reorder/churn/monetary signals.
 _SALES_SPINE_FUNCS = [
-    sig.ubiquitous_product_ids, sig.new_clients_for_manager, sig.active_clients_for_manager,
-    sig.reorder_candidates_for_manager, sig.churn_candidates_for_manager,
+    sig.ubiquitous_product_ids,
     sig.client_monetary, sig.client_features, sig.monthly_shipped,
     ds.client_features, ds.reorder_candidates, ds.churn_candidates, ds.active_clients,
     ds.label_reorder, ds.label_any_order, ds.label_buy_products,
@@ -162,3 +161,13 @@ def test_debt_and_payment_paths_keep_their_deleted_flags():
     paid_src = _norm(_PAID_SRC)
     assert "p.Deleted = 0" in paid_src, "payment path must keep p.Deleted=0"
     assert "IsValidForCurrentSale" not in paid_src, "payment path must not use the sales validity flag"
+
+
+def test_retained_seller_queries_delegate_to_canonical_source():
+    # Current imported sales are not the historical all-deleted calibration snapshot.
+    # Executed SQL fixtures validate cancellation, merge, returns and current source provenance.
+    for fn in (sig.new_clients_for_manager, sig.clients_overview_for_manager,
+               sig.active_clients_for_manager, sig.repeat_products_for_manager,
+               sig.churn_candidates_for_manager):
+        assert "retained_purchase_cte(" in inspect.getsource(fn)
+    assert "repeat_products_for_manager(" in inspect.getsource(sig.reorder_candidates_for_manager)

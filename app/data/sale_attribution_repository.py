@@ -1,5 +1,8 @@
 """Documentary sale/payment facts. Never infer contact causality or revalue money."""
 
+from datetime import UTC
+from zoneinfo import ZoneInfo
+
 from app.core import history
 from app.data.db import in_clause, query
 
@@ -57,6 +60,15 @@ LEFT JOIN dbo.ClientShoppingCart offer ON offer.ID=o.ClientShoppingCartID
 
 def _day(value):
     return value.date().isoformat() if value is not None else None
+
+
+def _return_day(value):
+    # SaleReturn.FromDate is UTC, like NativeSalesNet's return calendar. Payment
+    # FromDate has a stored document clock and must retain its separate policy.
+    if value is None:
+        return None
+    utc = value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    return utc.astimezone(ZoneInfo("Europe/Kyiv")).date().isoformat()
 
 
 def candidates(client_id: int, offset: int, limit: int) -> tuple[list[dict], int]:
@@ -153,7 +165,7 @@ def facts(sale_net_uids: list[str]) -> dict[str, dict]:
             {
                 "return_id": int(r["return_id"]),
                 "return_item_id": int(r["return_item_id"]),
-                "document_date": _day(r["document_at"]),
+                "document_date": _return_day(r["document_at"]),
                 "quantity": float(r["quantity"]),
                 "credit_processed": bool(r["credit_processed"]),
                 "recorded_return_credit_eur": None

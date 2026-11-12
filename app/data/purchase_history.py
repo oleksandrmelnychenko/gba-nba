@@ -3,7 +3,8 @@
 purchased_at is the verified Kyiv business wall clock, or the raw sale document clock when
 unknown. An imported sale is verified when its single-source lineage document date equals the
 sale document clock or the invoice clock (ChangedToInvoice): a sale that existed before it was
-invoiced keeps its creation date in Created, and the invoice clock carries the document date. purchased_at_utc is populated ONLY with positive timestamp provenance. Draft-order
+invoiced keeps its creation date in Created, and the invoice clock carries the document date.
+purchased_at_utc is populated ONLY with positive timestamp provenance. Draft-order
 creation is retained separately and never substituted for the confirmed purchase event.
 Callers supply internal SQL fragments/bound parameter names, never request text as scope_sql.
 """

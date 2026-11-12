@@ -151,7 +151,8 @@ def expected_value_row(r: pd.Series) -> float:
     debt_followup : overdue_amount at T (cash directly at stake).
     reorder_due / cross_sell : expected line revenue ~ client avg order value (trailing-365
                    turnover / order_count), the grounded proxy for one re-bought / cross-sold line.
-    churn_winback : client monetary (trailing-365 EUR turnover) -- the relationship at risk.
+    churn_winback : client turnover over the outcome window (trailing-365 EUR turnover scaled
+                   to ev_horizon_days) -- the same horizon as the other types.
     """
     tt = r["task_type"]
     monetary = float(r["monetary"])
@@ -161,9 +162,8 @@ def expected_value_row(r: pd.Series) -> float:
         return float(r["sig_overdue_amount"])
     if tt in ("reorder_due", "cross_sell"):
         return aov
-    if tt == "churn_winback":
-        return monetary
-    return monetary
+    from app.ml.score_task import horizon_turnover
+    return horizon_turnover(monetary)
 
 
 def validate_dataset_history(df: pd.DataFrame) -> list[str]:

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import shutil
 import sys
 import time
@@ -55,6 +56,7 @@ PROD_ARTIFACTS = ["propensity_model.joblib", "model_meta.json", "metrics.json", 
 DEFAULT_AUC_FLOOR = 0.62
 DEFAULT_AUC_EPSILON = 0.01
 N_SNAPSHOTS = 5
+BACKUPS_KEPT = 4
 H_DAYS = 60  # outcome window; a vintage is only fully labelled once it is >= H_DAYS in the past
 TRAINING_WINDOW_DAYS = 365
 # Live (manager-logged) rows are ground truth; weight them up relative to the backfill proxy.
@@ -209,6 +211,45 @@ def _model_card_consistency_errors(metrics_path: Path, card_path: Path) -> list[
             for label, value in expected.items() if value not in card]
 
 
+def _publish_heads(metrics_path: Path, meta_path: Path, min_rows: int, auc_floor: float) -> dict:
+    """Per-type gate: a head with too few labelled rows or an OOT AUC below the floor is recorded
+    as not published, so serving ranks that task type by the deterministic heuristic."""
+    rep = json.loads(metrics_path.read_text())
+    prod = rep.get("production_model", "hgb")
+    heads = {}
+    for task_type in rep.get("cv_per_type", {}):
+        rows = int(rep["cv_per_type"][task_type].get("n") or 0)
+        auc = (rep.get("oot_per_type", {}).get(prod, {}).get(task_type) or {}).get("auc")
+        auc = float(auc) if isinstance(auc, (int, float)) and not math.isnan(auc) else None
+        reasons = []
+        if rows < min_rows:
+            reasons.append(f"rows {rows} < {min_rows}")
+        if auc is None:
+            reasons.append("OOT AUC unavailable")
+        elif auc < auc_floor:
+            reasons.append(f"OOT AUC {auc:.4f} < floor {auc_floor:.2f}")
+        heads[task_type] = {"rows": rows, "oot_auc": auc, "published": not reasons,
+                            "reasons": reasons}
+        print(f"head {task_type:16s} rows={rows:<6d} auc={auc if auc is not None else 'n/a'}  "
+              f"-> {'PUBLISHED' if not reasons else 'WITHHELD (' + '; '.join(reasons) + ')'}")
+    meta = json.loads(meta_path.read_text())
+    meta["heads"] = heads
+    meta["head_gate"] = {"min_rows": min_rows, "auc_floor": auc_floor}
+    meta_path.write_text(json.dumps(meta, indent=2))
+    return heads
+
+
+def _prune_backups(keep: int = BACKUPS_KEPT) -> list[Path]:
+    """Keep only the newest `keep` backup directories (their names sort by timestamp)."""
+    backups = sorted(path for path in ART.glob("backup_*") if path.is_dir())
+    removed = backups[:-keep] if keep > 0 else backups
+    for path in removed:
+        shutil.rmtree(path)
+    if removed:
+        print(f"pruned {len(removed)} old backup dirs; kept {min(keep, len(backups))}")
+    return removed
+
+
 def _backup(ts: str) -> Path:
     dst = ART / f"backup_{ts}"
     dst.mkdir(parents=True, exist_ok=True)
@@ -287,6 +328,9 @@ def main() -> int:
                     help="also abort if new pooled OOT AUC < old - epsilon (default 0.01)")
     ap.add_argument("--n-snapshots", type=int, default=N_SNAPSHOTS,
                     help=f"monthly vintages to backfill (default {N_SNAPSHOTS})")
+    ap.add_argument("--min-head-rows", type=int, default=None,
+                    help="per-type gate: labelled rows a head needs to be published "
+                         "(default: min_model_training_rows from the service config)")
     ap.add_argument("--no-live-labels", action="store_true",
                     help="skip the Mongo live-label union (backfill only)")
     ap.add_argument("--dry-run", action="store_true",
@@ -314,6 +358,7 @@ def main() -> int:
             print(f"could not read current AUC: {exc}")
 
     backup_dir = _backup(ts)
+    _prune_backups()
 
     try:
         _hr("STEP 1/2 — rebuild dataset (backfill + optional live-label union)")
@@ -342,6 +387,11 @@ def main() -> int:
             comparison_note = (f"old AUC re-scored on the current fold {detail}: "
                                f"{old_auc:.4f} -> {rescored:.4f}")
             old_auc = rescored
+
+    from app.core.config import get_settings
+    min_head_rows = (args.min_head_rows if args.min_head_rows is not None
+                     else get_settings().min_model_training_rows)
+    _publish_heads(ART / "metrics.json", ART / "model_meta.json", min_head_rows, args.auc_floor)
 
     floor_ok = new_auc >= args.auc_floor
     regress_ok = old_auc is None or new_auc >= old_auc - args.auc_epsilon

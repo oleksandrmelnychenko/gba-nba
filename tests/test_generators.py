@@ -84,7 +84,7 @@ def test_churn_winback_builds_task(monkeypatch):
     t = tasks[0]
     assert t.task_key == "mgr:1|client:10|type:churn_winback|win:2026-06"
     assert t.priority == round(100.0 * t.p_outcome, 2)
-    assert t.expected_value == 12000.0         # churn E[value] = client annual turnover at risk
+    assert t.expected_value == round(12000.0 * 60 / 365, 2)   # turnover over the 60-day horizon
 
 
 def test_new_client_activation_is_retired_and_generates_nothing(monkeypatch):

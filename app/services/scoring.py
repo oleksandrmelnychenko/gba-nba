@@ -64,7 +64,7 @@ def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, fl
 
     Lazy import keeps the ML deps (joblib/sklearn) off the hot import path; score_task caches the
     loaded model. recency_days=None is mapped to 9999 — the dataset's missing-recency sentinel."""
-    from app.ml.score_task import IncompatibleModelArtifactError, expected_value, score_task
+    from app.ml.score_task import expected_value, score_task
 
     feats: dict = {"task_type": task_type}
     for k, v in signals.items():
@@ -75,9 +75,7 @@ def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, fl
                 feats[k] = float(v)
         elif k in _FEATURE_KEY_MAP and v is not None:
             feats[_FEATURE_KEY_MAP[k]] = float(v)
-    try:
-        s = score_task(feats)
-    except IncompatibleModelArtifactError:
+    if score_source(task_type) == "heuristic":
         p_outcome = _heuristic_probability(task_type, signals)
         value = expected_value(feats)
         return (
@@ -86,11 +84,27 @@ def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, fl
             round(value, 2),
             round(p_outcome * value, 4),
         )
+    s = score_task(feats)
     return s["priority"], s["p_outcome"], s["expected_value"], s["ev_score"]
 
 
+def score_source(task_type: str) -> str:
+    """"model" when the trained head may rank this task type, else "heuristic": an incompatible
+    artifact, or a head with fewer labelled training rows than min_model_training_rows (or one
+    the retrain gate withheld), has no basis for a probability."""
+    from app.ml.score_task import IncompatibleModelArtifactError, _model, head_published
+
+    if not head_published(task_type, get_settings().min_model_training_rows):
+        return "heuristic"
+    try:
+        _model()
+    except IncompatibleModelArtifactError:
+        return "heuristic"
+    return "model"
+
+
 def _heuristic_probability(task_type: str, signals: dict) -> float:
-    """Deterministic fail-safe while an incompatible model artifact is being retrained."""
+    """Deterministic score for a task type the model has no basis to rank."""
     monetary = float(signals.get("monetary") or 0.0)
     if task_type == "debt_followup":
         urgency = debt_urgency(int(signals.get("days_past_terms") or 0))

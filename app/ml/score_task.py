@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 
 from app.core import history
+from app.core.config import get_settings
 
 ART = Path(__file__).resolve().parent / "artifacts"
 
@@ -104,6 +105,38 @@ def model_compatibility() -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=1)
+def _metrics() -> dict:
+    p = ART / "metrics.json"
+    try:
+        return json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def head_training_rows(task_type: str) -> int:
+    """Labelled training rows behind one task type's head (0 when unknown)."""
+    try:
+        head = (_meta().get("heads") or {}).get(task_type)
+        if head is not None:
+            return int(head.get("rows") or 0)
+        return int((_metrics().get("cv_per_type") or {}).get(task_type, {}).get("n") or 0)
+    except (OSError, TypeError, ValueError):
+        return 0
+
+
+def head_published(task_type: str, min_rows: int) -> bool:
+    """True when the model may rank this task type: enough labelled rows and not withheld by
+    the retrain per-type gate. Otherwise the caller uses the deterministic heuristic."""
+    try:
+        head = (_meta().get("heads") or {}).get(task_type)
+    except (OSError, TypeError, ValueError):
+        return False
+    if head is not None and not head.get("published", False):
+        return False
+    return head_training_rows(task_type) >= min_rows
+
+
 def _vectorize(task: dict[str, Any]) -> np.ndarray:
     tt = task.get("task_type")
     row = {f: 0.0 for f in FEATURES}
@@ -119,9 +152,11 @@ def _vectorize(task: dict[str, Any]) -> np.ndarray:
 def expected_value(task: dict[str, Any]) -> float:
     """Simple, documented E[value] per task (EUR).
 
-    debt_followup : overdue_amount at T (cash directly at stake).
-    reorder_due / cross_sell : expected line revenue ~ avg order value = monetary / order_count.
-    churn_winback : client monetary (trailing-365 EUR turnover) -- relationship at risk.
+    One horizon for every type: the EUR expected inside the outcome window (ev_horizon_days,
+    the model's 60-day label window) if the outcome happens.
+    debt_followup : overdue_amount at T (cash collected inside the window).
+    reorder_due / cross_sell : one order ~ avg order value = monetary / order_count.
+    churn_winback : the client's turnover over the window = trailing-365 turnover * horizon/365.
     """
     tt = task.get("task_type")
     monetary = float(task.get("monetary", 0.0) or 0.0)
@@ -131,9 +166,11 @@ def expected_value(task: dict[str, Any]) -> float:
         return float(task.get("sig_overdue_amount", 0.0) or 0.0)
     if tt in ("reorder_due", "cross_sell"):
         return aov
-    if tt == "churn_winback":
-        return monetary
-    return monetary
+    return horizon_turnover(monetary)
+
+
+def horizon_turnover(annual_turnover: float) -> float:
+    return annual_turnover * get_settings().ev_horizon_days / TRAINING_WINDOW_DAYS
 
 
 def score_task(task: dict[str, Any]) -> dict[str, float]:

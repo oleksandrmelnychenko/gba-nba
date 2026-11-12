@@ -69,8 +69,14 @@ def test_urgency_bands():
     assert scoring.urgency_band(0.1) == Urgency.LOW
 
 
+@pytest.fixture
+def model_for_every_type(monkeypatch):
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "min_model_training_rows", 0)
+
+
 @requires_trained_model
-def test_score_task_priority_delegates_to_the_model():
+def test_score_task_priority_delegates_to_the_model(model_for_every_type):
     # priority must come from the trained propensity model (100 * p_outcome), NOT the legacy blend.
     from app.ml.score_task import score_task
     feat = {"days_past_terms": 40, "overdue_amount": 8000, "max_overdue_days": 40, "debt_lines": 3,
@@ -93,7 +99,7 @@ def test_score_task_priority_delegates_to_the_model():
 
 
 @requires_trained_model
-def test_score_task_priority_maps_short_signal_keys_per_type():
+def test_score_task_priority_maps_short_signal_keys_per_type(model_for_every_type):
     # each type's short raw-signal keys land on the right model FEATURE (mapping is the load-bearing
     # part: a wrong/missing key silently degrades the score).
     from app.ml.score_task import score_task
@@ -119,7 +125,7 @@ def test_score_task_priority_maps_short_signal_keys_per_type():
 
 
 @requires_trained_model
-def test_score_task_priority_maps_missing_recency_to_sentinel():
+def test_score_task_priority_maps_missing_recency_to_sentinel(model_for_every_type):
     # recency_days None (client with no order in the trailing window) -> 9999, the dataset sentinel.
     from app.ml.score_task import score_task
     feat = {"top_score": 0.5, "candidates": 3, "monetary": 5000,

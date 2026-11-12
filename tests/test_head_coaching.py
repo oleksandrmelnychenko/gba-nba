@@ -8,7 +8,7 @@ from pymongo import MongoClient
 
 from app.api import main
 from app.data import mongo, signals_repository
-from app.services import head_coaching, task_delegation
+from app.services import task_delegation
 
 HEAD = "11111111-1111-1111-1111-111111111111"
 SELLER = "22222222-2222-2222-2222-222222222222"

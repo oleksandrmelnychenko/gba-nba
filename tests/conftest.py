@@ -13,3 +13,15 @@ os.environ["INTERNAL_API_KEY"] = ""
 from app.core.config import get_settings  # noqa: E402
 
 get_settings.cache_clear()
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _fresh_client_book_cache():
+    from app.api import main
+
+    main._client_book_state.clear()
+    main._client_book_key_locks.clear()
+    yield

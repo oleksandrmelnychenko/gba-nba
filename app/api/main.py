@@ -425,6 +425,45 @@ def cockpit_count(manager_net_uid: str) -> dict:
             "by_urgency": {k: by_urgency[k] for k in ("critical", "high", "normal", "low")}}
 
 
+# The client book is ONE retained-purchase SQL snapshot (~3.5 s) that every page, search and
+# segment switch of «Мої клієнти» used to recompute. Cache it briefly per manager and business
+# date (same pattern as the team snapshot); debts and contact cooldowns stay live per request.
+_CLIENT_BOOK_TTL_S = 120.0
+_client_book_lock = threading.Lock()
+_client_book_state: dict = {}
+_client_book_key_locks: dict = {}
+
+
+def _client_book_cached(manager_id: int, as_of: str) -> tuple[list[dict], list[dict], set[int]]:
+    key = (manager_id, as_of, history.source_history_start().isoformat())
+
+    def fresh():
+        entry = _client_book_state.get(key)
+        if entry is not None and time.monotonic() - entry["at"] < _CLIENT_BOOK_TTL_S:
+            return entry["value"]
+        return None
+
+    with _client_book_lock:
+        value = fresh()
+        if value is not None:
+            return value
+        key_lock = _client_book_key_locks.setdefault(key, threading.Lock())
+    with key_lock:
+        with _client_book_lock:
+            value = fresh()
+            if value is not None:
+                return value
+        value = repeat_sales.read_snapshot(manager_id, as_of)
+        with _client_book_lock:
+            now = time.monotonic()
+            for stale in [k for k, entry in _client_book_state.items()
+                          if now - entry["at"] >= _CLIENT_BOOK_TTL_S]:
+                _client_book_state.pop(stale, None)
+                _client_book_key_locks.pop(stale, None)
+            _client_book_state[key] = {"at": now, "value": value}
+        return value
+
+
 @app.get("/cockpit/clients")
 def cockpit_clients(
     manager_net_uid: str, as_of_date: date | None = None,
@@ -440,7 +479,8 @@ def cockpit_clients(
     resolved_as_of = _resolved_as_of(as_of_date)
     started = time.time()
     try:
-        rows, products, churn = repeat_sales.read_snapshot(manager_id, resolved_as_of)
+        rows, products, churn = _client_book_cached(manager_id, resolved_as_of)
+        rows = [dict(row) for row in rows]
         debts = {
             int(d["client_id"]): d
             for d in signals_repository.overdue_debts_for_manager(manager_id, resolved_as_of)
@@ -935,6 +975,7 @@ def _build_team_snapshot(as_of_str: str) -> dict:
         "unverified_orders": unverified_orders,
     }
     return {
+        "unverified_orders": unverified_orders,
         "overview": {
             **degradation,
             "count": len(overview_rows),
@@ -989,7 +1030,7 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
         with _team_snap_lock:
             _team_metrics_state.update(
                 {"checked_at": datetime.now(ZoneInfo("UTC")).isoformat(), "error": None,
-                 "unverified_orders": computed["team"]["unverified_orders"]})
+                 "unverified_orders": computed.get("unverified_orders")})
             _team_snap_state.update(
                 {
                     "at": time.monotonic(),

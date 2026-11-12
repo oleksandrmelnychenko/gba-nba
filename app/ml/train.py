@@ -114,6 +114,92 @@ def safe_auc(y: np.ndarray, p: np.ndarray) -> float:
     return float(roc_auc_score(y, p))
 
 
+def cluster_bootstrap_auc_ci(
+    y: np.ndarray, p: np.ndarray, groups: np.ndarray, n_boot: int = 500, seed: int = 42,
+) -> list[float] | None:
+    """95% interval of the AUC, resampling whole clients.
+
+    One client contributes many correlated rows (a single buyer holds hundreds of reorder pairs),
+    so a row-level interval would be far too narrow.
+    """
+    y = np.asarray(y)
+    p = np.asarray(p, dtype=float)
+    groups = np.asarray(groups)
+    if len(np.unique(y)) < 2:
+        return None
+    unique = np.unique(groups)
+    members = {g: np.flatnonzero(groups == g) for g in unique}
+    rng = np.random.default_rng(seed)
+    aucs = []
+    for _ in range(n_boot):
+        idx = np.concatenate([members[g] for g in rng.choice(unique, len(unique))])
+        if len(np.unique(y[idx])) < 2:
+            continue
+        aucs.append(roc_auc_score(y[idx], p[idx]))
+    if not aucs:
+        return None
+    lo, hi = np.percentile(aucs, [2.5, 97.5])
+    return [float(lo), float(hi)]
+
+
+def baseline_score(frame: pd.DataFrame, task_type: str) -> np.ndarray | None:
+    """One-line recency/frequency rule the model head has to beat, or None when there is none.
+
+    reorder_due   : the pair's purchase rate, orders of that product per elapsed day.
+    churn_winback : shorter silence -> more likely to order again.
+    """
+    if task_type == "reorder_due":
+        elapsed = frame["sig_elapsed_days"].to_numpy(dtype=float)
+        return frame["sig_n_orders"].to_numpy(dtype=float) / np.maximum(elapsed, 1.0)
+    if task_type == "churn_winback":
+        return -frame["sig_silence_days"].to_numpy(dtype=float)
+    return None
+
+
+def served_reorder_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """The rows the live generator scores: per client and vintage, the most overdue product."""
+    reorder = frame[frame["task_type"] == "reorder_due"]
+    if reorder.empty:
+        return reorder
+    lead = reorder.groupby(["vintage", "client_id"])["sig_overdue_ratio"].idxmax()
+    return reorder.loc[lead]
+
+
+def honest_oot_report(test: pd.DataFrame, p_col: str) -> dict:
+    """Per-type OOT quality with client-level intervals, the simple baseline, and the served rows."""
+    out: dict = {}
+    for tt in TASK_TYPES:
+        g = test[test["task_type"] == tt]
+        y = g["label"].to_numpy()
+        entry: dict = {"n": int(len(g)), "clients": int(g["client_id"].nunique())}
+        if len(g) and len(np.unique(y)) == 2:
+            groups = g["client_id"].to_numpy()
+            pv = g[p_col].to_numpy()
+            entry["auc"] = safe_auc(y, pv)
+            entry["auc_ci95"] = cluster_bootstrap_auc_ci(y, pv, groups)
+            entry["mean_p"] = float(pv.mean())
+            entry["base_rate"] = float(y.mean())
+            base = baseline_score(g, tt)
+            if base is not None:
+                entry["baseline_auc"] = safe_auc(y, base)
+                entry["baseline_auc_ci95"] = cluster_bootstrap_auc_ci(y, base, groups)
+                entry["auc_minus_baseline"] = entry["auc"] - entry["baseline_auc"]
+        out[tt] = entry
+    served = served_reorder_rows(test)
+    ys = served["label"].to_numpy() if len(served) else np.array([])
+    served_entry: dict = {"n": int(len(served))}
+    if len(served) and len(np.unique(ys)) == 2:
+        ps = served[p_col].to_numpy()
+        served_entry.update({
+            "auc": safe_auc(ys, ps),
+            "auc_ci95": cluster_bootstrap_auc_ci(ys, ps, served["client_id"].to_numpy()),
+            "mean_p": float(ps.mean()),
+            "base_rate": float(ys.mean()),
+        })
+    out["reorder_due_served_rows"] = served_entry
+    return out
+
+
 def build_hgb() -> HistGradientBoostingClassifier:
     return HistGradientBoostingClassifier(
         learning_rate=0.06, max_iter=400, max_leaf_nodes=31,
@@ -494,6 +580,8 @@ def main() -> None:
     report["production_model"] = prod_name
     bench["oot"]["auc_model"] = oot[prod_name]["auc"]
     print(f"\n=== Production model: {prod_name} ===")
+
+    report["oot_honest"] = honest_oot_report(df_te, f"_p_{prod_name}")
 
     # ----------------------------------------------------------------- final fit on ALL data
     # Refit the chosen calibrated model on the full dataset for serving.

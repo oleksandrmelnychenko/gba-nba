@@ -1,7 +1,9 @@
 """One retained confirmed purchase per order/product, shared by seller advice and segments.
 
 purchased_at is the verified Kyiv business wall clock, or the raw sale document clock when
-unknown. purchased_at_utc is populated ONLY with positive timestamp provenance. Draft-order
+unknown. An imported sale is verified when its single-source lineage document date equals the
+sale document clock or the invoice clock (ChangedToInvoice): a sale that existed before it was
+invoiced keeps its creation date in Created, and the invoice clock carries the document date. purchased_at_utc is populated ONLY with positive timestamp provenance. Draft-order
 creation is retained separately and never substituted for the confirmed purchase event.
 Callers supply internal SQL fragments/bound parameter names, never request text as scope_sql.
 """
@@ -19,12 +21,12 @@ def retained_purchase_cte(
     sql = f"""
     WITH purchase_candidates AS (
         SELECT c.ID AS client_id, o.ID AS order_id, o.Created AS raw_order_created,
-               CASE WHEN sale.imported = 0 THEN sale.invoice_at
-                    ELSE sale.sale_created END AS event_at,
+               CASE WHEN sale.imported = 0
+                         OR (basis.matches_invoice = 1 AND basis.matches_created = 0)
+                    THEN sale.invoice_at ELSE sale.sale_created END AS event_at,
                CASE WHEN sale.imported = 0 THEN 'native_utc'
-                    WHEN sale.imported = 1 AND lineage.first_date = lineage.last_date
-                      AND lineage.source_count = 1
-                      AND ABS(DATEDIFF_BIG(millisecond, lineage.first_date, sale.sale_created)) <= 4
+                    WHEN sale.imported = 1
+                      AND (basis.matches_created = 1 OR basis.matches_invoice = 1)
                       THEN 'imported_lineage_utc' END AS timestamp_basis
         FROM dbo.Client c
         JOIN dbo.ClientAgreement ca ON ca.ClientID = c.ID AND ca.Deleted = 0
@@ -45,6 +47,14 @@ def retained_purchase_cte(
             FROM dbo.DataSyncImportedSaleSourceLine l
             WHERE l.LocalSaleID = sale.sale_id AND l.IsPresent = 1
         ) lineage
+        CROSS APPLY (
+            SELECT CASE WHEN lineage.first_date = lineage.last_date AND lineage.source_count = 1
+                          AND ABS(DATEDIFF_BIG(millisecond, lineage.first_date, sale.sale_created)) <= 4
+                        THEN 1 ELSE 0 END AS matches_created,
+                   CASE WHEN lineage.first_date = lineage.last_date AND lineage.source_count = 1
+                          AND ABS(DATEDIFF_BIG(millisecond, lineage.first_date, sale.invoice_at)) <= 4
+                        THEN 1 ELSE 0 END AS matches_invoice
+        ) basis
         WHERE c.Deleted = 0 AND ({scope_sql}) AND sale.sale_count = 1
     ), purchase_dates AS (
         SELECT client_id, order_id, raw_order_created, timestamp_basis,

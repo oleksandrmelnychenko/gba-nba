@@ -16,6 +16,7 @@ from app.core.money import cents, cents_decimal, decimal_value, tenths
 from app.data import signals_repository as sig
 
 _SUNDAY = 6
+UNVERIFIED_INVOICE_REASON = "invoice_event_date_unverified"
 
 
 def working_days_in_month(year: int, month: int) -> int:
@@ -112,9 +113,14 @@ def compute_target(manager_id: int, as_of: str | None = None,
 
     wd = working_days_in_month(today.year, today.month)
     wd_elapsed = working_days_elapsed(today)
+    unverified_orders = int(getattr(shipped, "unverified_orders", 0) or 0)
 
     return {
         "manager_id": manager_id,
+        "degraded": unverified_orders > 0,
+        "degraded_reasons": [UNVERIFIED_INVOICE_REASON] if unverified_orders else [],
+        "unverified_orders": unverified_orders,
+        "unverified_amount": cents(getattr(shipped, "unverified_amount", 0) or 0),
         "metric_definitions": {
             "version": 1,
             "plan_basis": "historical_reference_not_approved_plan",

@@ -293,9 +293,11 @@ def health() -> dict:
         and bool(generation["generation_ready"])
         and bool(model["model_compatible"])
     )
-    healthy = db_ok and mongo_ok and business_ready
+    metrics_health = _team_metrics_health()
+    healthy = db_ok and mongo_ok and business_ready and not metrics_health["metrics_degraded"]
     return {
         "status": "healthy" if healthy else "degraded",
+        **metrics_health,
         "db_connected": db_ok,
         "mongo_connected": mongo_ok,
         "business_ready": business_ready,
@@ -311,7 +313,8 @@ def health() -> dict:
 @app.get("/ready")
 def ready() -> JSONResponse:
     payload = health()
-    is_ready = payload["status"] == "healthy"
+    is_ready = bool(
+        payload["db_connected"] and payload["mongo_connected"] and payload["business_ready"])
     payload["status"] = "ready" if is_ready else "not_ready"
     return JSONResponse(status_code=200 if is_ready else 503, content=payload)
 
@@ -847,6 +850,35 @@ _team_snap_state: dict = {
 }
 
 
+_team_metrics_state: dict = {"checked_at": None, "error": None, "unverified_orders": None}
+
+
+def _record_team_snapshot_failure(exc: Exception) -> None:
+    detail = exc.detail if isinstance(exc, HTTPException) else type(exc).__name__
+    with _team_snap_lock:
+        _team_metrics_state.update(
+            {"checked_at": datetime.now(ZoneInfo("UTC")).isoformat(), "error": str(detail)})
+
+
+def _team_metrics_health() -> dict:
+    """Last team-target computation as seen by /health: a failure or unverified invoice dates
+    are a degraded metric state, never a silent "healthy"."""
+    with _team_snap_lock:
+        state = dict(_team_metrics_state)
+    reasons = []
+    if state["error"]:
+        reasons.append("team_targets_failed")
+    if state["unverified_orders"]:
+        reasons.append("invoice_event_date_unverified")
+    return {
+        "metrics_degraded": bool(reasons),
+        "metrics_degraded_reasons": reasons,
+        "metrics_checked_at": state["checked_at"],
+        "metrics_error": state["error"],
+        "unverified_invoice_orders": state["unverified_orders"],
+    }
+
+
 def _build_team_snapshot(as_of_str: str) -> dict:
     from app.services import targets
     team = []
@@ -859,6 +891,7 @@ def _build_team_snapshot(as_of_str: str) -> dict:
     coverage = history.rolling_days(as_of, 365)
     mids = signals_repository.all_managers()
     names = signals_repository.manager_names(mids)
+    unverified_orders = 0
     for mid in mids:
         # A team response is an accounting/management aggregate: silently skipping one failed
         # manager would make every total look valid while being incomplete. Fail the endpoint
@@ -876,7 +909,10 @@ def _build_team_snapshot(as_of_str: str) -> dict:
         overview_rows.append(target)
         tasks = lifecycle.team_stats(mid, as_of_str)
         _guard_team_stats(mid, tasks)
+        unverified_orders += int(target.get("unverified_orders") or 0)
         team.append({"manager_id": mid, "manager_name": names.get(mid),
+                     "degraded": bool(target.get("degraded")),
+                     "unverified_orders": int(target.get("unverified_orders") or 0),
                      "target": {"shipped": _summarize_metric(target["shipped"]),
                                 "paid": _summarize_metric(target["paid"])},
                      "tasks": tasks})
@@ -893,8 +929,14 @@ def _build_team_snapshot(as_of_str: str) -> dict:
     totals["close_rate"] = lifecycle.close_rate(totals["done_month"], totals["dismissed_month"])
     totals["conversion_rate"] = lifecycle.conversion_rate(totals["sold_month"], totals["done_month"])
     expected_count = len(mids)
+    degradation = {
+        "degraded": unverified_orders > 0,
+        "degraded_reasons": [targets.UNVERIFIED_INVOICE_REASON] if unverified_orders else [],
+        "unverified_orders": unverified_orders,
+    }
     return {
         "overview": {
+            **degradation,
             "count": len(overview_rows),
             "expected_manager_count": expected_count,
             "returned_manager_count": len(overview_rows),
@@ -903,6 +945,7 @@ def _build_team_snapshot(as_of_str: str) -> dict:
         },
         "team": {
             "is_head": True,
+            **degradation,
             "as_of": as_of,
             **coverage.metadata(),
             "expected_manager_count": expected_count,
@@ -938,8 +981,15 @@ def _team_snapshot_cached(as_of: str | None = None, *, allow_stale: bool = True)
             fresh = same and time.monotonic() - _team_snap_state["at"] < _TEAM_SNAP_TTL_S
             if _team_snap_state["value"] is not None and fresh:
                 return _team_snap_state["value"]
-        computed = _build_team_snapshot(key)
+        try:
+            computed = _build_team_snapshot(key)
+        except Exception as exc:
+            _record_team_snapshot_failure(exc)
+            raise
         with _team_snap_lock:
+            _team_metrics_state.update(
+                {"checked_at": datetime.now(ZoneInfo("UTC")).isoformat(), "error": None,
+                 "unverified_orders": computed["team"]["unverified_orders"]})
             _team_snap_state.update(
                 {
                     "at": time.monotonic(),

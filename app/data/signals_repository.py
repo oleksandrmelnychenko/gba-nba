@@ -18,9 +18,12 @@ from typing import Any
 
 from app.core import history
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.core.money import cents, cents_decimal, decimal_value
 from app.data.db import in_clause, query
 from app.data.purchase_history import retained_purchase_cte
+
+log = get_logger("signals")
 
 
 @lru_cache(maxsize=64)
@@ -842,11 +845,19 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
 
 # --- sales-target engine: monthly shipped & paid per manager ---
 
-def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
+class InvoiceSeries(dict):
+    """Monthly verified invoice gross plus the orders left out for an unverified invoice date."""
+
+    unverified_orders: int = 0
+    unverified_amount: Decimal = Decimal("0")
+
+
+def monthly_shipped(manager_id: int, since: str, as_of: str) -> InvoiceSeries:
     """Compatibility name: gross confirmed invoice documents, NOT recognized shipment revenue.
 
     Current document revisions and current client book; original line quantity (returns have
-    their own event, never rewrite the invoice month). Unknown invoice clock fails this metric.
+    their own event, never rewrite the invoice month). Orders without a verified invoice clock
+    are excluded from every month and reported on the result, never silently summed.
     """
     window = history.explicit_window(since, as_of)
     excluded = _excluded(window.as_of.isoformat())
@@ -858,17 +869,27 @@ def monthly_shipped(manager_id: int, since: str, as_of: str) -> dict[str, Decima
         params.update(values)
         predicate = f" AND oi.ProductID NOT IN {placeholders}"
     rows = query(retained_purchase_cte() + f"""
-        SELECT CONVERT(char(7),p.purchased_at,126) AS ym,
+        SELECT CASE WHEN p.timestamp_basis IS NULL THEN NULL
+                    ELSE CONVERT(char(7),p.purchased_at,126) END AS ym,
                SUM(CAST(oi.Qty AS decimal(30,8))*oi.PricePerItem) AS amt,
-               SUM(CASE WHEN p.timestamp_basis IS NULL THEN 1 ELSE 0 END) AS missing_date
+               COUNT(DISTINCT p.order_id) AS orders
         FROM purchase_orders p JOIN dbo.OrderItem oi ON oi.OrderID=p.order_id
         WHERE oi.Deleted=0 AND oi.IsValidForCurrentSale=1 AND oi.ProductID IS NOT NULL
               AND oi.Qty>0 {predicate}
-        GROUP BY CONVERT(char(7),p.purchased_at,126)
+        GROUP BY CASE WHEN p.timestamp_basis IS NULL THEN NULL
+                      ELSE CONVERT(char(7),p.purchased_at,126) END
     """, params)
-    if any(row["missing_date"] for row in rows):
-        raise ValueError("invoice_event_date_unverified")
-    return {row["ym"]: decimal_value(row["amt"]) for row in rows}
+    series = InvoiceSeries()
+    for row in rows:
+        if row["ym"] is None:
+            series.unverified_orders = int(row["orders"] or 0)
+            series.unverified_amount = decimal_value(row["amt"] or 0)
+        else:
+            series[row["ym"]] = decimal_value(row["amt"])
+    if series.unverified_orders:
+        log.warning("invoice_event_date_unverified", manager_id=manager_id,
+                    orders=series.unverified_orders)
+    return series
 
 
 def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:

@@ -70,7 +70,10 @@ def _derived_expected_value(doc: dict) -> float | None:
         order_count = _float_score(signals.get("order_count"))
         return monetary / order_count if order_count > 0 else None
     if task_type == TaskType.CHURN_WINBACK.value:
-        return _optional_float(signals.get("monetary"))
+        monetary = _optional_float(signals.get("monetary"))
+        if monetary is None:
+            return None
+        return monetary * get_settings().ev_horizon_days / 365
     return None
 
 
@@ -259,10 +262,12 @@ def upsert_generated(task: Task) -> str:
                 {"$set": {"due_date": due_date}},
             )
         # refresh computed fields only; keep status/notes/history/snooze/outcome
+        changed = any(existing.get(field) != value for field, value in computed.items()
+                      if field not in ("updated_at", "expires_at"))
         refreshed = mongo.tasks().update_one(
             {"task_key": task.task_key, "manager_id": task.manager_id,
              "status": {"$in": [status.value for status in ACTIVE]}}, {"$set": computed})
-        if refreshed.matched_count:
+        if refreshed.matched_count and changed:
             _event(task.task_key, "refresh", by="system")
     else:
         doc = {
@@ -514,6 +519,114 @@ def sweep_expired() -> int:
          "$or": [{"notes": {"$exists": False}}, {"notes": []}],
          "expires_at": {"$lt": _now()}})
     return res.deleted_count
+
+
+STALE_REASON = "expired_stale"
+
+
+def _human_touched(doc: dict) -> bool:
+    """Any trace of a person on the task: a status change, note, snooze or started work."""
+    if doc.get("notes") or doc.get("in_progress_since") or doc.get("snooze_until"):
+        return True
+    if doc.get("outcome") or doc.get("assignment_mode") or doc.get("origin") not in (None, "ai"):
+        return True
+    return any(
+        change.get("by") != "system"
+        or change.get("to") in (TaskStatus.SNOOZED.value, TaskStatus.IN_PROGRESS.value)
+        for change in doc.get("status_history") or []
+    )
+
+
+def _contacted_since_generation(docs: list[dict]) -> set[str]:
+    """Task keys whose client has a logged seller contact after the task was generated."""
+    client_ids = sorted({doc["client_id"] for doc in docs if doc.get("client_id")})
+    if not client_ids:
+        return set()
+    latest: dict[int, datetime] = {}
+    for event in mongo.seller_contact_events().find(
+            {"client_id": {"$in": client_ids}}, {"client_id": 1, "at": 1}):
+        at = event.get("at")
+        if isinstance(at, datetime):
+            at = _as_aware(at)
+            if at > latest.get(event["client_id"], datetime.min.replace(tzinfo=UTC)):
+                latest[event["client_id"]] = at
+    attributed = set(mongo.get_db()["explicit_sale_attributions"].distinct(
+        "task_key", {"task_key": {"$in": [doc["task_key"] for doc in docs]}}))
+    touched = set(attributed)
+    for doc in docs:
+        contact_at = latest.get(doc.get("client_id"))
+        generated_at = doc.get("generated_at")
+        if contact_at and (generated_at is None or contact_at >= _as_aware(generated_at)):
+            touched.add(doc["task_key"])
+    return touched
+
+
+def plan_stale_retirement(manager_id: int, current_keys: set[str],
+                          evaluated_types: set[str], now: datetime | None = None) -> list[dict]:
+    """SLA-breached AI tasks no person acted on that no longer belong in today's queue.
+
+    A task is retired when its signal is gone (its type was evaluated this run and no current
+    candidate maps to it) or when it is older than stale_task_max_age_days from creation.
+    Critical debt tasks whose signal is still current keep the reserved slots: the top
+    crit_debt_reserve of them are left in place and refreshed by generation.
+    Returns [{task, rule, age_days}] without writing.
+    """
+    settings = get_settings()
+    now = now or _now()
+    docs = list(mongo.tasks().find({
+        "manager_id": manager_id,
+        "status": {"$in": [TaskStatus.GENERATED.value, TaskStatus.OPEN.value]},
+        "task_type": {"$ne": TaskType.MANUAL.value},
+        "sla_breached": True,
+    }))
+    docs = [doc for doc in docs if not _human_touched(doc)]
+    contacted = _contacted_since_generation(docs)
+    docs = [doc for doc in docs if doc["task_key"] not in contacted]
+    docs.sort(key=_inbox_sort_key)
+    reserve_left = settings.crit_debt_reserve
+    plan = []
+    for doc in docs:
+        generated_at = doc.get("generated_at")
+        age_days = (now - _as_aware(generated_at)).days if generated_at else None
+        signal_gone = (doc.get("task_type") in evaluated_types
+                       and doc["task_key"] not in current_keys)
+        too_old = age_days is not None and age_days >= settings.stale_task_max_age_days
+        if not signal_gone and not too_old:
+            continue
+        if (not signal_gone and doc.get("task_type") == TaskType.DEBT_FOLLOWUP.value
+                and doc.get("urgency") == Urgency.CRITICAL.value and reserve_left > 0):
+            reserve_left -= 1
+            continue
+        plan.append({"task": doc, "age_days": age_days,
+                     "rule": "signal_not_current" if signal_gone else "max_age"})
+    return plan
+
+
+def retire_stale(manager_id: int, current_keys: set[str], evaluated_types: set[str]) -> dict:
+    """Close the planned stale tasks as superseded/expired_stale. Idempotent: a retired task is
+    terminal and never matches the plan again; a concurrent seller update wins the CAS."""
+    stats = {"retired": 0, "by_type": {}, "by_rule": {}}
+    if not get_settings().stale_retirement_enabled:
+        return stats
+    for item in plan_stale_retirement(manager_id, current_keys, evaluated_types):
+        doc = item["task"]
+        now = _mutation_time(doc.get("updated_at"))
+        result = mongo.tasks().update_one(
+            {"_id": doc["_id"], "status": doc["status"], "manager_id": manager_id,
+             "updated_at": doc.get("updated_at")},
+            {"$set": {"status": TaskStatus.SUPERSEDED.value, "resolved_at": now, "updated_at": now,
+                      "retired_reason": STALE_REASON,
+                      "retirement": {"rule": item["rule"], "age_days": item["age_days"], "at": now}},
+             "$push": {"status_history": {"from": doc["status"], "to": TaskStatus.SUPERSEDED.value,
+                                           "at": now, "by": "system", "reason": STALE_REASON}}})
+        if not result.modified_count:
+            continue
+        _event(doc["task_key"], f"status:{TaskStatus.SUPERSEDED.value}", by="system",
+               reason=f"{STALE_REASON}:{item['rule']}")
+        stats["retired"] += 1
+        for name, key in (("by_type", doc.get("task_type")), ("by_rule", item["rule"])):
+            stats[name][key] = stats[name].get(key, 0) + 1
+    return stats
 
 
 def sweep_orphaned() -> int:

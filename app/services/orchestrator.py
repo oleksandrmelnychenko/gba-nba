@@ -16,7 +16,7 @@ from app.core import history
 from app.core.config import get_settings, require_generation_enabled
 from app.core.logging import get_logger
 from app.domain.models import TaskType, Urgency
-from app.services import lifecycle, reconciliation
+from app.services import lifecycle, reconciliation, scoring
 from app.services.generators import (
     churn_winback,
     cross_sell,
@@ -162,14 +162,31 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     # collect candidates from all generators
     candidates = []
     generators_failed = 0
+    evaluated_types: set[str] = set()
     for gen in _GENERATORS:
         try:
-            candidates.extend(gen.generate(manager_id, as_of, window))
+            produced = gen.generate(manager_id, as_of, window)
         except Exception as exc:  # noqa: BLE001
             generators_failed += 1
             log.warning("generator_failed", generator=gen.__name__, manager_id=manager_id, error=str(exc))
+            continue
+        candidates.extend(produced)
+        gen_type = getattr(gen, "TYPE", None)
+        # cross_sell returns nothing when gba-reco is offline: an empty answer proves no absence.
+        if gen_type is None:
+            evaluated_types.update(task.task_type.value for task in produced)
+        elif produced or gen_type != TaskType.CROSS_SELL:
+            evaluated_types.add(gen_type.value)
 
     candidates, reconciliation_stats = reconciliation.prepare(manager_id, candidates, as_of)
+
+    # retire the stale part of the queue BEFORE admission so today's candidates get the slots
+    try:
+        stale = lifecycle.retire_stale(
+            manager_id, {task.task_key for task in candidates}, evaluated_types)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("stale_retirement_skipped", manager_id=manager_id, error=str(exc))
+        stale = {"retired": 0, "by_type": {}, "by_rule": {}}
 
     # pace coupling: behind monthly target -> lift revenue (shipped) / debt (paid) task priority.
     # Graceful: if targets/DB are unavailable, generation proceeds without the boost.
@@ -191,6 +208,7 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     }
     for task in candidates:
         task.signals = {**task.signals, **signal_history}
+        task.payload = {**task.payload, "score_source": scoring.score_source(task.task_type.value)}
 
     # highest expected EUR first so caps keep the BEST tasks; priority remains the legacy fallback
     # and tie-breaker for candidates without an EV score.
@@ -284,6 +302,8 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     stats = {"manager_id": manager_id, "as_of": as_of, "candidates": len(candidates),
              "generators_total": len(_GENERATORS), "generators_failed": generators_failed,
              "by_type": {tt.value: n for tt, n in per_type.items()},
+             "stale_retired": stale["retired"], "stale_retired_by_type": stale["by_type"],
+             "stale_retired_by_rule": stale["by_rule"],
              **coverage.metadata(), **counters, **reconciliation_stats}
     log.info("generation_done", **stats)
     return stats

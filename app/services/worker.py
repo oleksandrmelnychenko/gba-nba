@@ -1,6 +1,7 @@
 """Regeneration worker — nightly job that keeps every manager's inbox fresh.
 
-For each manager: run all generators (idempotent upsert via task_key). Then run lifecycle
+For each manager: retire the stale SLA-breached untouched tasks, then run all generators
+(idempotent upsert via task_key). Then run lifecycle
 sweeps: wake snoozed tasks whose time has come, and flag SLA-breached overdue tasks. Safe to
 re-run any time (idempotent).
 """
@@ -60,11 +61,15 @@ def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bo
         log.warning("reco_feedback_skipped", error=str(exc))
         fb = {"clients": 0, "sent": 0, "products": 0}
 
-    total_persisted = ok = failed = 0
+    total_persisted = ok = failed = stale_retired = 0
+    stale_by_type: dict[str, int] = {}
     for i, mid in enumerate(managers, 1):
         try:
             stats = orchestrator.generate_for_manager(mid, as_of)
             total_persisted += stats["persisted"]
+            stale_retired += stats.get("stale_retired", 0)
+            for task_type, count in (stats.get("stale_retired_by_type") or {}).items():
+                stale_by_type[task_type] = stale_by_type.get(task_type, 0) + count
             ok += 1
         except Exception as exc:  # noqa: BLE001
             failed += 1
@@ -72,6 +77,7 @@ def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bo
         if i % 5 == 0:
             log.info("regen_progress", done=i, total=len(managers), persisted=total_persisted)
 
+    log.info("stale_retirement_done", retired=stale_retired, by_type=stale_by_type)
     woken = lifecycle.wake_snoozed()
     heads = sig.head_user_ids()
     sla = lifecycle.sweep_sla(escalate_to=heads[0] if heads else None)
@@ -80,6 +86,7 @@ def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bo
     stats = {"managers": len(managers), "ok": ok, "failed": failed,
              "tasks_persisted": total_persisted, "snoozed_woken": woken,
              "orphaned_closed": orphaned,
+             "stale_retired": stale_retired, "stale_retired_by_type": stale_by_type,
              "sla_breached": sla["flagged"], "sla_escalated": sla["escalated"],
              "expired_purged": expired, "reco_feedback_clients": fb["clients"],
              "reco_feedback_products": fb["products"],

@@ -285,7 +285,9 @@ def prepare(manager_id: int, candidates: list, as_of: str) -> tuple[list, dict]:
             candidate.task_key = (f"client:{candidate.client_id}|type:{candidate.task_type.value}|"
                                   f"cycle:{cycle or 'unverified'}")
             terminal = mongo.tasks().find_one({"client_id": candidate.client_id,
-                "task_type": candidate.task_type.value, "status": {"$in": ["done", "dismissed"]}},
+                "task_type": candidate.task_type.value,
+                "$or": [{"status": {"$in": ["done", "dismissed"]}},
+                        {"status": "superseded", "retired_reason": "expired_stale"}]},
                 sort=[("generated_at", -1)])
             if terminal:
                 previous_cycle = _cycle(candidate.task_type, terminal.get("source_baseline") or {})

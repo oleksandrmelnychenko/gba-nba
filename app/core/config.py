@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     dismiss_mute_days: int = 30
     service_level_due_days: int = 3
     crit_debt_reserve: int = 5
+    # Stale-queue retirement: an SLA-breached AI task nobody acted on is closed (superseded with
+    # reason expired_stale) once its signal is gone or it is older than this many days from creation.
+    stale_retirement_enabled: bool = True
+    stale_task_max_age_days: int = Field(default=14, gt=0)
 
     # Signal tuning (calibrated 2026-06 on ConcordDb_V5 real data)
     debt_max_age_days: int = 365         # ignore stale write-off debts older than this (Debt.Created)
@@ -104,6 +108,11 @@ class Settings(BaseSettings):
     urgency_band_critical: float = 0.85
     urgency_band_high: float = 0.6
     urgency_band_normal: float = 0.3
+    # A task type whose model head has fewer labelled training rows than this (or failed the
+    # retrain per-type gate) is ranked by the deterministic heuristic, not the model probability.
+    min_model_training_rows: int = Field(default=500, ge=0)
+    # Expected value is the EUR expected inside this horizon — the model's outcome window.
+    ev_horizon_days: int = Field(default=60, gt=0)
 
     # Feedback learning loop: repeatedly DISMISSED / done-not-sold (client, task_type) pairs get a
     # priority penalty so the queue learns from the manager's behaviour (beyond the 30d dismiss mute).

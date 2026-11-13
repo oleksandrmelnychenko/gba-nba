@@ -78,6 +78,12 @@ class Settings(BaseSettings):
 
     # Signal tuning (calibrated 2026-06 on ConcordDb_V5 real data)
     debt_min_amount: float = 10.0        # EUR; drop settled/rounding sub-€10 overdues (~25% are noise)
+    # Debt follow-up by collectability (docs/task-quality-2026-11-13.md): 66.1% of documents
+    # 1-3 days past terms are settled within five days without a call, 5.6% of those over 90.
+    # No task inside the grace period; past it the freshest debt is the most urgent.
+    debt_grace_days: int = Field(default=3, ge=0)
+    debt_fresh_max_days: int = Field(default=30, gt=0)
+    debt_aged_max_days: int = Field(default=90, gt=0)
     reorder_min_cycle_days: int = 7      # floor for span/(n-1) cycle, suppresses burst-buyer false-criticals
     reorder_max_overdue_mult: float = 3.0  # cap elapsed at N×cycle; beyond this the product is abandoned
     # churn: a rate drop only counts once the silence exceeds the client's own rhythm.

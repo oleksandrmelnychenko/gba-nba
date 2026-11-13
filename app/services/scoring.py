@@ -165,7 +165,8 @@ def _heuristic_probability(task_type: str, signals: dict) -> float:
     """Deterministic score for a task type the model has no basis to rank."""
     monetary = float(signals.get("monetary") or 0.0)
     if task_type == "debt_followup":
-        urgency = debt_urgency(int(signals.get("days_past_terms") or 0))
+        urgency = debt_urgency(int(
+            signals.get("lead_days_past_terms") or signals.get("days_past_terms") or 0))
         value = value_from_monetary(float(signals.get("overdue_amount") or 0.0))
         confidence = 1.0
     elif task_type == "reorder_due":
@@ -219,14 +220,46 @@ def urgency_band(urgency_norm: float) -> Urgency:
     return Urgency.LOW
 
 
+DEBT_BAND_GRACE = "grace"
+DEBT_BAND_FRESH = "fresh"
+DEBT_BAND_AGED = "aged"
+DEBT_BAND_OLD = "old"
+_DEBT_BAND_RANK = {DEBT_BAND_FRESH: 0, DEBT_BAND_AGED: 1, DEBT_BAND_OLD: 2, DEBT_BAND_GRACE: 3}
+
+
+def debt_age_band(days_past_terms: int) -> str:
+    s = get_settings()
+    if days_past_terms <= s.debt_grace_days:
+        return DEBT_BAND_GRACE
+    if days_past_terms <= s.debt_fresh_max_days:
+        return DEBT_BAND_FRESH
+    return DEBT_BAND_AGED if days_past_terms <= s.debt_aged_max_days else DEBT_BAND_OLD
+
+
 def debt_urgency(days_past_terms: int) -> float:
-    """Any overdue debt is at least HIGH (>=0.6) — it's cash already at risk; older debt scales to
-    CRITICAL (>=0.85 at ~100 days past terms). Without this floor most debts are only a few days
-    past short terms (measured: 152/212 had <13d past), scored LOW, and got buried under reorder.
+    """Urgency of one overdue document by how collectable it is, not by how old it is.
+
+    Inside the grace period: 0 (most are paid without a call). Just past it the debt is the
+    most collectable and the most urgent: HIGH, 0.84 falling to 0.70 at debt_fresh_max_days.
+    Up to debt_aged_max_days: NORMAL, 0.55 falling to 0.40. Older: LOW 0.20 — old debt is
+    rarely settled by a call (5.6% in five days), it stays listed and no longer leads.
     """
-    if days_past_terms <= 0:
+    s = get_settings()
+    band = debt_age_band(days_past_terms)
+    if band == DEBT_BAND_GRACE:
         return 0.0
-    return max(0.0, min(1.0, 0.6 + 0.4 * _sat(days_past_terms, 60.0)))
+    if band == DEBT_BAND_FRESH:
+        span = max(1, s.debt_fresh_max_days - s.debt_grace_days - 1)
+        return 0.84 - 0.14 * (days_past_terms - s.debt_grace_days - 1) / span
+    if band == DEBT_BAND_AGED:
+        span = max(1, s.debt_aged_max_days - s.debt_fresh_max_days - 1)
+        return 0.55 - 0.15 * (days_past_terms - s.debt_fresh_max_days - 1) / span
+    return 0.2
+
+
+def debt_lead_days(days_past_terms: list[int]) -> int:
+    """The document that sets a client's debt urgency: the most collectable one past grace."""
+    return min(days_past_terms, key=lambda days: (_DEBT_BAND_RANK[debt_age_band(days)], days))
 
 
 def reorder_urgency(elapsed_days: float, cycle_days: float) -> float:

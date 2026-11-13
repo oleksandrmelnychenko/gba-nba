@@ -519,6 +519,8 @@ def cockpit_clients(
             debt = debts.get(int(r["client_id"]))
             r["overdue_eur"] = cents(debt["overdue_amount"]) if debt else 0.0
             r["max_days_past_terms"] = int(debt["max_days_past_terms"]) if debt else 0
+            r["debt_opening_balance_eur"] = cents(debt.get("opening_balance_amount")) if debt else 0.0
+            r["debt_opening_balance_count"] = int(debt.get("opening_balance_lines") or 0) if debt else 0
             r["debt_unknown_date_eur"] = cents(debt.get("unknown_date_amount")) if debt else 0.0
             r["debt_unknown_date_count"] = int(debt.get("unknown_date_lines") or 0) if debt else 0
             r["turnover_eur"] = cents(r.get("turnover_eur") or 0)
@@ -728,6 +730,8 @@ _debt_dash_state: dict = {
 
 _EMPTY_DEBT_DASH = {
     "value_at_risk_eur": 0.0,
+    "debt_opening_balance_count": 0,
+    "debt_opening_balance_eur": 0.0,
     "debt_unknown_date_count": 0,
     "debt_unknown_date_eur": 0.0,
     "debt_unknown_terms_count": 0,
@@ -806,6 +810,8 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
         "urgency_mix": counts["urgency_mix"],
         "value_at_risk_eur": debt["value_at_risk_eur"],
         "debt_aging": debt["debt_aging"],
+        "debt_opening_balance_count": debt.get("debt_opening_balance_count", 0),
+        "debt_opening_balance_eur": debt.get("debt_opening_balance_eur", 0.0),
         "debt_unknown_date_count": debt.get("debt_unknown_date_count", 0),
         "debt_unknown_date_eur": debt.get("debt_unknown_date_eur", 0.0),
         "debt_unknown_terms_count": debt.get("debt_unknown_terms_count", 0),
@@ -830,15 +836,20 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
     if not signals_repository.is_head_of_sales(manager_net_uid):
         return {"is_head": False, "requested_manager_net_uid": requested_net_uid,
                 "as_of": None, "teams": [],
-                "escalated_count": 0, "total_value_at_risk_eur": 0.0}
+                "escalated_count": 0, "total_value_at_risk_eur": 0.0,
+                "total_debt_opening_balance_eur": 0.0, "total_debt_opening_balance_count": 0}
     as_of = _current_task_as_of(as_of_date)
     coverage = history.rolling_days(as_of, 365)
     teams = []
     total_var = Decimal("0")
+    total_opening = Decimal("0")
+    total_opening_count = 0
     debt_by_manager = _debt_dashboards_cached(as_of)
     for mid in signals_repository.all_managers():
         var = debt_by_manager.get(mid, {}).get("value_at_risk_eur", 0.0)
         total_var += decimal_value(var)
+        total_opening += decimal_value(debt_by_manager.get(mid, {}).get("debt_opening_balance_eur", 0.0))
+        total_opening_count += int(debt_by_manager.get(mid, {}).get("debt_opening_balance_count", 0))
         workload = lifecycle.active_workload_counts(mid)
         teams.append({"manager_id": mid,
                       "open_tasks": workload["active_total"],
@@ -846,6 +857,8 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
                       "manual_backlog": workload["manual_backlog"],
                       "critical": lifecycle.critical_active_count(mid),
                       "value_at_risk_eur": var,
+                      "debt_opening_balance_count": debt_by_manager.get(mid, {}).get("debt_opening_balance_count", 0),
+                      "debt_opening_balance_eur": debt_by_manager.get(mid, {}).get("debt_opening_balance_eur", 0.0),
                       "debt_unknown_date_count": debt_by_manager.get(mid, {}).get("debt_unknown_date_count", 0),
                       "debt_unknown_date_eur": debt_by_manager.get(mid, {}).get("debt_unknown_date_eur", 0.0),
                       "debt_unknown_terms_count": debt_by_manager.get(mid, {}).get("debt_unknown_terms_count", 0),
@@ -854,7 +867,9 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
     return {"is_head": True, "requested_manager_net_uid": requested_net_uid,
             "as_of": as_of, **coverage.metadata(), "teams": teams,
             "escalated_count": lifecycle.escalated_count(),
-            "total_value_at_risk_eur": cents(total_var)}
+            "total_value_at_risk_eur": cents(total_var),
+            "total_debt_opening_balance_eur": cents(total_opening),
+            "total_debt_opening_balance_count": total_opening_count}
 
 
 def _summarize_metric(metric: dict) -> dict:

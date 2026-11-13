@@ -37,13 +37,35 @@ def test_value_curve_spreads_real_distribution():
     assert scoring.value_from_monetary(0) == 0.0
 
 
-def test_debt_urgency_any_overdue_is_at_least_high():
+def test_debt_urgency_follows_collectability_not_age():
     assert scoring.debt_urgency(0) == 0.0
     assert scoring.debt_urgency(-5) == 0.0
-    assert scoring.debt_urgency(1) >= 0.6                       # any overdue -> at least HIGH
-    assert scoring.urgency_band(scoring.debt_urgency(1)) in (Urgency.HIGH, Urgency.CRITICAL)
-    assert scoring.urgency_band(scoring.debt_urgency(120)) == Urgency.CRITICAL
-    assert scoring.debt_urgency(1) < scoring.debt_urgency(120) <= 1.0
+    assert scoring.debt_urgency(3) == 0.0
+    assert scoring.urgency_band(scoring.debt_urgency(4)) == Urgency.HIGH
+    assert scoring.urgency_band(scoring.debt_urgency(30)) == Urgency.HIGH
+    assert scoring.urgency_band(scoring.debt_urgency(31)) == Urgency.NORMAL
+    assert scoring.urgency_band(scoring.debt_urgency(90)) == Urgency.NORMAL
+    assert scoring.urgency_band(scoring.debt_urgency(91)) == Urgency.LOW
+    assert scoring.urgency_band(scoring.debt_urgency(4000)) == Urgency.LOW
+    assert (scoring.debt_urgency(4) > scoring.debt_urgency(30) > scoring.debt_urgency(31)
+            > scoring.debt_urgency(90) > scoring.debt_urgency(91) > 0.0)
+
+
+def test_debt_age_bands_and_the_document_that_leads():
+    assert [scoring.debt_age_band(d) for d in (1, 3, 4, 30, 31, 90, 91)] == [
+        "grace", "grace", "fresh", "fresh", "aged", "aged", "old"]
+    assert scoring.debt_lead_days([200, 45, 9, 5]) == 5
+    assert scoring.debt_lead_days([200, 45]) == 45
+    assert scoring.debt_lead_days([200, 95]) == 95
+    assert scoring.debt_lead_days([2, 200]) == 200
+
+
+def test_debt_rule_score_uses_the_leading_document():
+    fresh = scoring._heuristic_probability(
+        "debt_followup", {"days_past_terms": 200, "lead_days_past_terms": 5, "overdue_amount": 500})
+    old = scoring._heuristic_probability(
+        "debt_followup", {"days_past_terms": 200, "overdue_amount": 500})
+    assert fresh > old
 
 
 def test_priority_is_bounded_0_100():

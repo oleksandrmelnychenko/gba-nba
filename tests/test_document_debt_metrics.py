@@ -81,6 +81,72 @@ def test_clients_with_only_unverified_documents_reach_the_column_but_never_a_tas
     assert signals_repository.overdue_debts_for_manager(1, '2026-10-22', 50.0) == []
 
 
+def opening(key, amount, created, terms=30, client=7):
+    return {**debt(key, amount, created, terms), 'client_id': client,
+            'obligation_date_basis': None, 'opening_balance': 1}
+
+
+def test_opening_balances_count_as_overdue_on_the_stored_date_with_their_own_breakdown():
+    rows = [
+        debt(1, 100, '2026-09-01T10:00:00'),
+        opening(2, 500, '2024-12-31T21:59:59', 14),
+        opening(3, 250, '2015-11-01T10:00:00', 0, client=8),
+        opening(4, 241.52, '2014-07-03T21:00:00', 9000, client=9),
+        {**debt(5, 70, '2026-09-01T10:00:00'), 'obligation_date_basis': None},
+    ]
+    card = fold_documents(rows, '2026-11-13')
+    assert card['value_at_risk_eur'] == 850
+    assert card['debt_opening_balance_count'] == 2 and card['debt_opening_balance_eur'] == 750
+    assert card['debt_unknown_date_count'] == 2 and card['debt_unknown_date_eur'] == 311.52
+    assert card['debt_aging'][3] == {'bucket': '90+', 'amount_eur': 750, 'count': 2}
+    book = {row['client_id']: row for row in fold_clients(rows, '2026-11-13', with_unverified=True)}
+    assert sum(row['overdue_amount'] for row in book.values()) == Decimal('850')
+    assert book[7]['overdue_amount'] == Decimal('600') and book[7]['debt_ids'] == '1,2'
+    assert book[7]['opening_balance_amount'] == Decimal('500') and book[7]['opening_balance_lines'] == 1
+    assert book[7]['task_overdue_amount'] == Decimal('100') and book[7]['task_debt_ids'] == '1'
+    assert book[7]['max_days_past_terms'] == 668 and book[7]['task_max_days_past_terms'] == 43
+    assert book[7]['unknown_date_amount'] == Decimal('70.00')
+    assert book[8]['overdue_amount'] == Decimal('250') and book[8]['task_debt_lines'] == 0
+    assert book[9]['overdue_amount'] == 0 and book[9]['unknown_date_amount'] == Decimal('241.52')
+    assert sum(row['opening_balance_amount'] for row in book.values()) == Decimal('750')
+
+
+def test_an_opening_balance_alone_never_raises_a_task_and_grace_holds_fresh_debt_back():
+    from app.data.debt_snapshot import task_candidates
+    rows = [
+        opening(1, 5000, '2024-12-31T21:59:59', 14, client=8),
+        opening(2, 900, '2024-12-31T21:59:59', 14, client=9),
+        {**debt(3, 80, '2026-10-01T10:00:00', 30), 'client_id': 9},
+        {**debt(4, 300, '2026-10-11T10:00:00', 30), 'client_id': 10},
+        {**debt(5, 300, '2026-10-10T10:00:00', 30), 'client_id': 11},
+        {**debt(6, 9, '2026-09-01T10:00:00', 30), 'client_id': 12},
+        {**debt(7, 40, '2026-10-12T10:00:00', 30), 'client_id': 13},
+        {**debt(8, 40, '2026-06-01T10:00:00', 30), 'client_id': 13},
+    ]
+    found = {row['client_id']: row for row in task_candidates(fold_clients(rows, '2026-11-13'), 10.0, 3)}
+    assert set(found) == {9, 11, 13}
+    assert found[9]['overdue_amount'] == Decimal('80') and found[9]['debt_ids'] == '3'
+    assert found[9]['max_days_past_terms'] == 13 and found[9]['debt_lines'] == 1
+    assert found[11]['max_days_past_terms'] == 4
+    assert found[13]['days_past_terms'] == [2, 135] and found[13]['overdue_amount'] == Decimal('80')
+
+
+def test_a_document_without_a_verified_clock_that_is_no_opening_balance_stays_unknown():
+    row = {**debt(1, 70, '2024-09-01T10:00:00'), 'obligation_date_basis': None, 'opening_balance': 0}
+    card = fold_documents([row], '2026-11-13')
+    assert card['value_at_risk_eur'] == 0 and card['debt_unknown_date_eur'] == 70
+    assert card['debt_opening_balance_count'] == 0
+
+
+def test_documents_query_marks_opening_balances_by_the_accounting_carrier(monkeypatch):
+    from app.data import debt_snapshot
+    calls = []
+    monkeypatch.setattr(debt_snapshot, 'query', lambda sql, params: calls.append(sql) or [])
+    debt_snapshot.documents('2026-11-13')
+    assert 'AS opening_balance' in calls[0]
+    assert 'target.OwnershipType = 1' in calls[0] and 'target.IsCurrent = 1' in calls[0]
+
+
 def test_documents_query_converts_at_the_as_of_date_through_the_database_function(monkeypatch):
     from app.data import debt_snapshot
     calls = []

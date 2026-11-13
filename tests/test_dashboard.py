@@ -99,6 +99,8 @@ def test_manager_dashboard_shape_and_mix(client):
         "urgency_mix",
         "value_at_risk_eur",
         "debt_aging",
+        "debt_opening_balance_count",
+        "debt_opening_balance_eur",
         "debt_unknown_date_count",
         "debt_unknown_date_eur",
         "debt_unknown_terms_count",
@@ -242,12 +244,14 @@ def test_head_dashboard_shape(client):
         "teams",
         "escalated_count",
         "total_value_at_risk_eur",
+        "total_debt_opening_balance_eur",
+        "total_debt_opening_balance_count",
         "source_history_start",
         "effective_start",
         "history_complete",
     }
     teams = {t["manager_id"]: t for t in body["teams"]}
-    assert set(teams[1]) == {"manager_id", "open_tasks", "ai_active", "manual_backlog", "critical", "value_at_risk_eur", "debt_unknown_date_count", "debt_unknown_date_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur", "debt_unconverted_count"}
+    assert set(teams[1]) == {"manager_id", "open_tasks", "ai_active", "manual_backlog", "critical", "value_at_risk_eur", "debt_opening_balance_count", "debt_opening_balance_eur", "debt_unknown_date_count", "debt_unknown_date_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur", "debt_unconverted_count"}
     assert teams[1]["open_tasks"] == 2
     assert teams[1]["critical"] == 1
     assert teams[1]["value_at_risk_eur"] == 1234.50

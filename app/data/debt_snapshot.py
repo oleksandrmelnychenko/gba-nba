@@ -6,6 +6,13 @@ read classify() over documents(); only the task threshold (debt_min_amount) is t
 Debt.Created is the persisted obligation date, not response time. Imported timestamps
 need positive clock provenance; IsImported alone does not imply UTC or local time.
 Agreement terms are current persisted terms; historical term changes are unavailable.
+
+An opening balance is a document whose sale is an owned accounting carrier (the 1C balance
+entered on 2024-12-31). It has no source lineage, so its clock cannot be verified; the stored
+date is the only date there is and its uncertainty is hours against hundreds of days past
+terms. It is counted as overdue on the stored date and reported separately as an opening
+balance. It never raises a follow-up task: it needs an accounting decision, not a call.
+An opening balance that the stored date and terms do not put past due stays unknown_date.
 """
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
@@ -25,6 +32,7 @@ SELECT d.ID AS debt_id, c.ID AS client_id, c.MainManagerID AS manager_id, d.Crea
               AND ABS(DATEDIFF_BIG(millisecond, source_date.first_date, d.Created)) <= 4
               THEN 'imported_lineage_utc'
        END AS obligation_date_basis,
+       CASE WHEN carrier.present = 1 THEN 1 ELSE 0 END AS opening_balance,
        CASE WHEN a.Deleted = 0 AND a.NumberDaysDebt >= 0 THEN a.NumberDaysDebt END AS term_days,
        currency.Code AS currency_code,
        CAST(d.Total AS decimal(30, 4)) AS amount_native,
@@ -41,6 +49,12 @@ OUTER APPLY (
   FROM dbo.DataSyncImportedSaleSourceLine line
   WHERE line.LocalSaleID = sale.ID AND line.IsPresent = 1
 ) source_date
+OUTER APPLY (
+  SELECT TOP 1 1 AS present
+  FROM dbo.DataSyncAccountingSourceTarget target
+  WHERE target.TargetEntityType = N'Sale' AND target.TargetEntityID = sale.ID
+    AND target.IsCurrent = 1 AND target.OwnershipType = 1
+) carrier
 LEFT JOIN dbo.Agreement a ON a.ID = attachment.AgreementID
 LEFT JOIN dbo.Currency currency ON currency.ID = a.CurrencyID AND currency.Deleted = 0
 LEFT JOIN (
@@ -76,27 +90,38 @@ def documents(as_of: str, manager_id: int | None = None) -> list[dict]:
     return rows
 
 
+_VERIFIED_BASES = ('native_utc', 'imported_lineage_utc')
+
+
+def is_opening_balance(row: dict) -> bool:
+    return bool(row.get('opening_balance')) and row.get('obligation_date_basis') not in _VERIFIED_BASES
+
+
 def classify(row: dict, snapshot_day: date) -> tuple[str, int | None, int | None]:
     """(state, days_past_due, age_days); state is the single overdue rule of the cockpit.
 
-    overdue: positive open amount, convertible to EUR, verified obligation clock, valid
-    agreement terms, and the Kyiv obligation date plus terms is before the as-of day.
-    No age cap. unconverted, unknown_date and unknown_terms are reported, never summed.
+    overdue: positive open amount, convertible to EUR, valid agreement terms, and the Kyiv
+    obligation date plus terms is before the as-of day. The obligation clock is verified, or
+    the document is an opening balance counted on its stored date. No age cap.
+    unconverted, unknown_date and unknown_terms are reported, never summed.
     """
     if row.get('amount_eur') is None:
         return 'unconverted', None, None
-    if row.get('obligation_date_basis') not in ('native_utc', 'imported_lineage_utc'):
+    opening = is_opening_balance(row)
+    if row.get('obligation_date_basis') not in _VERIFIED_BASES and not opening:
         return 'unknown_date', None, None
     created = row['obligation_at']
     if created.tzinfo is None:
         created = created.replace(tzinfo=UTC)
     obligation_day = created.astimezone(_KYIV).date()
     if obligation_day > snapshot_day:
-        return 'future', None, None
+        return ('unknown_date' if opening else 'future'), None, None
     if row.get('term_days') is None:
-        return 'unknown_terms', None, None
+        return ('unknown_date' if opening else 'unknown_terms'), None, None
     age_days = (snapshot_day - obligation_day).days
     days_past_due = age_days - int(row['term_days'])
+    if opening and days_past_due < 1:
+        return 'unknown_date', None, None
     return ('overdue' if days_past_due >= 1 else 'current'), days_past_due, age_days
 
 
@@ -113,6 +138,8 @@ def fold_documents(rows: list[dict], as_of: str) -> dict:
     unknown_count = 0
     unknown_date_amount = Decimal(0)
     unknown_date_count = 0
+    opening_amount = Decimal(0)
+    opening_count = 0
     unconverted: dict[str, Decimal] = defaultdict(Decimal)
     unconverted_count = 0
     _unique(rows)
@@ -130,6 +157,9 @@ def fold_documents(rows: list[dict], as_of: str) -> dict:
             unknown_count += 1
             unknown_amount += amount
         elif state == 'overdue':
+            if is_opening_balance(row):
+                opening_count += 1
+                opening_amount += amount
             for name, low, high in _BUCKETS:
                 if days_past_due >= low and (high is None or days_past_due <= high):
                     amounts[name] += amount
@@ -139,6 +169,8 @@ def fold_documents(rows: list[dict], as_of: str) -> dict:
     return {
         'value_at_risk_eur': cents(sum(amounts.values(), Decimal(0))),
         'debt_aging': [{'bucket': name, 'amount_eur': cents(amounts[name]), 'count': counts[name]} for name, _, _ in _BUCKETS],
+        'debt_opening_balance_count': opening_count,
+        'debt_opening_balance_eur': cents(opening_amount),
         'debt_unknown_date_count': unknown_date_count,
         'debt_unknown_date_eur': cents(unknown_date_amount),
         'debt_unknown_terms_count': unknown_count,
@@ -153,7 +185,11 @@ def fold_documents(rows: list[dict], as_of: str) -> dict:
 def fold_clients(rows: list[dict], as_of: str, *, with_unverified: bool = False) -> list[dict]:
     """Overdue documents per client: the «Мої клієнти» column and the debt follow-up source.
 
-    with_unverified also returns clients whose only open documents have an unverified clock,
+    overdue_amount, debt_lines, debt_ids and the two maxima cover every overdue document, so
+    the column adds up to the card. opening_balance_amount/lines are the part of them that is
+    an opening balance. The task_* fields leave opening balances out: they are what a
+    follow-up task may be raised on, and task_days_past_terms lists each such document.
+    with_unverified also returns clients whose only open documents have an unknown date,
     so the per-client unknown_date_amount adds up to the card's debt_unknown_date_eur.
     """
     snapshot_day = date.fromisoformat(as_of)
@@ -167,23 +203,61 @@ def fold_clients(rows: list[dict], as_of: str, *, with_unverified: bool = False)
             'client_id': int(row['client_id']), 'manager_id': row.get('manager_id'),
             'debt_ids': [], 'overdue_amount': Decimal(0),
             'max_overdue_days': 0, 'max_days_past_terms': 0, 'debt_lines': 0,
+            'opening_balance_amount': Decimal(0), 'opening_balance_lines': 0,
+            'task_debt_ids': [], 'task_overdue_amount': Decimal(0),
+            'task_max_overdue_days': 0, 'task_max_days_past_terms': 0, 'task_debt_lines': 0,
+            'task_days_past_terms': [],
             'unknown_date_amount': Decimal(0), 'unknown_date_lines': 0,
         })
+        amount = decimal_value(row['amount_eur'])
         if state == 'unknown_date':
-            entry['unknown_date_amount'] += decimal_value(row['amount_eur'])
+            entry['unknown_date_amount'] += amount
             entry['unknown_date_lines'] += 1
             continue
         entry['debt_ids'].append(int(row['debt_id']))
-        entry['overdue_amount'] += decimal_value(row['amount_eur'])
+        entry['overdue_amount'] += amount
         entry['max_overdue_days'] = max(entry['max_overdue_days'], age_days)
         entry['max_days_past_terms'] = max(entry['max_days_past_terms'], days_past_due)
         entry['debt_lines'] += 1
+        if is_opening_balance(row):
+            entry['opening_balance_amount'] += amount
+            entry['opening_balance_lines'] += 1
+            continue
+        entry['task_debt_ids'].append(int(row['debt_id']))
+        entry['task_overdue_amount'] += amount
+        entry['task_max_overdue_days'] = max(entry['task_max_overdue_days'], age_days)
+        entry['task_max_days_past_terms'] = max(entry['task_max_days_past_terms'], days_past_due)
+        entry['task_debt_lines'] += 1
+        entry['task_days_past_terms'].append(days_past_due)
     return [
         {**entry, 'debt_ids': ','.join(str(value) for value in entry['debt_ids']),
+         'task_debt_ids': ','.join(str(value) for value in entry['task_debt_ids']),
          'overdue_amount': cents_decimal(entry['overdue_amount']),
+         'opening_balance_amount': cents_decimal(entry['opening_balance_amount']),
+         'task_overdue_amount': cents_decimal(entry['task_overdue_amount']),
          'unknown_date_amount': cents_decimal(entry['unknown_date_amount'])}
         for entry in clients.values()
         if entry['debt_lines'] or with_unverified
+    ]
+
+
+def task_candidates(clients: list[dict], min_amount: float, grace_days: int) -> list[dict]:
+    """Clients a debt follow-up task may be raised for, in the task's own terms.
+
+    Opening balances are left out, the amount must reach min_amount, and the oldest
+    remaining document must be more than grace_days past terms.
+    """
+    minimum = decimal_value(min_amount)
+    return [
+        {'client_id': entry['client_id'], 'manager_id': entry.get('manager_id'),
+         'debt_ids': entry['task_debt_ids'], 'overdue_amount': entry['task_overdue_amount'],
+         'max_overdue_days': entry['task_max_overdue_days'],
+         'max_days_past_terms': entry['task_max_days_past_terms'],
+         'debt_lines': entry['task_debt_lines'],
+         'days_past_terms': sorted(entry['task_days_past_terms'])}
+        for entry in clients
+        if entry['task_debt_lines'] and entry['task_overdue_amount'] >= minimum
+        and entry['task_max_days_past_terms'] > grace_days
     ]
 
 

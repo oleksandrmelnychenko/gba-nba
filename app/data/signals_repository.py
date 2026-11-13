@@ -403,6 +403,14 @@ def overdue_debts_for_manager(manager_id: int, as_of: str, min_amount: float = 0
             if row["overdue_amount"] >= decimal_value(min_amount) or not row["debt_lines"]]
 
 
+def debt_task_candidates(manager_id: int, as_of: str) -> list[dict]:
+    """Clients of a manager a debt follow-up task may be raised for (debt_snapshot rule)."""
+    s = get_settings()
+    return debt_snapshot.task_candidates(
+        debt_snapshot.overdue_clients(as_of, manager_id), s.debt_min_amount, s.debt_grace_days
+    )
+
+
 # --- reorder_due signal ---
 
 def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,

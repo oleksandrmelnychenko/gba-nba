@@ -16,10 +16,11 @@ AS_OF, WIN = "2026-06-08", "2026-06"
 
 
 def test_debt_followup_builds_task(monkeypatch):
-    monkeypatch.setattr(debt_followup.sig, "overdue_debts_for_manager",
-                        lambda mid, as_of, min_amount: [
+    monkeypatch.setattr(debt_followup.sig, "debt_task_candidates",
+                        lambda mid, as_of: [
                             {"client_id": 10, "overdue_amount": 5000, "max_overdue_days": 40,
-                             "max_days_past_terms": 33, "debt_lines": 2}])
+                             "max_days_past_terms": 33, "debt_lines": 2,
+                             "days_past_terms": [2, 12, 33]}])
     monkeypatch.setattr(debt_followup.sig, "contacts_for_clients",
                         lambda ids: {10: {"full_name": "Acme", "phone": "+380", "email": "a@b.c"}})
     monkeypatch.setattr(debt_followup.sig, "client_features",
@@ -38,6 +39,27 @@ def test_debt_followup_builds_task(monkeypatch):
     assert t.priority == round(100.0 * t.p_outcome, 2)
     assert t.ev_score == pytest.approx(t.p_outcome * t.expected_value, abs=0.5)
     assert t.expected_value == 5000.0          # debt E[value] = overdue amount (cash at stake)
+    assert t.payload["debt"]["lead_days_past_terms"] == 12
+    assert t.payload["debt"]["age_band"] == "fresh"
+    assert t.payload["debt"]["days_past_terms"] == 33
+    assert t.urgency.value == "high"
+    assert t.title == "Нагадати про оплату заборгованості"
+
+
+def test_debt_followup_marks_old_debt_as_low_urgency(monkeypatch):
+    monkeypatch.setattr(debt_followup.sig, "debt_task_candidates",
+                        lambda mid, as_of: [
+                            {"client_id": 10, "overdue_amount": 900, "max_overdue_days": 400,
+                             "max_days_past_terms": 370, "debt_lines": 2,
+                             "days_past_terms": [1, 120, 370]}])
+    monkeypatch.setattr(debt_followup.sig, "contacts_for_clients", lambda ids: {})
+    monkeypatch.setattr(debt_followup.sig, "client_features", lambda ids, as_of: {})
+    task = debt_followup.generate(1, AS_OF, WIN)[0]
+    assert task.urgency.value == "low"
+    assert task.payload["debt"]["age_band"] == "old"
+    assert task.payload["debt"]["lead_days_past_terms"] == 120
+    assert task.title.startswith("Стара заборгованість")
+    assert task.reason.startswith("Стара заборгованість")
 
 
 def test_reorder_due_bundles_per_client(monkeypatch):

@@ -131,14 +131,15 @@ def reorder_candidates(asof: str) -> list[dict]:
 
 
 def debt_candidates(asof: str) -> list[dict]:
-    minimum = get_settings().debt_min_amount
+    settings = get_settings()
     return [{
         "client_id": int(r["client_id"]),
         "overdue_amount": float(r["overdue_amount"]),
         "max_overdue_days": int(r["max_overdue_days"]),
         "days_past_terms": int(r["max_days_past_terms"]),
         "debt_lines": int(r["debt_lines"]),
-    } for r in debt_snapshot.overdue_clients(asof) if float(r["overdue_amount"]) >= minimum]
+    } for r in debt_snapshot.task_candidates(
+        debt_snapshot.overdue_clients(asof), settings.debt_min_amount, settings.debt_grace_days)]
 
 
 def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365) -> list[dict]:

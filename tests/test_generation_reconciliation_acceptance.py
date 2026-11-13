@@ -77,7 +77,7 @@ def scenario(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(sig, "overdue_debts_for_manager", debts)
+    monkeypatch.setattr(sig, "debt_task_candidates", debts)
     monkeypatch.setattr(
         sig,
         "reorder_candidates_for_manager",

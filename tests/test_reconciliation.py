@@ -357,7 +357,7 @@ def test_stale_generator_cannot_reassign_transferred_task_back(db, monkeypatch):
 
 def test_debt_generator_preserves_exact_document_ids(monkeypatch):
     from app.services.generators import debt_followup
-    monkeypatch.setattr(debt_followup.sig, "overdue_debts_for_manager", lambda *a, **kw: [{
+    monkeypatch.setattr(debt_followup.sig, "debt_task_candidates", lambda *a, **kw: [{
         "client_id": 10, "debt_ids": "501,503", "max_days_past_terms": 2,
         "max_overdue_days": 12, "overdue_amount": 70, "debt_lines": 2}])
     monkeypatch.setattr(debt_followup.sig, "contacts_for_clients", lambda ids: {})

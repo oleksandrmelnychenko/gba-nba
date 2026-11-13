@@ -122,7 +122,7 @@ def test_endpoint_paging_validation_inclusive_day_and_failure(sources, monkeypat
     monkeypatch.setattr(main.signals_repository, "manager_id_for_netuid", lambda uid: 1)
     monkeypatch.setattr(main.repeat_sales, "read_snapshot",
                         lambda mid, day: calls.append(day) or ([client(1, 0), client(2, 0)], [], set()))
-    monkeypatch.setattr(main.signals_repository, "overdue_debts_for_manager", lambda *a: [])
+    monkeypatch.setattr(main.signals_repository, "overdue_debts_for_manager", lambda *a, **kw: [])
     api = TestClient(main.app)
     params = {"manager_net_uid": UID, "as_of_date": AS_OF, "limit": 1, "offset": 1, "segment": "new_client"}
     response = api.get("/cockpit/clients", params=params)

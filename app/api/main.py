@@ -483,12 +483,15 @@ def cockpit_clients(
         rows = [dict(row) for row in rows]
         debts = {
             int(d["client_id"]): d
-            for d in signals_repository.overdue_debts_for_manager(manager_id, resolved_as_of)
+            for d in signals_repository.overdue_debts_for_manager(
+                manager_id, resolved_as_of, with_unverified=True)
         }
         for r in rows:
             debt = debts.get(int(r["client_id"]))
             r["overdue_eur"] = cents(debt["overdue_amount"]) if debt else 0.0
             r["max_days_past_terms"] = int(debt["max_days_past_terms"]) if debt else 0
+            r["debt_unknown_date_eur"] = cents(debt.get("unknown_date_amount")) if debt else 0.0
+            r["debt_unknown_date_count"] = int(debt.get("unknown_date_lines") or 0) if debt else 0
             r["turnover_eur"] = cents(r.get("turnover_eur") or 0)
         page = repeat_sales.enrich_and_page(manager_id, resolved_as_of, rows, segment=segment,
                                             search=search, offset=offset, limit=limit, facts=(products, churn))

@@ -33,7 +33,7 @@ def api(monkeypatch):
         main.repeat_sales, "read_snapshot",
         lambda mid, day: calls.append((mid, day)) or ([_client(1), _client(2), _client(3)], [], set()))
     monkeypatch.setattr(main.signals_repository, "overdue_debts_for_manager",
-                        lambda *a: debts["rows"])
+                        lambda *a, **kw: debts["rows"])
     return TestClient(main.app), calls, debts
 
 

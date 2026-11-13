@@ -62,6 +62,23 @@ def test_client_column_and_card_share_one_rule_without_age_cap():
     assert clients[7]['debt_ids'] == '1,2' and clients[7]['debt_lines'] == 2
     assert clients[7]['max_days_past_terms'] == 843 and clients[7]['max_overdue_days'] == 873
     assert clients[8]['overdue_amount'] == Decimal('40.00')
+    assert clients[7]['unknown_date_amount'] == Decimal('70.00') and clients[7]['unknown_date_lines'] == 1
+
+
+def test_clients_with_only_unverified_documents_reach_the_column_but_never_a_task(monkeypatch):
+    from app.data import debt_snapshot, signals_repository
+    rows = [
+        {**debt(1, 70, '2024-09-01T10:00:00'), 'client_id': 9, 'obligation_date_basis': None},
+        {**debt(2, 30, '2026-09-01T10:00:00'), 'client_id': 10},
+    ]
+    assert [row['client_id'] for row in fold_clients(rows, '2026-10-22')] == [10]
+    book = {row['client_id']: row for row in fold_clients(rows, '2026-10-22', with_unverified=True)}
+    assert book[9]['overdue_amount'] == 0 and book[9]['unknown_date_amount'] == Decimal('70.00')
+    card = fold_documents(rows, '2026-10-22')
+    assert card['debt_unknown_date_eur'] == sum(row['unknown_date_amount'] for row in book.values())
+    monkeypatch.setattr(debt_snapshot, 'documents', lambda as_of, manager_id=None: rows)
+    assert [row['client_id'] for row in signals_repository.overdue_debts_for_manager(1, '2026-10-22', 10.0)] == [10]
+    assert signals_repository.overdue_debts_for_manager(1, '2026-10-22', 50.0) == []
 
 
 def test_documents_query_converts_at_the_as_of_date_through_the_database_function(monkeypatch):

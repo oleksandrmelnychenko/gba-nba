@@ -393,10 +393,12 @@ def contacts_for_clients(client_ids: list[int]) -> dict[int, dict]:
 
 # --- debt_followup signal ---
 
-def overdue_debts_for_manager(manager_id: int, as_of: str, min_amount: float = 0.0) -> list[dict]:
+def overdue_debts_for_manager(manager_id: int, as_of: str, min_amount: float = 0.0, *,
+                              with_unverified: bool = False) -> list[dict]:
     """Per client: overdue debt in EUR under debt_snapshot's rule; min_amount is a task threshold."""
-    return [row for row in debt_snapshot.overdue_clients(as_of, manager_id)
-            if row["overdue_amount"] >= decimal_value(min_amount)]
+    rows = debt_snapshot.overdue_clients(as_of, manager_id, with_unverified=with_unverified)
+    return [row for row in rows
+            if row["overdue_amount"] >= decimal_value(min_amount) or not row["debt_lines"]]
 
 
 # --- reorder_due signal ---

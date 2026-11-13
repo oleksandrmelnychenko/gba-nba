@@ -150,20 +150,29 @@ def fold_documents(rows: list[dict], as_of: str) -> dict:
     }
 
 
-def fold_clients(rows: list[dict], as_of: str) -> list[dict]:
-    """Overdue documents per client: the «Мої клієнти» column and the debt follow-up source."""
+def fold_clients(rows: list[dict], as_of: str, *, with_unverified: bool = False) -> list[dict]:
+    """Overdue documents per client: the «Мої клієнти» column and the debt follow-up source.
+
+    with_unverified also returns clients whose only open documents have an unverified clock,
+    so the per-client unknown_date_amount adds up to the card's debt_unknown_date_eur.
+    """
     snapshot_day = date.fromisoformat(as_of)
     _unique(rows)
     clients: dict[int, dict] = {}
     for row in sorted(rows, key=lambda item: item['debt_id']):
         state, days_past_due, age_days = classify(row, snapshot_day)
-        if state != 'overdue':
+        if state not in ('overdue', 'unknown_date'):
             continue
         entry = clients.setdefault(int(row['client_id']), {
             'client_id': int(row['client_id']), 'manager_id': row.get('manager_id'),
             'debt_ids': [], 'overdue_amount': Decimal(0),
             'max_overdue_days': 0, 'max_days_past_terms': 0, 'debt_lines': 0,
+            'unknown_date_amount': Decimal(0), 'unknown_date_lines': 0,
         })
+        if state == 'unknown_date':
+            entry['unknown_date_amount'] += decimal_value(row['amount_eur'])
+            entry['unknown_date_lines'] += 1
+            continue
         entry['debt_ids'].append(int(row['debt_id']))
         entry['overdue_amount'] += decimal_value(row['amount_eur'])
         entry['max_overdue_days'] = max(entry['max_overdue_days'], age_days)
@@ -171,13 +180,16 @@ def fold_clients(rows: list[dict], as_of: str) -> list[dict]:
         entry['debt_lines'] += 1
     return [
         {**entry, 'debt_ids': ','.join(str(value) for value in entry['debt_ids']),
-         'overdue_amount': cents_decimal(entry['overdue_amount'])}
+         'overdue_amount': cents_decimal(entry['overdue_amount']),
+         'unknown_date_amount': cents_decimal(entry['unknown_date_amount'])}
         for entry in clients.values()
+        if entry['debt_lines'] or with_unverified
     ]
 
 
-def overdue_clients(as_of: str, manager_id: int | None = None) -> list[dict]:
-    return fold_clients(documents(as_of, manager_id), as_of)
+def overdue_clients(as_of: str, manager_id: int | None = None, *,
+                    with_unverified: bool = False) -> list[dict]:
+    return fold_clients(documents(as_of, manager_id), as_of, with_unverified=with_unverified)
 
 
 def dashboards(as_of: str) -> dict[int, dict]:

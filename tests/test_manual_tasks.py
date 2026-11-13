@@ -211,7 +211,7 @@ def test_cockpit_clients_merges_debt(client, monkeypatch):
                                             [], set()))
     monkeypatch.setattr(
         main.signals_repository, "overdue_debts_for_manager",
-        lambda mid, as_of: [{"client_id": 10, "overdue_amount": 500.129,
+        lambda mid, as_of, **kw: [{"client_id": 10, "overdue_amount": 500.129,
                              "max_overdue_days": 40, "max_days_past_terms": 12,
                              "debt_lines": 2}])
     resp = client.get("/cockpit/clients", params={"manager_net_uid": MGR_UID})

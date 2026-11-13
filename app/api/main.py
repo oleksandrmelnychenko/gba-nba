@@ -700,6 +700,8 @@ _EMPTY_DEBT_DASH = {
     "debt_unknown_date_eur": 0.0,
     "debt_unknown_terms_count": 0,
     "debt_unknown_terms_eur": 0.0,
+    "debt_unconverted_count": 0,
+    "debt_unconverted_native": [],
     "debt_aging": [
         {"bucket": "0-30", "amount_eur": 0.0, "count": 0},
         {"bucket": "31-60", "amount_eur": 0.0, "count": 0},
@@ -755,7 +757,7 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
     aggregation (value_at_risk + aging). No scores are recomputed. Internal-key gated."""
     manager_id = _resolve_manager(manager_net_uid)
     as_of = _current_task_as_of(as_of_date)
-    coverage = history.rolling_days(as_of, settings.debt_max_age_days)
+    coverage = history.rolling_days(as_of, 365)
     try:
         counts = lifecycle.dashboard_counts(manager_id, as_of)
         debt = _debt_dashboards_cached(as_of).get(manager_id) or _EMPTY_DEBT_DASH
@@ -776,6 +778,8 @@ def cockpit_dashboard(manager_net_uid: str, as_of_date: date | None = None) -> d
         "debt_unknown_date_eur": debt.get("debt_unknown_date_eur", 0.0),
         "debt_unknown_terms_count": debt.get("debt_unknown_terms_count", 0),
         "debt_unknown_terms_eur": debt.get("debt_unknown_terms_eur", 0.0),
+        "debt_unconverted_count": debt.get("debt_unconverted_count", 0),
+        "debt_unconverted_native": debt.get("debt_unconverted_native", []),
         "completed_vs_open": counts["completed_vs_open"],
         "ai_active": counts["ai_active"],
         "manual_backlog": counts["manual_backlog"],
@@ -796,7 +800,7 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
                 "as_of": None, "teams": [],
                 "escalated_count": 0, "total_value_at_risk_eur": 0.0}
     as_of = _current_task_as_of(as_of_date)
-    coverage = history.rolling_days(as_of, settings.debt_max_age_days)
+    coverage = history.rolling_days(as_of, 365)
     teams = []
     total_var = Decimal("0")
     debt_by_manager = _debt_dashboards_cached(as_of)
@@ -813,7 +817,8 @@ def cockpit_head_dashboard(manager_net_uid: str, as_of_date: date | None = None)
                       "debt_unknown_date_count": debt_by_manager.get(mid, {}).get("debt_unknown_date_count", 0),
                       "debt_unknown_date_eur": debt_by_manager.get(mid, {}).get("debt_unknown_date_eur", 0.0),
                       "debt_unknown_terms_count": debt_by_manager.get(mid, {}).get("debt_unknown_terms_count", 0),
-                      "debt_unknown_terms_eur": debt_by_manager.get(mid, {}).get("debt_unknown_terms_eur", 0.0)})
+                      "debt_unknown_terms_eur": debt_by_manager.get(mid, {}).get("debt_unknown_terms_eur", 0.0),
+                      "debt_unconverted_count": debt_by_manager.get(mid, {}).get("debt_unconverted_count", 0)})
     return {"is_head": True, "requested_manager_net_uid": requested_net_uid,
             "as_of": as_of, **coverage.metadata(), "teams": teams,
             "escalated_count": lifecycle.escalated_count(),

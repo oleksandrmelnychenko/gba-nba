@@ -123,28 +123,22 @@ def test_repository_rolling_and_factual_sql_windows(monkeypatch):
 
     sig.new_clients_for_manager(7, "2025-02-01")
     sig.active_clients_for_manager(7, "2025-02-01")
-    sig.overdue_debts_for_manager(7, "2025-02-01")
     sig.reorder_candidates_for_manager(7, "2025-02-01")
     sig.churn_candidates_for_manager(7, "2025-06-01")
-    sig.client_monetary([11], "2025-02-01")
     sig.client_features([11], "2025-02-01")
 
     by_marker = {
         "new": calls[0],
         "active": calls[1],
-        "debt": calls[2],
-        "reorder": calls[3],
-        "churn": calls[4],
-        "monetary": calls[5],
-        "features": calls[6],
+        "reorder": calls[2],
+        "churn": calls[3],
+        "features": calls[4],
     }
     assert by_marker["new"][1]["created_start"] == "2025-01-01"
     assert by_marker["new"][1]["source_start"] == "2025-01-01"
     assert by_marker["active"][1]["start"] == "2025-01-01"
-    assert by_marker["debt"][1]["start"] == "2025-01-01"
     assert by_marker["reorder"][1]["source_start"] == "2025-01-01"
     assert by_marker["churn"][1]["start"] == "2025-01-01"
-    assert by_marker["monetary"][1]["start"] == "2025-01-01"
     assert by_marker["features"][1]["start"] == "2025-01-01"
     for sql, params in calls:
         assert params["asof"] >= "2025-01-01"
@@ -180,18 +174,13 @@ def test_dataset_mirrors_rolling_and_factual_windows(monkeypatch):
     )
     monkeypatch.setattr(ds, "_excluded_pids", lambda asof: set())
 
-    ds.client_features([11], "2025-02-01")
     ds.reorder_candidates("2025-02-01")
-    ds.debt_candidates("2025-02-01")
     ds.churn_candidates("2025-06-01")
     ds.active_clients("2025-02-01")
 
-    assert calls[0][1]["start"] == "2025-01-01"
-    assert calls[1][1]["source_start"] == "2025-01-01"
+    assert calls[0][1]["source_start"] == "2025-01-01"
+    assert calls[1][1]["start"] == "2025-01-01"
     assert calls[2][1]["start"] == "2025-01-01"
-    assert calls[3][1]["start"] == "2025-01-01"
-    assert calls[4][1]["start"] == "2025-01-01"
-    assert "NOT IN (NULL)" not in calls[0][0]
     for sql, params in calls:
         assert params["asof"] >= "2025-01-01"
         assert "GETDATE()" not in sql

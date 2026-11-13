@@ -45,7 +45,7 @@ def manager_id() -> int:
 
 
 def test_overdue_debts_are_real_euro_not_inflated(manager_id):
-    rows = sig.overdue_debts_for_manager(manager_id, AS_OF, max_age_days=365, min_amount=10.0)
+    rows = sig.overdue_debts_for_manager(manager_id, AS_OF, min_amount=10.0)
     assert rows, "expected this manager to have overdue debt clients on dev data"
 
     amounts = [float(r["overdue_amount"]) for r in rows]

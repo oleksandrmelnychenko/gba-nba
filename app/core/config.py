@@ -77,7 +77,6 @@ class Settings(BaseSettings):
     stale_task_max_age_days: int = Field(default=14, gt=0)
 
     # Signal tuning (calibrated 2026-06 on ConcordDb_V5 real data)
-    debt_max_age_days: int = 365         # ignore stale write-off debts older than this (Debt.Created)
     debt_min_amount: float = 10.0        # EUR; drop settled/rounding sub-€10 overdues (~25% are noise)
     reorder_min_cycle_days: int = 7      # floor for span/(n-1) cycle, suppresses burst-buyer false-criticals
     reorder_max_overdue_mult: float = 3.0  # cap elapsed at N×cycle; beyond this the product is abandoned

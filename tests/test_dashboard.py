@@ -61,8 +61,6 @@ def client(monkeypatch):
     monkeypatch.setattr(main.signals_repository, "is_head_of_sales",
                         lambda nu: nu in _HEADS)
     monkeypatch.setattr(main.signals_repository, "all_managers", lambda: [1, 2])
-    monkeypatch.setattr(main.signals_repository, "debt_dashboard_for_manager",
-                        lambda mid, as_of: _DEBT.get(mid, {"value_at_risk_eur": 0.0, "debt_aging": []}))
     monkeypatch.setattr(main.debt_snapshot, "dashboards",
                         lambda as_of: dict(_DEBT))
     return TestClient(main.app)
@@ -105,6 +103,8 @@ def test_manager_dashboard_shape_and_mix(client):
         "debt_unknown_date_eur",
         "debt_unknown_terms_count",
         "debt_unknown_terms_eur",
+        "debt_unconverted_count",
+        "debt_unconverted_native",
         "completed_vs_open",
         "active_total",
         "ai_active",
@@ -247,7 +247,7 @@ def test_head_dashboard_shape(client):
         "history_complete",
     }
     teams = {t["manager_id"]: t for t in body["teams"]}
-    assert set(teams[1]) == {"manager_id", "open_tasks", "ai_active", "manual_backlog", "critical", "value_at_risk_eur", "debt_unknown_date_count", "debt_unknown_date_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur"}
+    assert set(teams[1]) == {"manager_id", "open_tasks", "ai_active", "manual_backlog", "critical", "value_at_risk_eur", "debt_unknown_date_count", "debt_unknown_date_eur", "debt_unknown_terms_count", "debt_unknown_terms_eur", "debt_unconverted_count"}
     assert teams[1]["open_tasks"] == 2
     assert teams[1]["critical"] == 1
     assert teams[1]["value_at_risk_eur"] == 1234.50
@@ -285,29 +285,6 @@ def test_dashboard_requires_internal_key(client, monkeypatch):
                       headers={"X-Internal-Api-Key": "s3cret"}).status_code == 200
     assert client.get("/cockpit/head/dashboard", params={"manager_net_uid": HEAD_UID},
                       headers={"X-Internal-Api-Key": "s3cret"}).status_code == 200
-
-
-# ---------------- EUR-correct debt aggregation (unit) ----------------
-
-def test_debt_dashboard_aging_buckets(monkeypatch):
-    from app.data import signals_repository as sig
-    rows = [
-        {"client_id": 1, "overdue_amount": 100.0, "max_overdue_days": 10},   # 0-30
-        {"client_id": 2, "overdue_amount": 200.0, "max_overdue_days": 30},   # 0-30 (boundary)
-        {"client_id": 3, "overdue_amount": 50.0, "max_overdue_days": 45},    # 31-60
-        {"client_id": 4, "overdue_amount": 75.0, "max_overdue_days": 90},    # 61-90 (boundary)
-        {"client_id": 5, "overdue_amount": 1000.0, "max_overdue_days": 365}, # 90+
-    ]
-    monkeypatch.setattr(sig, "overdue_debts_for_manager", lambda mid, as_of, **kw: rows)
-    out = sig.debt_dashboard_for_manager(7, "2026-06-17")
-    assert out["value_at_risk_eur"] == 1425.0
-    aging = {b["bucket"]: b for b in out["debt_aging"]}
-    assert aging["0-30"] == {"bucket": "0-30", "amount_eur": 300.0, "count": 2}
-    assert aging["31-60"] == {"bucket": "31-60", "amount_eur": 50.0, "count": 1}
-    assert aging["61-90"] == {"bucket": "61-90", "amount_eur": 75.0, "count": 1}
-    assert aging["90+"] == {"bucket": "90+", "amount_eur": 1000.0, "count": 1}
-
-
 def test_workload_split_includes_deferred_commitments_without_changing_visible_inbox(client):
     from app.services import lifecycle
     _seed(1, "visible-ai")

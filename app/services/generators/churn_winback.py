@@ -60,7 +60,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             explanation=Explanation(
                 factors=[f"активність впала на ~{drop_pct}% ({prior}→{recent} замовлень)",
                          f"не замовляв {silence} дн",
-                         f"річний оборот {monetary_cid:.0f}"],
+                         f"річний оборот {monetary_cid:.0f} EUR"],
                 source_signal="churn", confidence=conf),
             contact=Contact(phone=c.get("phone"), email=c.get("email"),
                             preferred="phone" if c.get("phone") else "email"),

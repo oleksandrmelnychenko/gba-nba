@@ -11,10 +11,10 @@ import inspect
 import re
 
 from app.core import config
+from app.data import debt_snapshot
 from app.data import signals_repository as sig
 from app.ml import dataset as ds
 
-_OVERDUE_SRC = sig._EUR_VALUE_CTE + "\n" + inspect.getsource(sig.overdue_debts_for_manager)
 _PAID_SRC = inspect.getsource(sig.monthly_paid)
 
 
@@ -28,53 +28,14 @@ def _norm(s: str) -> str:
 # Do not extend this historical guard to those source-backed documentary queries.
 _SALES_SPINE_FUNCS = [
     sig.ubiquitous_product_ids,
-    sig.client_monetary, sig.client_features,
-    ds.client_features, ds.reorder_candidates, ds.churn_candidates, ds.active_clients,
+    ds.reorder_candidates, ds.churn_candidates, ds.active_clients,
     ds.label_reorder, ds.label_any_order, ds.label_buy_products,
 ]
-
-
-def test_overdue_debt_wraps_total_in_euro_conversion():
-    norm = _norm(_OVERDUE_SRC)
-    assert "SUM(eur_value)" in norm, \
-        "overdue debt must sum the per-row EUR-converted value (eur_value), not a raw total"
-    assert "er.rate" in norm and "cr.rate" in norm, \
-        "Debt.Total must be converted to EUR via the exchange-rate joins (set-based reproduction " \
-        "of dbo.GetExchangedToEuroValue), not treated as already-EUR"
-    assert "ISNULL(a.CurrencyID, 2)" in norm, \
-        "conversion must default missing agreement currency to EUR (2), not assume the debt is EUR"
-
-
-def test_overdue_debt_does_not_raw_sum_total():
-    norm = _norm(_OVERDUE_SRC)
-    assert "SUM(d.Total)" not in norm, \
-        "raw SUM(d.Total) treats UAH debt as EUR (~50x inflated) — must stay wrapped in conversion"
-    assert re.search(r"SUM\(\s*d\.Total\s*\)", _OVERDUE_SRC) is None, \
-        "no raw SUM over Debt.Total in any whitespace form"
 
 
 # Payment conversion semantics are executed against fixture rows in
 # test_payment_target_filter.py. The former EuroAmount prohibition was based on
 # pre-fix sync data and is invalid after the current document-conversion sync.
-
-
-def test_overdue_debt_uses_parameterized_filters():
-    assert ":mid" in _OVERDUE_SRC and ":asof" in _OVERDUE_SRC
-    assert ":maxage" in _OVERDUE_SRC and ":minamt" in _OVERDUE_SRC
-
-
-def test_overdue_debt_uses_effective_history_order_and_ignores_deleted_rates():
-    norm = _norm(sig._EUR_VALUE_CTE)
-    assert norm.count("erh.Created <= d.Created") == 1
-    assert norm.count("crh.Created <= d.Created") == 2
-    assert norm.count("erh.Deleted = 0") == 1
-    assert norm.count("crh.Deleted = 0") == 2
-    assert "ORDER BY erh.Created DESC, erh.ID DESC, er0.ID DESC" in norm
-    assert norm.count(
-        "ORDER BY crh.Created DESC, crh.ID DESC, cr0.ID DESC"
-    ) == 2
-    assert "ORDER BY erh.ID DESC" not in norm
-    assert "ORDER BY crh.ID DESC" not in norm
 
 
 def test_sales_spine_uses_validity_flag_not_deleted():
@@ -94,8 +55,6 @@ def test_sales_spine_uses_validity_flag_not_deleted():
 # The 1C refresh re-mints «Ввід боргів», so its ID must be resolved from the current Product row.
 # The hard exclusion must remain independent of the data-driven ubiquity threshold.
 
-# Turnover/feature queries that must hard-exclude the synthetic ids (in addition to ubiquity).
-_TURNOVER_FUNCS = [sig.client_monetary, sig.client_features, ds.client_features]
 
 
 def test_synthetic_product_id_is_resolved_dynamically():
@@ -122,20 +81,24 @@ def test_excluded_helpers_union_synthetic_ids_unconditionally():
         )
 
 
-def test_turnover_queries_emit_hard_not_in_exclusion():
-    """Every turnover/feature query must apply an `AND oi.ProductID NOT IN (...)` exclusion built from
-    the _excluded()/_excluded_pids() set (which now always contains the synthetic ids), so 25422404
-    is dropped regardless of ubiquity. DB-free guard."""
-    for fn in _TURNOVER_FUNCS:
-        src = _norm(inspect.getsource(fn))
-        assert "_excluded" in src, (
-            f"{fn.__module__}.{fn.__name__} must source its exclusion set from the _excluded helper "
-            "(which unions the hard synthetic ids), not from ubiquity alone"
-        )
-        assert re.search(r"oi\.ProductID NOT IN", src), (
-            f"{fn.__module__}.{fn.__name__} must emit `AND oi.ProductID NOT IN (...)` to hard-exclude "
-            "the synthetic accounting line from turnover"
-        )
+def test_client_features_share_the_turnover_column_population(monkeypatch):
+    """monetary is «Оборот (12м)»: retained confirmed purchases, synthetic lines excluded, and the
+    training dataset reads the very same function."""
+    calls = []
+    monkeypatch.setattr(sig, "query", lambda sql, params=None: calls.append((_norm(sql), params)) or [
+        {"client_id": 11, "monetary": 120.5, "order_count": 3, "recency_days": 4}])
+    monkeypatch.setattr(sig, "_excluded", lambda as_of: frozenset({42}))
+    features = ds.client_features([11, 12], "2026-07-25")
+    sql, params = calls[0]
+    assert features == {11: {"monetary": 120.5, "order_count": 3, "recency_days": 4},
+                        12: {"monetary": 0.0, "order_count": 0, "recency_days": None}}
+    assert "s.ChangedToInvoice IS NOT NULL" in sql and "s.Deleted = 0 AND s.IsMerged = 0" in sql
+    assert "oi.Qty - COALESCE(oi.ReturnedQty, 0)" in sql
+    assert "SUM(turnover_eur) AS monetary" in sql and "COUNT(DISTINCT order_id) AS order_count" in sql
+    assert "FROM retained_purchases WHERE product_id NOT IN (:x0)" in sql and params["x0"] == 42
+    assert "c.ID IN (:c0,:c1)" in sql
+    overview = inspect.getsource(sig.clients_overview_for_manager)
+    assert "retained_purchase_cte" in overview and "turnover_eur" in overview
 
 
 def test_synthetic_exclusion_holds_when_ubiquity_does_not_fire(monkeypatch):
@@ -155,7 +118,7 @@ def test_synthetic_exclusion_holds_when_ubiquity_does_not_fire(monkeypatch):
 def test_debt_and_payment_paths_keep_their_deleted_flags():
     """The debt/payment paths are correct as-is — they must keep d.Deleted=0 / p.Deleted=0 (these
     are NOT the all-Deleted=1 sales spine) and must NOT adopt the sales validity flag by mistake."""
-    debt_src = _norm(_OVERDUE_SRC)
+    debt_src = _norm(debt_snapshot._DOCUMENTS_SQL)
     assert "d.Deleted = 0" in debt_src, "debt path must keep d.Deleted=0"
     assert "IsValidForCurrentSale" not in debt_src, "debt path must not use the sales validity flag"
     paid_src = _norm(_PAID_SRC)

@@ -17,7 +17,7 @@ AS_OF, WIN = "2026-06-08", "2026-06"
 
 def test_debt_followup_builds_task(monkeypatch):
     monkeypatch.setattr(debt_followup.sig, "overdue_debts_for_manager",
-                        lambda mid, as_of, max_age_days, min_amount: [
+                        lambda mid, as_of, min_amount: [
                             {"client_id": 10, "overdue_amount": 5000, "max_overdue_days": 40,
                              "max_days_past_terms": 33, "debt_lines": 2}])
     monkeypatch.setattr(debt_followup.sig, "contacts_for_clients",

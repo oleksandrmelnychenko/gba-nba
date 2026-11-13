@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import mongomock
@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from app.api import main
 from app.data import mongo
-from app.data import signals_repository as signals
+from app.data.debt_snapshot import fold_documents
 from app.domain.models import Outcome
 from app.services import targets
 
@@ -23,25 +23,21 @@ def _headers() -> dict[str, str]:
     )
 
 
+def _document(key: int, amount: str, days_past_due: int) -> dict:
+    return {"debt_id": key, "client_id": key, "amount_eur": Decimal(amount), "term_days": 0,
+            "obligation_at": datetime(2026, 10, 22, 9, tzinfo=UTC) - timedelta(days=days_past_due),
+            "obligation_date_basis": "native_utc"}
+
+
 def test_accounting_money_rounds_half_up():
     assert Outcome(sold=True, amount="1.005").amount == 1.01
-    dashboard = signals._debt_dashboard_from_rows(
-        [
-            {"overdue_amount": "1.005", "max_overdue_days": 5},
-            {"overdue_amount": "2.005", "max_overdue_days": 5},
-        ]
-    )
+    dashboard = fold_documents([_document(1, "1.005", 5), _document(2, "2.005", 5)], "2026-10-22")
     assert dashboard["value_at_risk_eur"] == 3.01
     assert dashboard["debt_aging"][0]["amount_eur"] == 3.01
 
 
 def test_value_at_risk_reconciles_displayed_bucket_cents_exactly():
-    dashboard = signals._debt_dashboard_from_rows(
-        [
-            {"overdue_amount": "1.005", "max_overdue_days": 5},
-            {"overdue_amount": "2.005", "max_overdue_days": 40},
-        ]
-    )
+    dashboard = fold_documents([_document(1, "1.005", 5), _document(2, "2.005", 40)], "2026-10-22")
     bucket_total = sum(
         (Decimal(str(row["amount_eur"])) for row in dashboard["debt_aging"]),
         Decimal("0"),

@@ -33,6 +33,7 @@ import pandas as pd
 from app.clients import reco_client
 from app.core import history
 from app.core.config import get_settings
+from app.data import debt_snapshot
 from app.data import signals_repository as sig
 from app.data.db import in_clause, query
 
@@ -63,48 +64,8 @@ def _excluded_pids(asof: str) -> set[int]:
 # Shared as-of client features (turnover/recency/order_count), trailing 365d, manager-free.
 # --------------------------------------------------------------------------------------
 def client_features(client_ids: list[int], asof: str, window_days: int = 365) -> dict[int, dict]:
-    """Per client as-of T: trailing-365d EUR turnover, days-since-last-order (recency),
-    and trailing-365d distinct order_count. Synthetic + hard-excluded SKUs removed from turnover."""
-    if not client_ids:
-        return {}
-    window = history.rolling_days(asof, window_days)
-    out: dict[int, dict] = {cid: {"monetary": 0.0, "recency_days": None, "order_count": 0}
-                            for cid in client_ids}
-    ph, params = in_clause("c", client_ids)
-    excl = _excluded_pids(window.as_of.isoformat())
-    not_in = ""
-    if excl:
-        eph, eparams = in_clause("x", sorted(excl))
-        not_in = f" AND oi.ProductID NOT IN {eph}"
-        params = {**params, **eparams}
-    rows = query(
-        f"""
-        SELECT ca.ClientID AS client_id,
-               SUM(oi.Qty * oi.PricePerItem) AS monetary,
-               COUNT(DISTINCT o.ID) AS order_count,
-               DATEDIFF(day, MAX(o.Created), :asof) AS recency_days
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created >= :start AND o.Created < :asof
-              AND oi.ProductID IS NOT NULL AND ca.ClientID IN {ph}
-              {not_in}
-        GROUP BY ca.ClientID
-        """,
-        {
-            "asof": window.as_of.isoformat(),
-            "start": window.effective_start.isoformat(),
-            **params,
-        },
-    )
-    for r in rows:
-        cid = int(r["client_id"])
-        out[cid] = {
-            "monetary": float(r["monetary"] or 0.0),
-            "order_count": int(r["order_count"] or 0),
-            "recency_days": int(r["recency_days"]) if r["recency_days"] is not None else None,
-        }
-    return out
+    """The serving features themselves, so a training row and a live row share one definition."""
+    return sig.client_features(client_ids, asof, window_days)
 
 
 # --------------------------------------------------------------------------------------
@@ -170,41 +131,14 @@ def reorder_candidates(asof: str) -> list[dict]:
 
 
 def debt_candidates(asof: str) -> list[dict]:
-    s = get_settings()
-    window = history.rolling_days(asof, s.debt_max_age_days)
-    rows = query(
-        """
-        SELECT c.ID AS client_id,
-               SUM(dbo.GetExchangedToEuroValue(d.Total, ISNULL(a.CurrencyID, 2), d.Created))
-                   AS overdue_amount,
-               MAX(DATEDIFF(day, d.Created, :asof)) AS max_overdue_days,
-               MAX(DATEDIFF(day, d.Created, :asof) - ISNULL(a.NumberDaysDebt, 0)) AS max_days_past_terms,
-               COUNT(*) AS debt_lines
-        FROM dbo.ClientInDebt cid
-        JOIN dbo.Debt d ON d.ID = cid.DebtID AND d.Deleted = 0
-        JOIN dbo.Client c ON c.ID = cid.ClientID AND c.Deleted = 0
-        LEFT JOIN dbo.Agreement a ON a.ID = cid.AgreementID
-        WHERE cid.Deleted = 0 AND d.Total > 0
-              AND d.Created >= :start AND d.Created < :asof
-              AND DATEDIFF(day, d.Created, :asof) > ISNULL(a.NumberDaysDebt, 0)
-              AND DATEDIFF(day, d.Created, :asof) <= :maxage
-        GROUP BY c.ID
-        HAVING SUM(dbo.GetExchangedToEuroValue(d.Total, ISNULL(a.CurrencyID, 2), d.Created)) >= :minamt
-        """,
-        {
-            "asof": window.as_of.isoformat(),
-            "start": window.effective_start.isoformat(),
-            "maxage": s.debt_max_age_days,
-            "minamt": s.debt_min_amount,
-        },
-    )
+    minimum = get_settings().debt_min_amount
     return [{
         "client_id": int(r["client_id"]),
-        "overdue_amount": float(r["overdue_amount"] or 0.0),
-        "max_overdue_days": int(r["max_overdue_days"] or 0),
-        "days_past_terms": int(r["max_days_past_terms"] or 0),
-        "debt_lines": int(r["debt_lines"] or 0),
-    } for r in rows]
+        "overdue_amount": float(r["overdue_amount"]),
+        "max_overdue_days": int(r["max_overdue_days"]),
+        "days_past_terms": int(r["max_days_past_terms"]),
+        "debt_lines": int(r["debt_lines"]),
+    } for r in debt_snapshot.overdue_clients(asof) if float(r["overdue_amount"]) >= minimum]
 
 
 def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365) -> list[dict]:

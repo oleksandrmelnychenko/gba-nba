@@ -18,8 +18,7 @@ TYPE = TaskType.DEBT_FOLLOWUP
 
 def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
     s = get_settings()
-    rows = sig.overdue_debts_for_manager(manager_id, as_of, max_age_days=s.debt_max_age_days,
-                                         min_amount=s.debt_min_amount)
+    rows = sig.overdue_debts_for_manager(manager_id, as_of, min_amount=s.debt_min_amount)
     if not rows:
         return []
     client_ids = [int(r["client_id"]) for r in rows]
@@ -53,7 +52,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             manager_id=manager_id, client_id=cid, client_name=name, task_type=TYPE,
             title="Нагадати про оплату заборгованості",
             reason=f"Прострочка {max_overdue} дн (на {days_past} дн понад умови), "
-                   f"борг {amount:.0f}",
+                   f"борг {amount:.0f} EUR",
             priority=prio, p_outcome=p_out, expected_value=ev, ev_score=ev_score,
             urgency=scoring.urgency_band(u),
             payload={"debt": {"debt_ids": [int(value) for value in str(r.get("debt_ids") or "").split(",") if value],
@@ -65,8 +64,8 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
                      "order_count": cf.get("order_count", 0)},
             explanation=Explanation(
                 factors=[f"прострочка {days_past} дн понад умови договору",
-                         f"сума боргу {amount:.0f}",
-                         f"річний оборот {monetary:.0f}"],
+                         f"сума боргу {amount:.0f} EUR",
+                         f"річний оборот {monetary:.0f} EUR"],
                 source_signal="debt", confidence=1.0),
             contact=Contact(phone=c.get("phone"), email=c.get("email"),
                             preferred="phone" if c.get("phone") else "email"),

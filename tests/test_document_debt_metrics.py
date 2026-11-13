@@ -3,11 +3,11 @@ from decimal import Decimal
 
 import pytest
 
-from app.data.debt_snapshot import fold_documents
+from app.data.debt_snapshot import fold_clients, fold_documents
 
 
 def debt(key, amount, created, terms=30):
-    return {'debt_id': key, 'amount_eur': amount, 'obligation_at': datetime.fromisoformat(created), 'term_days': terms, 'obligation_date_basis': 'native_utc'}
+    return {'debt_id': key, 'client_id': 7, 'amount_eur': amount, 'obligation_at': datetime.fromisoformat(created), 'term_days': terms, 'obligation_date_basis': 'native_utc'}
 
 
 def test_each_document_uses_days_past_terms_instead_of_client_oldest_age():
@@ -37,9 +37,44 @@ def test_kyiv_business_day_and_rounding_reconcile():
     assert result['value_at_risk_eur'] == sum(row['amount_eur'] for row in result['debt_aging']) == 0.02
 
 
-def test_missing_fx_is_not_zero_or_local_amount():
-    with pytest.raises(ValueError, match='debt_eur_conversion_missing'):
-        fold_documents([debt(1, 100, '2026-10-01T10:00:00', 0), debt(2, None, '2026-10-01T10:00:00', 0)], '2026-10-22')
+def test_missing_fx_is_excluded_and_reported_in_native_currency():
+    missing = {**debt(2, None, '2026-10-01T10:00:00', 0), 'currency_code': 'CZK', 'amount_native': Decimal('2500')}
+    result = fold_documents([debt(1, 100, '2026-10-01T10:00:00', 0), missing], '2026-10-22')
+    assert result['value_at_risk_eur'] == 100
+    assert result['debt_unconverted_count'] == 1
+    assert result['debt_unconverted_native'] == [{'currency': 'CZK', 'amount': 2500.0}]
+    assert fold_clients([debt(1, 100, '2026-10-01T10:00:00', 0), missing], '2026-10-22')[0]['overdue_amount'] == 100
+
+
+def test_client_column_and_card_share_one_rule_without_age_cap():
+    rows = [
+        debt(1, 100, '2026-09-01T10:00:00'),
+        debt(2, 200, '2024-06-01T10:00:00'),
+        debt(3, 300, '2026-10-01T10:00:00'),
+        debt(4, 50, '2026-09-01T10:00:00', None),
+        {**debt(5, 70, '2026-09-01T10:00:00'), 'obligation_date_basis': None},
+        {**debt(6, 40, '2026-08-01T10:00:00', 0), 'client_id': 8},
+    ]
+    card = fold_documents(rows, '2026-10-22')
+    clients = {row['client_id']: row for row in fold_clients(rows, '2026-10-22')}
+    assert card['value_at_risk_eur'] == 340
+    assert sum(row['overdue_amount'] for row in clients.values()) == Decimal('340')
+    assert clients[7]['debt_ids'] == '1,2' and clients[7]['debt_lines'] == 2
+    assert clients[7]['max_days_past_terms'] == 843 and clients[7]['max_overdue_days'] == 873
+    assert clients[8]['overdue_amount'] == Decimal('40.00')
+
+
+def test_documents_query_converts_at_the_as_of_date_through_the_database_function(monkeypatch):
+    from app.data import debt_snapshot
+    calls = []
+    monkeypatch.setattr(debt_snapshot, 'query', lambda sql, params: calls.append((sql, params)) or [])
+    debt_snapshot.overdue_clients('2026-10-22', 7)
+    sql, params = calls[0]
+    assert 'dbo.GetExchangedToEuroValue(d.Total, currency.ID, :fx_date)' in sql
+    assert params['fx_date'] == '2026-10-22' and params['manager_id'] == 7
+    assert 'c.MainManagerID = :manager_id' in sql
+    assert 'SUM(d.Total)' not in sql and 'ISNULL(a.CurrencyID' not in sql
+    assert 'DATEDIFF(day, d.Created' not in sql
 
 
 def test_ambiguous_document_attachment_cannot_double_count():

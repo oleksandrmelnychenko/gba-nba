@@ -502,7 +502,8 @@ def cockpit_clients(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
 ) -> dict:
     """The manager's client book with light commercial stats + overdue debt — the cockpit
-    «Мої клієнти» view. Recommendations hydrate per client in the console via the existing
+    «Мої клієнти» view. turnover_eur («Оборот (12м)») is gross: confirmed invoices of the
+    trailing 365 days, return documents not subtracted (turnover_basis says so). Recommendations hydrate per client in the console via the existing
     NetUID-keyed gba-server routes; this endpoint supplies the book and the NetUIDs."""
     manager_id = _resolve_manager(manager_net_uid)
     resolved_as_of = _resolved_as_of(as_of_date)
@@ -528,7 +529,7 @@ def cockpit_clients(
                                             search=search, offset=offset, limit=limit, facts=(products, churn))
         METRICS.record_request((time.time() - started) * 1000)
         return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
-                "as_of": resolved_as_of, **page}
+                "as_of": resolved_as_of, "turnover_basis": signals_repository.TURNOVER_BASIS, **page}
     except Exception as exc:  # noqa: BLE001
         METRICS.record_request((time.time() - started) * 1000, error=True)
         log.error("cockpit_clients_failed", manager_id=manager_id, error=str(exc))

@@ -178,3 +178,55 @@ def test_monthly_history_clamp_matches_explicit_source_floor(manager_id):
     assert to_cents(sig.monthly_paid(manager_id, pre_floor, AS_OF)) == to_cents(
         sig.monthly_paid(manager_id, source_floor, AS_OF)
     )
+
+
+def test_book_scope_candidates_are_the_union_of_every_manager(manager_id):
+    """The retrain dataset enumerates through the serving readers with no manager: what it
+    sees for a manager's clients is exactly what that manager's generator sees."""
+    as_of = datetime.fromisoformat(AS_OF).date().replace(day=1).isoformat()
+    book_churn = {int(r["client_id"]): (int(r["recent_orders"]), int(r["prior_orders"]),
+                                        int(r["silence_days"]))
+                  for r in sig.churn_candidates_for_manager(None, as_of)}
+    own_churn = {int(r["client_id"]): (int(r["recent_orders"]), int(r["prior_orders"]),
+                                       int(r["silence_days"]))
+                 for r in sig.churn_candidates_for_manager(manager_id, as_of)}
+    assert own_churn and own_churn.items() <= book_churn.items()
+
+    book = {(int(r["client_id"]), int(r["product_id"])): (int(r["n_orders"]), int(r["elapsed_days"]))
+            for r in sig.reorder_candidates_for_manager(None, as_of)}
+    own = {(int(r["client_id"]), int(r["product_id"])): (int(r["n_orders"]), int(r["elapsed_days"]))
+           for r in sig.reorder_candidates_for_manager(manager_id, as_of)}
+    assert own and own.items() <= book.items()
+    own_clients = {int(r["client_id"]) for r in sig.clients_for_manager(manager_id)}
+    assert {pair for pair in book if pair[0] in own_clients} == set(own)
+
+
+def test_dataset_rows_carry_the_served_features_and_later_labels(manager_id):
+    from app.ml import dataset as ds
+
+    vintage = "2026-09-01"
+    served = {(int(r["client_id"]), int(r["product_id"]))
+              for r in sig.reorder_candidates_for_manager(manager_id, vintage)}
+    rows = {(r["client_id"], r["product_id"]) for r in ds.reorder_candidates(vintage)}
+    excluded = ds._excluded_pids(vintage)
+    assert {pair for pair in served if pair[1] not in excluded} <= rows
+    bought = sig.purchases_between(sorted({c for c, _ in served})[:50], vintage, "2026-10-31")
+    assert bought and all(int(r["product_id"]) > 0 for r in bought)
+
+
+def test_opening_balances_reconcile_between_card_column_and_tasks(manager_id):
+    from app.data import debt_snapshot
+
+    card = debt_snapshot.dashboards(AS_OF)[manager_id]
+    book = debt_snapshot.overdue_clients(AS_OF, manager_id, with_unverified=True)
+    assert cents(sum(r["overdue_amount"] for r in book)) == card["value_at_risk_eur"]
+    assert cents(sum(r["opening_balance_amount"] for r in book)) == card["debt_opening_balance_eur"]
+    assert sum(r["opening_balance_lines"] for r in book) == card["debt_opening_balance_count"]
+    assert cents(sum(r["unknown_date_amount"] for r in book)) == card["debt_unknown_date_eur"]
+    assert card["value_at_risk_eur"] == cents(sum(b["amount_eur"] for b in card["debt_aging"]))
+    grace = get_settings().debt_grace_days
+    for row in sig.debt_task_candidates(manager_id, AS_OF):
+        assert row["max_days_past_terms"] > grace and row["debt_lines"] >= 1
+        assert float(row["overdue_amount"]) >= get_settings().debt_min_amount
+    opening_only = {r["client_id"] for r in book if r["opening_balance_lines"] and not r["task_debt_lines"]}
+    assert not opening_only & {r["client_id"] for r in sig.debt_task_candidates(manager_id, AS_OF)}

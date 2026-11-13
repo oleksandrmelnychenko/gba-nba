@@ -131,6 +131,7 @@ def test_endpoint_paging_validation_inclusive_day_and_failure(sources, monkeypat
     assert body["count"] == 1 and body["total"] == body["population_count"] == 2
     assert body["clients"][0]["client_id"] == 2 and calls == [AS_OF]
     assert body["as_of"] == AS_OF
+    assert body["turnover_basis"] == "gross_invoiced_returns_not_subtracted"
     assert api.get("/cockpit/clients", params={**params, "segment": "bogus"}).status_code == 422
     assert api.get("/cockpit/clients", params={**params, "limit": 201}).status_code == 422
     monkeypatch.setattr(repeat, "_latest_contacts",

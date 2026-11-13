@@ -61,10 +61,13 @@ def test_pages_searches_and_segments_share_one_snapshot(api):
 def test_cached_snapshot_is_not_mutated_and_debts_stay_live(api):
     client, calls, debts = api
     assert _get(client)["clients"][0]["overdue_eur"] == 0.0
-    debts["rows"] = [{"client_id": 1, "overdue_amount": 55.5, "max_days_past_terms": 9}]
+    debts["rows"] = [{"client_id": 1, "overdue_amount": 55.5, "max_days_past_terms": 9,
+                      "opening_balance_amount": 40.25, "opening_balance_lines": 2}]
     body = _get(client)
     assert body["clients"][0]["overdue_eur"] == 55.5
     assert body["clients"][0]["max_days_past_terms"] == 9
+    assert body["clients"][0]["debt_opening_balance_eur"] == 40.25
+    assert body["clients"][0]["debt_opening_balance_count"] == 2
     assert calls == [(1, AS_OF)]
     cached = main._client_book_state[(1, AS_OF, "2025-01-01")]["value"][0]
     assert "overdue_eur" not in cached[0] and "_due_count" in cached[0]

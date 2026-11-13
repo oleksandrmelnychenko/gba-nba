@@ -320,8 +320,18 @@ def contact_book_for_manager(manager_id: int, client_id: int | None = None) -> l
     )
 
 
+TURNOVER_BASIS = "gross_invoiced_returns_not_subtracted"
+
+
 def clients_overview_for_manager(manager_id: int, as_of: str, window_days: int = 365) -> list[dict]:
-    """Owned client book; turnover and last purchase share the retained-invoice grain."""
+    """Owned client book; turnover and last purchase share the retained-invoice grain.
+
+    turnover_eur («Оборот (12м)») is GROSS: confirmed invoices by invoice date, return
+    documents not subtracted. The purchase rule nets OrderItem.ReturnedQty, which the source
+    fills for a few euros only (45.96 EUR on 2026-11-13), so the figure equals the gross
+    invoiced amount; returns of the same period are 1.0-1.7 % of it. TURNOVER_BASIS names
+    this on the API.
+    """
     window = history.rolling_days(as_of, window_days)
     params = {"mid": manager_id, "asof": window.as_of.isoformat(),
               "source_start": history.source_history_start().isoformat(),
@@ -637,7 +647,8 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
     """Per client as-of T: the shared model features over the retained confirmed purchases.
 
     monetary is the same number as «Оборот (12м)» in clients_overview_for_manager: invoiced,
-    non-deleted, non-merged sales by invoice date, net of returned quantity. order_count and
+    non-deleted, non-merged sales by invoice date — gross, return documents are not
+    subtracted (see TURNOVER_BASIS). order_count and
     recency_days count the same purchases, so average order value has one population.
     recency_days is None for clients without a purchase in the window (callers map None -> 9999,
     the dataset's missing-recency sentinel). app.ml.dataset.client_features delegates here.

@@ -28,9 +28,62 @@ def _norm(s: str) -> str:
 # Do not extend this historical guard to those source-backed documentary queries.
 _SALES_SPINE_FUNCS = [
     sig.ubiquitous_product_ids,
-    ds.reorder_candidates, ds.churn_candidates, ds.active_clients,
-    ds.label_reorder, ds.label_any_order, ds.label_buy_products,
 ]
+
+
+def test_training_dataset_reads_candidates_and_labels_through_the_serving_readers():
+    """The dataset owns no sales SQL: a training row and a served task share one rule."""
+    source = inspect.getsource(ds)
+    assert "query(" not in source and "dbo." not in source
+    for fn, reader in (
+        (ds.reorder_candidates, "sig.reorder_candidates_for_manager( None,"),
+        (ds.churn_candidates, "sig.churn_candidates_for_manager(None,"),
+        (ds.active_clients, "sig.active_clients_for_manager( None,"),
+        (ds.debt_candidates, "debt_snapshot.task_candidates("),
+        (ds._bought, "sig.purchases_between("),
+        (ds.label_debt_paydown, "sig.payments_between("),
+    ):
+        assert reader in _norm(inspect.getsource(fn)), fn.__name__
+    for fn in (sig.purchases_between, sig.active_clients_for_manager,
+               sig.churn_candidates_for_manager, sig.repeat_products_for_manager):
+        assert "retained_purchase_cte(" in inspect.getsource(fn), fn.__name__
+    paid = _norm(inspect.getsource(sig.payments_between))
+    assert "p.IsCanceled = 0" in paid and "carrier.OwnershipType = 1" in paid
+    assert "SUM(p.EuroAmount)" in paid and "_kyiv_midnight_utc" in paid
+
+
+def test_book_scope_is_one_manager_or_the_whole_managed_book():
+    assert sig._book_scope(7) == ("c.MainManagerID = :mid", {"mid": 7})
+    assert sig._book_scope(None) == ("c.MainManagerID IS NOT NULL", {})
+
+
+def test_dataset_labels_are_read_on_the_days_after_the_candidate_cutoff(monkeypatch):
+    calls = []
+
+    def purchases(client_ids, start, end):
+        calls.append((sorted(client_ids), start, end))
+        return [{"client_id": 1, "product_id": 10}, {"client_id": 2, "product_id": 30}]
+
+    monkeypatch.setattr(sig, "purchases_between", purchases)
+    assert ds.label_reorder("2026-09-01", [(1, 10), (1, 11), (2, 20)]) == {(1, 10)}
+    assert ds.label_any_order("2026-09-01", [1, 2, 3]) == {1, 2}
+    assert ds.label_buy_products("2026-09-01", {1: [10, 99], 2: [31]}) == {1}
+    assert {call[1:] for call in calls} == {("2026-09-01", "2026-10-31")}
+    window = ("2026-09-01", "2026-10-31")
+    monkeypatch.setattr(sig, "payments_between",
+                        lambda ids, start, end: {1: 60, 2: 49.99} if (start, end) == window else {})
+    assert ds.label_debt_paydown("2026-09-01", {1: 100.0, 2: 100.0, 3: 100.0}) == {1}
+
+
+def test_cross_sell_pool_is_the_generator_cap_per_manager(monkeypatch):
+    rows = [{"client_id": cid, "manager_id": 1 if cid < 10 else 2, "client_net_uid": f"u{cid}"}
+            for cid in (1, 2, 3, 11, 12)]
+    monkeypatch.setattr(sig, "active_clients_for_manager", lambda *a, **k: rows)
+    monkeypatch.setattr(sig, "client_features",
+                        lambda ids, asof: {cid: {"monetary": float(cid % 10)} for cid in ids})
+    settings = config.get_settings().model_copy(update={"cross_sell_max_clients": 2})
+    monkeypatch.setattr(ds, "get_settings", lambda: settings)
+    assert [c["client_id"] for c in ds.active_clients("2026-09-01")] == [3, 2, 12, 11]
 
 
 # Payment conversion semantics are executed against fixture rows in

@@ -170,7 +170,7 @@ def test_monthly_series_clamp_since_without_inventing_dense_months(monkeypatch):
 def test_dataset_mirrors_rolling_and_factual_windows(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
-        ds,
+        sig,
         "query",
         lambda sql, params=None: calls.append((sql, dict(params or {}))) or [],
     )
@@ -186,29 +186,107 @@ def test_dataset_mirrors_rolling_and_factual_windows(monkeypatch):
     for sql, params in calls:
         assert params["asof"] >= "2025-01-01"
         assert "GETDATE()" not in sql
+        assert "c.MainManagerID IS NOT NULL" in sql and "mid" not in params
+
+
+_CLIENT = {"client_id": 77, "client_net_uid": "AB-77"}
+
+
+def _reco(monkeypatch, tmp_path, answers):
+    monkeypatch.setattr(ds, "_RECO_CACHE_DIR", str(tmp_path))
+    calls: list[tuple] = []
+    failures = {"n": 0}
+
+    def recommend(*args, **kwargs):
+        calls.append((args, kwargs))
+        answer = answers[min(len(calls), len(answers)) - 1]
+        if answer is None:
+            failures["n"] += 1
+            return []
+        return answer
+
+    monkeypatch.setattr(ds.reco_client, "recommend", recommend)
+    monkeypatch.setattr(ds.reco_client, "recommend_failures", lambda: failures["n"])
+    return calls, tmp_path / "source_2025-01-01"
 
 
 def test_reco_cache_rejects_legacy_payload(monkeypatch, tmp_path):
+    fresh = [{"product_id": 2, "source": "discovery"}]
+    calls, cache_dir = _reco(monkeypatch, tmp_path, [fresh])
+    cache_dir.mkdir()
+    (cache_dir / "2026-01-01_77.json").write_text(
+        json.dumps({"source_history_start": "2025-01-01", "as_of": "2026-01-01",
+                    "recommendations": [{"product_id": 1, "source": "discovery"}]}))
+
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == (fresh, True)
+    assert len(calls) == 1
+    assert json.loads((cache_dir / "2026-01-01_ab-77.json").read_text()) == {
+        "source_history_start": "2025-01-01",
+        "as_of": "2026-01-01",
+        "client_id": 77,
+        "client_net_uid": "ab-77",
+        "recommendations": fresh,
+    }
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == (fresh, True)
+    assert len(calls) == 1
+
+
+def test_reco_cache_entry_of_a_reminted_client_id_is_not_joined(monkeypatch, tmp_path):
+    fresh = [{"product_id": 2, "source": "discovery"}]
+    calls, cache_dir = _reco(monkeypatch, tmp_path, [fresh])
+    cache_dir.mkdir()
+    (cache_dir / "2026-01-01_ab-77.json").write_text(
+        json.dumps({"source_history_start": "2025-01-01", "as_of": "2026-01-01",
+                    "client_id": 5, "client_net_uid": "ab-77",
+                    "recommendations": [{"product_id": 1, "source": "discovery"}]}))
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == (fresh, True)
+    assert len(calls) == 1
+
+
+def test_reco_empty_answer_is_cached_and_a_failed_call_is_retried_then_left_uncached(
+        monkeypatch, tmp_path):
+    calls, cache_dir = _reco(monkeypatch, tmp_path, [[]])
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == ([], True)
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == ([], True)
+    assert len(calls) == 1
+
+    calls, cache_dir = _reco(monkeypatch, tmp_path / "failed", [None, None])
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == ([], False)
+    assert len(calls) == 2
+    assert not list(cache_dir.glob("*.json"))
+
+    recovered = [{"product_id": 3, "source": "discovery"}]
+    calls, cache_dir = _reco(monkeypatch, tmp_path / "flaky", [None, recovered])
+    assert ds._reco_raw_cached(_CLIENT, "2026-01-01", 8) == (recovered, True)
+    assert len(calls) == 2
+
+
+def test_reco_cache_prune_drops_entries_no_current_client_can_join(monkeypatch, tmp_path):
     monkeypatch.setattr(ds, "_RECO_CACHE_DIR", str(tmp_path))
     cache_dir = tmp_path / "source_2025-01-01"
     cache_dir.mkdir()
-    cache_file = cache_dir / "2026-01-01_77.json"
-    cache_file.write_text(json.dumps([{"product_id": 1, "source": "discovery"}]))
-    fresh = [{"product_id": 2, "source": "discovery"}]
-    calls: list[tuple] = []
-    monkeypatch.setattr(
-        ds.reco_client,
-        "recommend",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or fresh,
-    )
+    for name in ("2026-01-01_511776.json", "2026-01-01_ab-77.json", "2026-02-01_gone-1.json"):
+        (cache_dir / name).write_text("{}")
+    assert ds.prune_reco_cache({"ab-77"}) == 2
+    assert [path.name for path in cache_dir.glob("*.json")] == ["2026-01-01_ab-77.json"]
 
-    assert ds._reco_raw_cached(77, "2026-01-01", 8) == fresh
-    assert len(calls) == 1
-    assert json.loads(cache_file.read_text()) == {
-        "source_history_start": "2025-01-01",
-        "as_of": "2026-01-01",
-        "recommendations": fresh,
-    }
+
+def test_cross_sell_candidates_report_reco_coverage(monkeypatch, tmp_path):
+    answers = {1: [{"product_id": 9, "source": "discovery", "score": 0.4567}], 2: None, 3: []}
+    monkeypatch.setattr(ds.reco_client, "is_healthy", lambda: True)
+    monkeypatch.setattr(ds, "active_clients", lambda asof: [
+        {"client_id": cid, "client_net_uid": f"u-{cid}"} for cid in answers])
+    monkeypatch.setattr(ds, "_excluded_pids", lambda asof: set())
+    monkeypatch.setattr(
+        ds, "_reco_raw_cached",
+        lambda client, asof, timeout: (answers[client["client_id"]] or [],
+                                       answers[client["client_id"]] is not None))
+    rows = ds.cross_sell_candidates("2026-01-01", max_workers=1)
+    assert rows == [{"client_id": 1, "reco_product_ids": [9], "top_score": 0.457, "candidates": 1}]
+    assert ds.RECO_COVERAGE["2026-01-01"] == {"asked": 3, "failed": 1, "offline": False}
+    monkeypatch.setattr(ds.reco_client, "is_healthy", lambda: False)
+    assert ds.cross_sell_candidates("2026-02-01") == []
+    assert ds.RECO_COVERAGE["2026-02-01"]["offline"] is True
 
 
 def _history_frame(**overrides) -> pd.DataFrame:

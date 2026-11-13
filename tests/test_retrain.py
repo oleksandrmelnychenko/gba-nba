@@ -291,3 +291,117 @@ def test_main_swaps_on_pass_restores_on_fail(tmp_path, monkeypatch):
     assert (art / "propensity_model.joblib").read_bytes() == b"MODEL_OLD"  # restored
     # metrics restored to the old AUC too
     assert retrain._pooled_oot_auc(art / "metrics.json") == pytest.approx(0.73)
+
+
+# ----------------------------------------------------------------------- same-rows gate
+def _fold_frame():
+    rows = []
+    for vintage, shift in (("2026-05-01", 0), ("2026-06-01", 1), ("2026-07-01", 2),
+                           ("2026-08-01", 3), ("2026-09-01", 4)):
+        for client in range(40):
+            signal = float((client * 7 + shift) % 11)
+            rows.append({"vintage": vintage, "client_id": client, "task_type": "reorder_due",
+                         "label": int(signal > 5), "monetary": signal * 10, "recency_days": 5.0,
+                         "order_count": 3, "sig_n_orders": signal, "sig_elapsed_days": 10.0,
+                         "is_reorder_due": 1})
+    frame = pd.DataFrame(rows)
+    from app.ml.train import FEATURES
+    for column in FEATURES:
+        if column not in frame.columns:
+            frame[column] = 0.0
+    return frame
+
+
+def _old_model(tmp_path, monkeypatch, *, informative: bool):
+    import joblib
+    from sklearn.linear_model import LogisticRegression
+
+    from app.ml.train import FEATURES
+
+    art = tmp_path / "artifacts"
+    art.mkdir()
+    backup = art / "backup_x"
+    backup.mkdir()
+    monkeypatch.setattr(retrain, "ART", art)
+    monkeypatch.setattr(retrain, "PARQUET", tmp_path / "ds.parquet")
+    frame = _fold_frame()
+    frame.to_parquet(retrain.PARQUET, index=False)
+    target = frame["label"] if informative else 1 - frame["label"]
+    model = LogisticRegression(max_iter=500).fit(frame[FEATURES].astype(float), target)
+    joblib.dump(model, backup / "propensity_model.joblib")
+    (backup / "model_meta.json").write_text(json.dumps({"features": FEATURES}))
+    return art, backup
+
+
+def test_previous_model_is_scored_on_the_current_fold_with_brier_and_calibration(tmp_path, monkeypatch):
+    _art, backup = _old_model(tmp_path, monkeypatch, informative=True)
+    quality, detail = retrain._old_quality_on_current_split(backup)
+    assert detail == "2026-08-01..2026-09-01"
+    assert quality["pooled"]["n"] == 80 and quality["reorder_due"]["n"] == 80
+    assert quality["pooled"]["auc"] > 0.9
+    assert 0.0 <= quality["pooled"]["brier"] < 0.25
+    assert 0.0 <= quality["pooled"]["calibration_error"] <= 1.0
+    assert quality["cross_sell"] == {"n": 0}
+    assert retrain._old_auc_on_current_split(backup)[0] == pytest.approx(quality["pooled"]["auc"])
+
+
+def test_stored_auc_is_not_trusted_when_the_dataset_rule_changed(tmp_path, monkeypatch):
+    art, backup = _old_model(tmp_path, monkeypatch, informative=True)
+    split = {"oot_split": {"train_max": "2026-07-01", "test": ["2026-08-01", "2026-09-01"]}}
+    (art / "metrics.json").write_text(json.dumps(split))
+    (backup / "metrics.json").write_text(json.dumps(split))
+    (art / "model_meta.json").write_text(json.dumps({"dataset_rule": "new-rule"}))
+    assert retrain._same_evaluation_rows(backup) is False
+    (backup / "model_meta.json").write_text(json.dumps({"dataset_rule": "new-rule"}))
+    assert retrain._same_evaluation_rows(backup) is True
+    other = {"oot_split": {"train_max": "2026-06-01", "test": ["2026-07-01", "2026-08-01"]}}
+    (backup / "metrics.json").write_text(json.dumps(other))
+    assert retrain._same_evaluation_rows(backup) is False
+
+
+def test_unreadable_dataset_disables_the_comparison_instead_of_crashing(tmp_path, monkeypatch):
+    _art, backup = _old_model(tmp_path, monkeypatch, informative=True)
+    retrain.PARQUET.write_bytes(b"broken")
+    quality, detail = retrain._old_quality_on_current_split(backup)
+    assert quality is None and "не вдалося" in detail
+
+
+def test_work_dir_run_never_points_at_production(tmp_path, monkeypatch):
+    from app.ml import dataset as ds
+    from app.ml import train
+
+    seed = tmp_path / "production"
+    seed.mkdir()
+    (seed / "propensity_model.joblib").write_bytes(b"LIVE")
+    (seed / "metrics.json").write_text("{}")
+    for module, name in ((retrain, "ART"), (retrain, "DATA"), (retrain, "PARQUET"),
+                         (train, "ART"), (train, "DATA"), (ds, "_RECO_CACHE_DIR")):
+        monkeypatch.setattr(module, name, getattr(module, name))
+    work = tmp_path / "work"
+    retrain._use_work_dir(work, seed)
+    assert retrain.ART == train.ART
+    assert retrain.ART == work / "artifacts"
+    assert retrain.PARQUET == train.DATA
+    assert retrain.PARQUET == work / "data" / "nba_dataset.parquet"
+    assert ds._RECO_CACHE_DIR == str(work / "data" / "reco_cache")
+    assert (work / "artifacts" / "propensity_model.joblib").read_bytes() == b"LIVE"
+    (retrain.ART / "propensity_model.joblib").write_bytes(b"TRIAL")
+    assert (seed / "propensity_model.joblib").read_bytes() == b"LIVE"
+
+
+def test_calibration_error_and_fold_quality():
+    import numpy as np
+
+    from app.ml import train
+
+    y = np.array([0, 0, 1, 1])
+    assert train.calibration_error(y, np.array([0.0, 0.0, 1.0, 1.0])) == 0.0
+    assert train.calibration_error(y, np.array([0.5, 0.5, 0.5, 0.5]), bins=1) == 0.0
+    assert train.calibration_error(y, np.array([1.0, 1.0, 0.0, 0.0]), bins=2) == 1.0
+    quality = train.fold_quality(y, np.array([0.1, 0.2, 0.8, 0.9]))
+    assert quality["auc"] == 1.0 and quality["n"] == 4 and quality["base_rate"] == 0.5
+    assert train.fold_quality(np.array([]), np.array([])) == {"n": 0}
+    frame = pd.DataFrame({"dataset_rule": ["a", "a", 0]})
+    assert train.dataset_rule_of(frame) == "a"
+    assert train.dataset_rule_of(pd.DataFrame({"dataset_rule": ["a", "b"]})) is None
+    assert train.dataset_rule_of(pd.DataFrame({"x": [1]})) is None

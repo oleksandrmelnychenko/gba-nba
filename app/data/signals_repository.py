@@ -352,24 +352,42 @@ def clients_overview_for_manager(manager_id: int, as_of: str, window_days: int =
     """, params)
 
 
-def active_clients_for_manager(manager_id: int, as_of: str, recent_days: int = 120,
+_BOOK_SCOPE = "c.MainManagerID IS NOT NULL"
+_MANAGER_SCOPE = "c.MainManagerID = :mid"
+
+
+def _book_scope(manager_id: int | None) -> tuple[str, dict]:
+    """One manager's clients, or with None the whole managed book the generators serve.
+
+    The retrain dataset enumerates its candidates through the same readers with None, so a
+    training row and a served task come from one rule over one population.
+    """
+    if manager_id is None:
+        return _BOOK_SCOPE, {}
+    return _MANAGER_SCOPE, {"mid": manager_id}
+
+
+def active_clients_for_manager(manager_id: int | None, as_of: str, recent_days: int = 120,
                                min_orders: int = 3) -> list[dict]:
     """Clients with >= min_orders distinct orders in the last recent_days — the only clients worth
     a cross-sell reco call (reco needs purchase history; cold clients return no discovery). On real
     data this is ~20% of a manager's book, so it cuts reco HTTP calls 4-5x vs. all clients."""
     window = history.rolling_days(as_of, recent_days)
+    scope, scope_params = _book_scope(manager_id)
     return query(
-        retained_purchase_cte(start_param="start") + """
+        retained_purchase_cte(scope_sql=scope, start_param="start") + """
         , act AS (
             SELECT client_id AS cid FROM retained_purchases
             GROUP BY client_id HAVING COUNT(DISTINCT order_id) >= :minord
         )
         SELECT c.ID AS client_id, c.FullName AS full_name, c.Name AS name,
-               c.MobileNumber AS phone, c.EmailAddress AS email
+               c.MobileNumber AS phone, c.EmailAddress AS email,
+               c.MainManagerID AS manager_id,
+               LOWER(CONVERT(varchar(36), c.NetUID)) AS client_net_uid
         FROM act JOIN dbo.Client c ON c.ID = act.cid
         """,
         {
-            "mid": manager_id,
+            **scope_params,
             "asof": window.as_of.isoformat(),
             "start": window.effective_start.isoformat(),
             "minord": min_orders,
@@ -413,7 +431,7 @@ def debt_task_candidates(manager_id: int, as_of: str) -> list[dict]:
 
 # --- reorder_due signal ---
 
-def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,
+def repeat_products_for_manager(manager_id: int | None, as_of: str, min_purchases: int = 3,
                                 min_cycle_days: int = 7, *, include_day: bool = False,
                                 include_book: bool = False) -> list[dict]:
     """Same retained purchase cycle for generation and the client screen, before due filtering.
@@ -426,7 +444,8 @@ def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int 
     end = window.as_of + timedelta(days=1) if include_day else window.as_of
     recent = history.rolling_days(end, 90)
     baseline = history.rolling_days(end, 365)
-    params = {"mid": manager_id, "asof": end.isoformat(), "cycle_asof": as_of,
+    scope, scope_params = _book_scope(manager_id)
+    params = {**scope_params, "asof": end.isoformat(), "cycle_asof": as_of,
               "source_start": window.effective_start.isoformat(), "minp": min_purchases,
               "mincyc": min_cycle_days, "maxmult": get_settings().reorder_max_overdue_mult,
               "recent_start": recent.effective_start.isoformat(),
@@ -440,7 +459,7 @@ def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int 
             params.update(extra)
     # Window ranks count each order only once across its product rows, so the entire book,
     # repeat cycles and churn use one scan of the same retained source snapshot.
-    sql = retained_purchase_cte(materialize_orders=True) + f"""
+    sql = retained_purchase_cte(scope_sql=scope, materialize_orders=True) + f"""
         , ranked AS (
             SELECT *, ROW_NUMBER() OVER (
                 PARTITION BY client_id, product_id ORDER BY purchased_at DESC, order_id DESC) AS rn,
@@ -515,12 +534,12 @@ def repeat_products_for_manager(manager_id: int, as_of: str, min_purchases: int 
             WHERE pa.ProductID = x.product_id AND pa.Deleted = 0
                   AND st.Deleted = 0 AND st.ForDefective = 0
         ) stock
-        WHERE c.Deleted = 0 AND c.MainManagerID = :mid
+        WHERE c.Deleted = 0 AND {scope}
     """ + ("" if include_book else " AND x.product_id IS NOT NULL") + " ORDER BY c.ID, x.product_id; DROP TABLE #repeat_purchase_orders;"
     return query(sql, params)
 
 
-def reorder_candidates_for_manager(manager_id: int, as_of: str, min_purchases: int = 3,
+def reorder_candidates_for_manager(manager_id: int | None, as_of: str, min_purchases: int = 3,
                                    min_cycle_days: int = 7, max_overdue_mult: float = 3.0) -> list[dict]:
     """Existing average-gap/minimum-cycle policy, shared verbatim with the client evidence."""
     return [row for row in repeat_products_for_manager(manager_id, as_of, min_purchases, min_cycle_days)
@@ -542,7 +561,7 @@ def product_names(product_ids: list[int]) -> dict[int, str]:
 
 # --- churn_winback signal ---
 
-def churn_candidates_for_manager(manager_id: int, as_of: str,
+def churn_candidates_for_manager(manager_id: int | None, as_of: str,
                                  recent_days: int = 90, baseline_days: int = 365) -> list[dict]:
     """Per client: compare the recent-window order RATE vs the prior baseline RATE.
 
@@ -562,8 +581,9 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
     prior_span_days = (recent.effective_start - baseline.effective_start).days
     if recent_span_days <= 0 or prior_span_days <= 0:
         return []
+    scope, scope_params = _book_scope(manager_id)
     rows = query(
-        retained_purchase_cte(start_param="start") + """
+        retained_purchase_cte(scope_sql=scope, start_param="start") + """
         , client_orders AS (
             SELECT DISTINCT client_id, order_id, purchased_at AS dt FROM retained_purchases
         ),
@@ -587,7 +607,7 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
                   < 0.5 * (prior_orders * 1.0 / :prior_span)
         """,
         {
-            "mid": manager_id,
+            **scope_params,
             "asof": baseline.as_of.isoformat(),
             "start": baseline.effective_start.isoformat(),
             "recent_start": recent.effective_start.isoformat(),
@@ -656,6 +676,61 @@ def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -
             "order_count": int(r["order_count"] or 0),
             "recency_days": int(r["recency_days"]) if r["recency_days"] is not None else None,
         }
+    return out
+
+
+def client_net_uids() -> set[str]:
+    """NetUID of every client row, lower case: the stable half of a persisted client key."""
+    return {str(row["net_uid"]) for row in query(
+        "SELECT LOWER(CONVERT(varchar(36), NetUID)) AS net_uid FROM dbo.Client")}
+
+
+def purchases_between(client_ids: list[int], start: str, end: str) -> list[dict]:
+    """(client_id, product_id) of the retained confirmed purchases on the Kyiv days
+    start <= day < end: the outcome side of the rule the generators read their signals with."""
+    out: list[dict] = []
+    ids = sorted({int(value) for value in client_ids})
+    for index in range(0, len(ids), 800):
+        ph, params = in_clause("c", ids[index:index + 800])
+        out.extend(query(
+            retained_purchase_cte(scope_sql=f"c.ID IN {ph}", start_param="start", end_param="end") + """
+            SELECT DISTINCT client_id, product_id FROM retained_purchases
+            """,
+            {"start": start, "end": end, **params},
+        ))
+    return out
+
+
+def payments_between(client_ids: list[int], start: str, end: str) -> dict[int, Decimal]:
+    """Cash received per client on the Kyiv register days start <= day < end, in EUR.
+
+    The payment rule of monthly_paid: not deleted, not cancelled, no owned accounting carrier,
+    the document's own EuroAmount.
+    """
+    out: dict[int, Decimal] = {}
+    ids = sorted({int(value) for value in client_ids})
+    bounds = {"since_utc": _kyiv_midnight_utc(history.require_as_of(start)),
+              "until_utc": _kyiv_midnight_utc(history.require_as_of(end))}
+    for index in range(0, len(ids), 800):
+        ph, params = in_clause("c", ids[index:index + 800])
+        rows = query(
+            f"""
+            SELECT p.ClientID AS client_id, SUM(p.EuroAmount) AS paid
+            FROM dbo.IncomePaymentOrder p
+            JOIN dbo.Client c ON c.ID = p.ClientID AND c.Deleted = 0
+            WHERE p.Deleted = 0 AND p.IsCanceled = 0
+                  AND p.FromDate >= :since_utc AND p.FromDate < :until_utc
+                  AND p.ClientID IN {ph}
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dbo.DataSyncAccountingSourceTarget carrier
+                      WHERE carrier.TargetEntityType = 'IncomePaymentOrder'
+                            AND carrier.TargetEntityID = p.ID
+                            AND carrier.IsCurrent = 1 AND carrier.OwnershipType = 1)
+            GROUP BY p.ClientID
+            """,
+            {**bounds, **params},
+        )
+        out.update({int(r["client_id"]): decimal_value(r["paid"] or 0) for r in rows})
     return out
 
 

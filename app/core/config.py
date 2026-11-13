@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     cross_sell_recent_days: int = 120
     cross_sell_min_orders: int = 3
     cross_sell_max_clients: int = 40  # only the top-N active clients by turnover get a (costly) reco call
+    # Retrain backfill asks reco about every cross-sell client of every vintage; reco answers a
+    # request in seconds, so a wide burst with a short timeout returns nothing.
+    retrain_reco_workers: int = Field(default=4, ge=1, le=16)
+    retrain_reco_timeout: int = Field(default=30, ge=1, le=300)
     # Exclude products bought by >this share of clients — synthetic accounting lines ("Ввід боргів"
     # = debt entry, ~75% of clients) that aren't real products. Real parts top out ~14%.
     ubiquity_exclude_pct: float = 0.20

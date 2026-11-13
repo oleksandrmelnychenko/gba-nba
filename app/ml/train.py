@@ -108,6 +108,56 @@ def reliability(y_true: np.ndarray, p: np.ndarray, bins: int = 10) -> list[dict]
     return out
 
 
+def calibration_error(y_true: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
+    """Expected calibration error over equal-count bins: mean |predicted - realised|, weighted."""
+    y_true = np.asarray(y_true, dtype=float)
+    p = np.asarray(p, dtype=float)
+    if len(p) == 0:
+        return float("nan")
+    order = np.argsort(p, kind="stable")
+    total = 0.0
+    for chunk in np.array_split(order, min(bins, len(p))):
+        if len(chunk):
+            total += len(chunk) * abs(float(p[chunk].mean()) - float(y_true[chunk].mean()))
+    return total / len(p)
+
+
+def fold_quality(y_true: np.ndarray, p: np.ndarray) -> dict:
+    """AUC, Brier, calibration error and the mean predicted against the realised rate."""
+    y_true = np.asarray(y_true).astype(int)
+    p = np.asarray(p, dtype=float)
+    if len(p) == 0:
+        return {"n": 0}
+    return {
+        "n": int(len(p)),
+        "auc": safe_auc(y_true, p),
+        "brier": float(brier_score_loss(y_true, p)),
+        "calibration_error": calibration_error(y_true, p),
+        "mean_p": float(p.mean()),
+        "base_rate": float(y_true.mean()),
+    }
+
+
+def quality_by_type(frame: pd.DataFrame, p: np.ndarray) -> dict:
+    """fold_quality of the whole frame, per task type and of the served reorder rows."""
+    scored = frame.assign(_p=np.asarray(p, dtype=float))
+    out = {"pooled": fold_quality(scored["label"].to_numpy(), scored["_p"].to_numpy())}
+    for task_type in TASK_TYPES:
+        rows = scored[scored["task_type"] == task_type]
+        out[task_type] = fold_quality(rows["label"].to_numpy(), rows["_p"].to_numpy())
+    served = served_reorder_rows(scored)
+    out["reorder_due_served_rows"] = fold_quality(served["label"].to_numpy(), served["_p"].to_numpy())
+    return out
+
+
+def dataset_rule_of(df: pd.DataFrame) -> str | None:
+    """The one rule the dataset rows were enumerated and labelled with, or None when mixed."""
+    if "dataset_rule" not in df.columns:
+        return None
+    rules = sorted({value for value in df["dataset_rule"] if isinstance(value, str)})
+    return rules[0] if len(rules) == 1 else None
+
+
 def safe_auc(y: np.ndarray, p: np.ndarray) -> float:
     if len(np.unique(y)) < 2:
         return float("nan")
@@ -580,6 +630,8 @@ def main() -> None:
     else:
         prod_name = "hgb" if auc_hgb >= auc_lr else "logit"
     report["production_model"] = prod_name
+    report["dataset_rule"] = dataset_rule_of(df)
+    report["oot_quality"] = quality_by_type(df_te, df_te[f"_p_{prod_name}"].to_numpy())
     bench["oot"]["auc_model"] = oot[prod_name]["auc"]
     print(f"\n=== Production model: {prod_name} ===")
 
@@ -603,6 +655,7 @@ def main() -> None:
         "source_history_start": history.source_history_start().isoformat(),
         "training_window_days": TRAINING_WINDOW_DAYS,
         "training_vintages": training_vintages,
+        "dataset_rule": dataset_rule_of(df),
     }
     (ART / "model_meta.json").write_text(json.dumps(meta, indent=2))
     (ART / "metrics.json").write_text(json.dumps(report, indent=2, default=float))

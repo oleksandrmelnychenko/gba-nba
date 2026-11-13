@@ -1,26 +1,24 @@
 """Vintaged backfill training-set builder for the NBA propensity model.
 
-For each monthly snapshot T, this replays the EXACT as-of signal SQL that the live generators
-use (app/data/signals_repository.py), with the per-manager filter DROPPED so every candidate
-task instance in the book is enumerated at the historical vintage. It then computes a leak-safe
-feature vector (type-specific signals as-of T + shared client_monetary/recency/order_count as-of T
-+ task_type one-hot) and joins the per-type H-day OUTCOME label evaluated strictly in (T, T+H].
+For each monthly snapshot T the candidates are enumerated by the SAME readers the live
+generators call (app/data/signals_repository.py), scoped to the whole managed client book
+instead of one manager: reorder_candidates_for_manager, churn_candidates_for_manager,
+active_clients_for_manager, debt_snapshot.task_candidates. A training row and a served task
+therefore come from one rule over one population: retained confirmed purchases (invoiced,
+non-deleted, non-merged sales that are not accounting carriers), dated by the invoice on its
+Europe/Kyiv day. The features are the generator's own (type signals as-of T + the shared
+client features of sig.client_features + task_type one-hot).
+
+The per-type outcome label is read on the Kyiv days T <= day < T+H with the same purchase
+and payment rules (sig.purchases_between, sig.payments_between), strictly after the cut-off
+the candidates were enumerated with.
 
 This measures NATURAL conversion (propensity P(outcome | task)), NOT manager causal lift: the
 outcome window covers everyone whether or not a manager would have acted. It is the correct
 target for RANKING the inbox by P(outcome)xE[value]; it is not a treatment-effect estimate.
 
-Data traps honored (ConcordDb_V5), identical to the generators:
-  * Sale/Order/OrderItem validity = oi.IsValidForCurrentSale=1 (NOT Deleted: dbo.Order/OrderItem
-    are nearly all Deleted=1, so Deleted=0 kept only ~16% of sales); Order.Created is the event
-    time used for windows.
-  * PricePerItem is already EUR (turnover via SUM(Qty*PricePerItem)).
-  * Debt.Total -> EUR via dbo.GetExchangedToEuroValue(Total, ISNULL(Agreement.CurrencyID,2), Created).
-  * Payments: IncomePaymentOrder.Amount -> EUR via GetExchangedToEuroValue(Amount,CurrencyID,FromDate);
-    payment event time is FromDate (NOT the bulk-sync Created).
-  * Synthetic/ubiquitous SKUs (e.g. debt-entry) excluded from reorder + monetary.
-  * Hard-exclude the synthetic debt-entry ids (resolved live; settings.synthetic_product_ids as an
-    env override) everywhere — unconditional, independent of the data-driven ubiquity threshold.
+Synthetic/ubiquitous SKUs (the debt-entry «Ввід боргів», resolved live) are excluded from
+reorder pairs and cross-sell products, as in serving.
 The four types: reorder_due, debt_followup, churn_winback, cross_sell.
 new_client_activation is intentionally dropped (Client.Created is a 1C sync stamp, not a real signal).
 """
@@ -35,9 +33,9 @@ from app.core import history
 from app.core.config import get_settings
 from app.data import debt_snapshot
 from app.data import signals_repository as sig
-from app.data.db import in_clause, query
 
 H_DAYS = 60
+DATASET_RULE = "serving-readers-confirmed-invoice-kyiv-v2"
 TRAINING_WINDOW_DAYS = 365
 DEBT_PAYDOWN_FRACTION = 0.5  # >=50% of overdue@T paid in (T,T+H] = debt_followup success.
 
@@ -69,50 +67,14 @@ def client_features(client_ids: list[int], asof: str, window_days: int = 365) ->
 
 
 # --------------------------------------------------------------------------------------
-# Candidate enumeration — generator signal SQL, manager filter dropped, as_of=T.
+# Candidate enumeration — the generators' own readers over the whole managed book, as_of=T.
 # --------------------------------------------------------------------------------------
 def reorder_candidates(asof: str) -> list[dict]:
     s = get_settings()
-    window = history.factual_window(asof)
-    rows = query(
-        """
-        WITH per_product AS (
-            SELECT ca.ClientID AS client_id, oi.ProductID AS product_id,
-                   COUNT(DISTINCT o.ID) AS n_orders,
-                   MIN(o.Created) AS first_buy, MAX(o.Created) AS last_buy
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-            JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE oi.IsValidForCurrentSale = 1
-                  AND o.Created >= :source_start AND o.Created < :asof
-                  AND oi.ProductID IS NOT NULL
-                  AND c.Deleted = 0
-            GROUP BY ca.ClientID, oi.ProductID
-            HAVING COUNT(DISTINCT o.ID) >= 3
-        ),
-        cyc AS (
-            SELECT client_id, product_id, n_orders,
-                   DATEDIFF(day, last_buy, :asof) AS elapsed_days,
-                   CASE WHEN DATEDIFF(day, first_buy, last_buy) * 1.0 / NULLIF(n_orders - 1, 0) < :mincyc
-                        THEN :mincyc * 1.0
-                        ELSE DATEDIFF(day, first_buy, last_buy) * 1.0 / NULLIF(n_orders - 1, 0)
-                   END AS cycle_days
-            FROM per_product
-            WHERE DATEDIFF(day, first_buy, last_buy) > 0
-        )
-        SELECT client_id, product_id, n_orders, cycle_days, elapsed_days
-        FROM cyc
-        WHERE elapsed_days >= cycle_days AND elapsed_days <= cycle_days * :maxmult
-        """,
-        {
-            "asof": window.as_of.isoformat(),
-            "source_start": window.effective_start.isoformat(),
-            "mincyc": s.reorder_min_cycle_days,
-            "maxmult": s.reorder_max_overdue_mult,
-        },
-    )
-    excl = _excluded_pids(window.as_of.isoformat())
+    rows = sig.reorder_candidates_for_manager(
+        None, asof, min_cycle_days=s.reorder_min_cycle_days,
+        max_overdue_mult=s.reorder_max_overdue_mult)
+    excl = _excluded_pids(history.require_as_of(asof).isoformat())
     out = []
     for r in rows:
         pid = int(r["product_id"])
@@ -142,48 +104,9 @@ def debt_candidates(asof: str) -> list[dict]:
         debt_snapshot.overdue_clients(asof), settings.debt_min_amount, settings.debt_grace_days)]
 
 
-def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365) -> list[dict]:
-    baseline = history.rolling_days(asof, baseline_days)
-    recent_window = history.rolling_days(asof, recent_days)
-    recent_span_days = (recent_window.as_of - recent_window.effective_start).days
-    prior_span_days = (recent_window.effective_start - baseline.effective_start).days
-    if recent_span_days <= 0 or prior_span_days <= 0:
-        return []
-    rows = query(
-        """
-        WITH client_orders AS (
-            SELECT DISTINCT ca.ClientID AS client_id, o.ID AS order_id, o.Created AS dt
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-            JOIN dbo.Client c ON c.ID = ca.ClientID
-            WHERE o.Created >= :start AND o.Created < :asof AND c.Deleted = 0
-        ),
-        agg AS (
-            SELECT client_id,
-                   SUM(CASE WHEN dt >= :recent_start THEN 1 ELSE 0 END) AS recent_orders,
-                   SUM(CASE WHEN dt >= :start
-                            AND dt < :recent_start THEN 1 ELSE 0 END) AS prior_orders,
-                   MAX(dt) AS last_order
-            FROM client_orders GROUP BY client_id
-        )
-        SELECT client_id, recent_orders, prior_orders,
-               DATEDIFF(day, last_order, :asof) AS silence_days
-        FROM agg
-        WHERE prior_orders >= 2
-              AND (recent_orders * 1.0 / :recent_span)
-                  < 0.5 * (prior_orders * 1.0 / :prior_span)
-        """,
-        {
-            "asof": baseline.as_of.isoformat(),
-            "start": baseline.effective_start.isoformat(),
-            "recent_start": recent_window.effective_start.isoformat(),
-            "recent_span": recent_span_days,
-            "prior_span": prior_span_days,
-        },
-    )
+def churn_candidates(asof: str) -> list[dict]:
     out = []
-    for r in rows:
+    for r in sig.churn_candidates_for_manager(None, asof):
         recent = int(r["recent_orders"] or 0)
         prior = int(r["prior_orders"] or 0)
         out.append({
@@ -191,54 +114,60 @@ def churn_candidates(asof: str, recent_days: int = 90, baseline_days: int = 365)
             "recent_orders": recent,
             "prior_orders": prior,
             "silence_days": int(r["silence_days"] or 0),
-            "drop_ratio": (recent / prior) if prior else 0.0,
+            "drop_ratio": round(recent / prior, 2) if prior else 0.0,
         })
     return out
 
 
-def active_clients(asof: str) -> list[int]:
-    """cross_sell pool: clients with >= min_orders distinct orders in last recent_days (manager-free)."""
+def active_clients(asof: str) -> list[dict]:
+    """cross_sell pool: per manager the cross_sell_max_clients most valuable clients with
+    >= cross_sell_min_orders confirmed orders in cross_sell_recent_days — the clients the
+    generator asks reco about."""
     s = get_settings()
-    window = history.rolling_days(asof, s.cross_sell_recent_days)
-    rows = query(
-        """
-        WITH act AS (
-            SELECT ca.ClientID AS cid
-            FROM dbo.ClientAgreement ca
-            JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-                 AND o.Created >= :start AND o.Created < :asof
-            JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-            JOIN dbo.Client c ON c.ID = ca.ClientID AND c.Deleted = 0
-            GROUP BY ca.ClientID
-            HAVING COUNT(DISTINCT o.ID) >= :minord
-        )
-        SELECT cid FROM act
-        """,
-        {
-            "asof": window.as_of.isoformat(),
-            "start": window.effective_start.isoformat(),
-            "minord": s.cross_sell_min_orders,
-        },
-    )
-    return [int(r["cid"]) for r in rows]
+    rows = sig.active_clients_for_manager(
+        None, asof, recent_days=s.cross_sell_recent_days, min_orders=s.cross_sell_min_orders)
+    feats = sig.client_features([int(r["client_id"]) for r in rows], asof)
+    by_manager: dict[int, list[dict]] = {}
+    for r in rows:
+        by_manager.setdefault(int(r["manager_id"]), []).append(r)
+    out: list[dict] = []
+    for manager_id in sorted(by_manager):
+        clients = sorted(
+            by_manager[manager_id],
+            key=lambda c: (-(feats.get(int(c["client_id"]), {}).get("monetary") or 0.0),
+                           int(c["client_id"])))
+        out.extend({"client_id": int(c["client_id"]), "client_net_uid": str(c["client_net_uid"])}
+                   for c in clients[:s.cross_sell_max_clients])
+    return out
 
 
 _RECO_CACHE_DIR = "data/reco_cache"
 
 
-def _reco_raw_cached(cid: int, asof: str, reco_timeout: int) -> list[dict]:
-    """reco /recommend/copurchase result for (cid, asof), persisted to disk so the backfill is
-    idempotent/resumable and the contended live reco service is hit at most once per pair. A timed-out
-    or errored call returns [] (graceful, exactly like the live generator) and is NOT cached, so it
-    can be retried on a later run."""
+def _reco_cache_dir() -> str:
+    import os
+
+    path = os.path.join(_RECO_CACHE_DIR, f"source_{history.source_history_start().isoformat()}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _reco_raw_cached(client: dict, asof: str, reco_timeout: int) -> tuple[list[dict], bool]:
+    """(recommendations, answered) of reco /recommend/copurchase for one client as of T.
+
+    An answer is persisted under the client's NetUID together with the client id it was given
+    for and is reused only while both still name the same client: a database rebuild re-mints
+    ids, and an entry of the old numbering can never be joined to a current client. An empty
+    answer of a healthy reco is an answer and is cached; a failed call is not, so the next run
+    asks again.
+    """
     import json
     import os
 
+    cid, net_uid = int(client["client_id"]), str(client["client_net_uid"]).lower()
     canonical_asof = history.require_as_of(asof).isoformat()
     source_start = history.source_history_start().isoformat()
-    cache_dir = os.path.join(_RECO_CACHE_DIR, f"source_{source_start}")
-    os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(cache_dir, f"{canonical_asof}_{cid}.json")
+    path = os.path.join(_reco_cache_dir(), f"{canonical_asof}_{net_uid}.json")
     if os.path.exists(path):
         with open(path) as fh:
             cached = json.load(fh)
@@ -246,153 +175,143 @@ def _reco_raw_cached(cid: int, asof: str, reco_timeout: int) -> list[dict]:
             isinstance(cached, dict)
             and cached.get("source_history_start") == source_start
             and cached.get("as_of") == canonical_asof
+            and cached.get("client_id") == cid
+            and cached.get("client_net_uid") == net_uid
             and isinstance(cached.get("recommendations"), list)
         ):
-            return cached["recommendations"]
+            return cached["recommendations"], True
     from app.services.generators.cross_sell import _RECO_REQUEST_N
-    recs = reco_client.recommend(cid, top_n=_RECO_REQUEST_N, as_of_date=canonical_asof,
-                                 path="/recommend/copurchase", timeout=reco_timeout)
-    if recs:  # only cache non-empty (empty may be a transient timeout — allow retry)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(
-                {
-                    "source_history_start": source_start,
-                    "as_of": canonical_asof,
-                    "recommendations": recs,
-                },
-                fh,
-            )
-        os.replace(tmp, path)
-    return recs
+    recs: list[dict] = []
+    answered = False
+    for _attempt in range(2):
+        failures = reco_client.recommend_failures()
+        recs = reco_client.recommend(cid, top_n=_RECO_REQUEST_N, as_of_date=canonical_asof,
+                                     path="/recommend/copurchase", timeout=reco_timeout)
+        answered = reco_client.recommend_failures() == failures
+        if answered:
+            break
+    if not answered:
+        return [], False
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(
+            {
+                "source_history_start": source_start,
+                "as_of": canonical_asof,
+                "client_id": cid,
+                "client_net_uid": net_uid,
+                "recommendations": recs,
+            },
+            fh,
+        )
+    os.replace(tmp, path)
+    return recs, True
 
 
-def cross_sell_candidates(asof: str, max_workers: int = 32, reco_timeout: int = 8) -> list[dict]:
-    """One candidate per active client that reco (as_of T) returns >=1 discovery product for.
-    Mirrors the generator: copurchase engine, discovery source, score>=0.05, top-5 kept.
-    The discovered product ids are captured so the label can check a real cross-sell buy.
+def prune_reco_cache(known_net_uids: set[str]) -> int:
+    """Drop cache entries that cannot be joined to a current client: the files of the old
+    client-id numbering and those of clients that no longer exist."""
+    import os
 
-    Reco calls are independent HTTP I/O fanned out over a thread pool and persisted to a disk cache
-    (so the backfill is resumable and the contended live reco service is hit at most once per
-    (client, as_of)). A short reco_timeout bounds any one slow call; a timed-out client yields no
-    cross-sell candidate that run — graceful degradation identical to the live generator's 8s bound.
+    removed = 0
+    directory = _reco_cache_dir()
+    for name in os.listdir(directory):
+        if not name.endswith(".json"):
+            continue
+        key = name[:-5].split("_", 1)[-1]
+        if key not in known_net_uids:
+            os.remove(os.path.join(directory, name))
+            removed += 1
+    return removed
+
+
+RECO_COVERAGE: dict[str, dict] = {}
+
+
+def cross_sell_candidates(asof: str, max_workers: int | None = None,
+                          reco_timeout: int | None = None) -> list[dict]:
+    """One candidate per client of the cross-sell pool that reco (as_of T) returns >=1 discovery
+    product for. Mirrors the generator: copurchase engine, discovery source, score>=0.05,
+    top-5 kept. The discovered product ids are captured so the label can check a real buy.
+
+    Reco answers one request in seconds, so the fan-out is small and patient
+    (retrain_reco_workers, retrain_reco_timeout): a wide burst only times out and leaves the
+    type without rows. How many clients were asked and how many calls failed is kept in
+    RECO_COVERAGE[asof] for the retrain report.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     from app.services.generators.cross_sell import _MAX_PRODUCTS, _MIN_SCORE
+    settings = get_settings()
+    coverage = RECO_COVERAGE[asof] = {"asked": 0, "failed": 0, "offline": False}
     if not reco_client.is_healthy():
+        coverage["offline"] = True
         return []
-    cids = active_clients(asof)
+    clients = active_clients(asof)
     excl = _excluded_pids(asof)
+    timeout = reco_timeout or settings.retrain_reco_timeout
 
-    def _one(cid: int) -> dict | None:
-        recs = _reco_raw_cached(cid, asof, reco_timeout)
+    def _one(client: dict) -> tuple[dict | None, bool]:
+        recs, answered = _reco_raw_cached(client, asof, timeout)
         disc = [r for r in recs if r.get("source") == "discovery"
                 and float(r.get("score", 0)) >= _MIN_SCORE
                 and int(r.get("product_id", 0)) not in excl]
         if not disc:
-            return None
+            return None, answered
         disc = disc[:_MAX_PRODUCTS]
         return {
-            "client_id": cid,
+            "client_id": int(client["client_id"]),
             "reco_product_ids": [int(r["product_id"]) for r in disc],
-            "top_score": float(disc[0].get("score", 0)),
+            "top_score": round(float(disc[0].get("score", 0)), 3),
             "candidates": len(disc),
-        }
+        }, answered
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        return [r for r in ex.map(_one, cids) if r is not None]
+    with ThreadPoolExecutor(max_workers=max_workers or settings.retrain_reco_workers) as ex:
+        results = list(ex.map(_one, clients))
+    coverage["asked"] = len(results)
+    coverage["failed"] = sum(1 for _row, answered in results if not answered)
+    return [row for row, _answered in results if row is not None]
 
 
 # --------------------------------------------------------------------------------------
-# Leak-safe outcome labels in (T, T+H].
+# Leak-safe outcome labels on the Kyiv days T <= day < T+H, by the serving purchase rule.
 # --------------------------------------------------------------------------------------
+def _bought(asof: str, client_ids: list[int]) -> dict[int, set[int]]:
+    bought: dict[int, set[int]] = {}
+    for r in sig.purchases_between(client_ids, asof, _t_plus_h(asof)):
+        bought.setdefault(int(r["client_id"]), set()).add(int(r["product_id"]))
+    return bought
+
+
 def label_reorder(asof: str, pairs: list[tuple[int, int]]) -> set[tuple[int, int]]:
-    """(client_id, product_id) pairs where the client re-buys THAT product in (T, T+H]."""
+    """(client_id, product_id) pairs where the client buys THAT product again in the window."""
     if not pairs:
         return set()
-    cids = sorted({c for c, _ in pairs})
-    pids = sorted({p for _, p in pairs})
-    cph, cparams = in_clause("c", cids)
-    pph, pparams = in_clause("p", pids)
-    rows = query(
-        f"""
-        SELECT DISTINCT ca.ClientID AS client_id, oi.ProductID AS product_id
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created > :asof AND o.Created <= :end
-              AND ca.ClientID IN {cph} AND oi.ProductID IN {pph}
-        """,
-        {"asof": asof, "end": _t_plus_h(asof), **cparams, **pparams},
-    )
-    bought = {(int(r["client_id"]), int(r["product_id"])) for r in rows}
-    wanted = set(pairs)
-    return bought & wanted
+    bought = _bought(asof, [c for c, _ in pairs])
+    return {(c, p) for c, p in pairs if p in bought.get(c, set())}
 
 
 def label_any_order(asof: str, client_ids: list[int]) -> set[int]:
-    """clients placing ANY valid order in (T, T+H] — used for churn_winback success."""
+    """clients with ANY confirmed purchase in the window — used for churn_winback success."""
     if not client_ids:
         return set()
-    ph, params = in_clause("c", client_ids)
-    rows = query(
-        f"""
-        SELECT DISTINCT ca.ClientID AS client_id
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID AND oi.IsValidForCurrentSale = 1
-        WHERE o.Created > :asof AND o.Created <= :end AND ca.ClientID IN {ph}
-        """,
-        {"asof": asof, "end": _t_plus_h(asof), **params},
-    )
-    return {int(r["client_id"]) for r in rows}
+    return set(_bought(asof, client_ids))
 
 
 def label_debt_paydown(asof: str, overdue_by_client: dict[int, float]) -> set[int]:
-    """clients whose EUR payments in (T, T+H] cover >= DEBT_PAYDOWN_FRACTION of overdue@T."""
-    cids = list(overdue_by_client)
-    if not cids:
+    """clients whose EUR payments in the window cover >= DEBT_PAYDOWN_FRACTION of overdue@T."""
+    if not overdue_by_client:
         return set()
-    ph, params = in_clause("c", cids)
-    rows = query(
-        f"""
-        SELECT c.ID AS client_id,
-               SUM(dbo.GetExchangedToEuroValue(p.Amount, p.CurrencyID, p.FromDate)) AS paid
-        FROM dbo.IncomePaymentOrder p
-        JOIN dbo.Client c ON c.ID = p.ClientID AND c.Deleted = 0
-        WHERE p.Deleted = 0 AND p.FromDate > :asof AND p.FromDate <= :end AND c.ID IN {ph}
-        GROUP BY c.ID
-        """,
-        {"asof": asof, "end": _t_plus_h(asof), **params},
-    )
-    paid = {int(r["client_id"]): float(r["paid"] or 0.0) for r in rows}
+    paid = sig.payments_between(list(overdue_by_client), asof, _t_plus_h(asof))
     return {cid for cid, ov in overdue_by_client.items()
-            if ov > 0 and paid.get(cid, 0.0) >= DEBT_PAYDOWN_FRACTION * ov}
+            if ov > 0 and float(paid.get(cid, 0)) >= DEBT_PAYDOWN_FRACTION * ov}
 
 
 def label_buy_products(asof: str, client_products: dict[int, list[int]]) -> set[int]:
-    """clients who buy ANY of their reco-discovered product ids in (T, T+H] — cross_sell success."""
-    cids = list(client_products)
-    if not cids:
+    """clients who buy ANY of their reco-discovered product ids in the window."""
+    if not client_products:
         return set()
-    all_pids = sorted({p for ps in client_products.values() for p in ps})
-    cph, cparams = in_clause("c", cids)
-    pph, pparams = in_clause("p", all_pids)
-    rows = query(
-        f"""
-        SELECT DISTINCT ca.ClientID AS client_id, oi.ProductID AS product_id
-        FROM dbo.ClientAgreement ca
-        JOIN dbo.[Order] o ON o.ClientAgreementID = ca.ID
-        JOIN dbo.OrderItem oi ON oi.OrderID = o.ID
-        WHERE oi.IsValidForCurrentSale = 1 AND o.Created > :asof AND o.Created <= :end
-              AND ca.ClientID IN {cph} AND oi.ProductID IN {pph}
-        """,
-        {"asof": asof, "end": _t_plus_h(asof), **cparams, **pparams},
-    )
-    bought: dict[int, set[int]] = {}
-    for r in rows:
-        bought.setdefault(int(r["client_id"]), set()).add(int(r["product_id"]))
+    bought = _bought(asof, list(client_products))
     return {cid for cid, ps in client_products.items() if bought.get(cid, set()) & set(ps)}
 
 
@@ -463,6 +382,7 @@ def build_snapshot(asof: str) -> pd.DataFrame:
             "source_history_start": coverage.source_history_start.isoformat(),
             "effective_start": coverage.effective_start.isoformat(),
             "history_complete": coverage.history_complete,
+            "dataset_rule": DATASET_RULE,
             "task_type": ttype, "client_id": cid,
             "monetary": f(cid, "monetary"),
             "recency_days": f(cid, "recency_days", 9999),

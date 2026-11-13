@@ -144,20 +144,27 @@ def _oot_split(metrics_path: Path) -> tuple[str, str, str] | None:
         return None
 
 
-def _old_auc_on_current_split(backup_dir: Path) -> tuple[float | None, str]:
-    """Score the PREVIOUS production model on the CURRENT test fold.
+def _dataset_rule(meta_path: Path) -> str | None:
+    try:
+        return json.loads(meta_path.read_text()).get("dataset_rule")
+    except (OSError, ValueError):
+        return None
 
-    The dataset window rolls forward every run, so the AUC stored in the old metrics.json was
-    measured on an older, different test fold. Comparing it to the new number would flag a
-    regression whenever the fresh window is simply harder — and would block every retrain
-    forever. Re-scoring the old model on the new fold makes the delta gate an apples-to-apples
-    comparison again.
-    """
+
+def _same_evaluation_rows(backup_dir: Path) -> bool:
+    """True when the stored AUC of the previous model was measured on the rows the new one was:
+    the same temporal fold of a dataset built by the same rule."""
+    return (_oot_split(ART / "metrics.json") == _oot_split(backup_dir / "metrics.json")
+            and _dataset_rule(ART / "model_meta.json") == _dataset_rule(backup_dir / "model_meta.json"))
+
+
+def _old_quality_on_current_split(backup_dir: Path) -> tuple[dict | None, str]:
+    """AUC, Brier and calibration of the PREVIOUS production model on the CURRENT test fold,
+    pooled and per task type — the same rows the new model's oot_quality is reported on."""
     import joblib
     import pandas as pd
-    from sklearn.metrics import roc_auc_score
 
-    from app.ml.train import FEATURES, resolve_oot_split
+    from app.ml.train import FEATURES, quality_by_type, resolve_oot_split
 
     old_meta_path = backup_dir / "model_meta.json"
     if old_meta_path.exists():
@@ -169,15 +176,53 @@ def _old_auc_on_current_split(backup_dir: Path) -> tuple[float | None, str]:
     if not model_path.exists() or not PARQUET.exists():
         return None, "немає старої моделі або свіжого датасету"
 
-    frame = pd.read_parquet(PARQUET)
-    frame["vd"] = pd.to_datetime(frame["vintage"])
-    _, test_lo, test_hi = resolve_oot_split(frame["vd"].tolist())
-    test = frame[(frame["vd"] >= test_lo) & (frame["vd"] <= test_hi)]
-    if test.empty or test["label"].nunique() < 2:
-        return None, "новий тестовий фолд порожній або без обох класів"
+    try:
+        frame = pd.read_parquet(PARQUET)
+        frame["vd"] = pd.to_datetime(frame["vintage"])
+        _, test_lo, test_hi = resolve_oot_split(frame["vd"].tolist())
+        test = frame[(frame["vd"] >= test_lo) & (frame["vd"] <= test_hi)]
+        if test.empty or test["label"].nunique() < 2:
+            return None, "новий тестовий фолд порожній або без обох класів"
+        probabilities = joblib.load(model_path).predict_proba(test[FEATURES].astype(float))[:, 1]
+    except Exception as exc:  # noqa: BLE001
+        return None, f"стару модель не вдалося оцінити на новому фолді ({type(exc).__name__})"
+    return quality_by_type(test, probabilities), f"{test_lo}..{test_hi}"
 
-    probabilities = joblib.load(model_path).predict_proba(test[FEATURES])[:, 1]
-    return float(roc_auc_score(test["label"].to_numpy(), probabilities)), f"{test_lo}..{test_hi}"
+
+def _print_comparison(old: dict, new: dict) -> None:
+    print(f"{'rows':26s} {'n':>6s}  {'AUC old':>8s} {'AUC new':>8s}  {'Brier old':>9s} "
+          f"{'Brier new':>9s}  {'cal.err old':>11s} {'cal.err new':>11s}  "
+          f"{'mean p old':>10s} {'mean p new':>10s} {'realised':>9s}")
+    for key in ("pooled", "reorder_due", "reorder_due_served_rows", "debt_followup",
+                "churn_winback", "cross_sell"):
+        a, b = old.get(key) or {}, new.get(key) or {}
+        if not (a.get("n") or b.get("n")):
+            continue
+
+        def cell(row: dict, name: str, width: int) -> str:
+            value = row.get(name)
+            return f"{value:{width}.4f}" if isinstance(value, float) and not math.isnan(value) \
+                else " " * (width - 3) + "n/a"
+
+        print(f"{key:26s} {int(b.get('n') or a.get('n') or 0):6d}  "
+              f"{cell(a, 'auc', 8)} {cell(b, 'auc', 8)}  {cell(a, 'brier', 9)} {cell(b, 'brier', 9)}  "
+              f"{cell(a, 'calibration_error', 11)} {cell(b, 'calibration_error', 11)}  "
+              f"{cell(a, 'mean_p', 10)} {cell(b, 'mean_p', 10)} {cell(b or a, 'base_rate', 9)}")
+
+
+def _old_auc_on_current_split(backup_dir: Path) -> tuple[float | None, str]:
+    """Score the PREVIOUS production model on the CURRENT test fold.
+
+    The dataset window rolls forward every run, so the AUC stored in the old metrics.json was
+    measured on an older, different test fold. Comparing it to the new number would flag a
+    regression whenever the fresh window is simply harder — and would block every retrain
+    forever. Re-scoring the old model on the new fold makes the delta gate an apples-to-apples
+    comparison again.
+    """
+    quality, detail = _old_quality_on_current_split(backup_dir)
+    if quality is None:
+        return None, detail
+    return float(quality["pooled"]["auc"]), detail
 
 
 def _crosssell_oot_auc(metrics_path: Path) -> float | None:
@@ -288,6 +333,22 @@ def _rebuild_dataset(snapshots: list[str], include_live: bool) -> dict:
     bf = ds.build_dataset(snapshots)
     bf["is_live"] = 0
     summary = {"backfill_rows": int(len(bf)), "live_rows": 0}
+    coverage = [ds.RECO_COVERAGE.get(snapshot, {}) for snapshot in snapshots]
+    summary["reco_asked"] = sum(int(c.get("asked", 0)) for c in coverage)
+    summary["reco_failed"] = sum(int(c.get("failed", 0)) for c in coverage)
+    summary["reco_offline_vintages"] = sum(1 for c in coverage if c.get("offline"))
+    print(f"reco: asked {summary['reco_asked']} clients, {summary['reco_failed']} calls failed, "
+          f"{summary['reco_offline_vintages']} vintages with reco offline")
+    if summary["reco_offline_vintages"] or summary["reco_failed"] > 0.2 * max(summary["reco_asked"], 1):
+        print("WARNING: cross_sell rows are incomplete — reco did not answer for part of the pool; "
+              "the cached answers are kept and the next run asks only for the missing ones")
+    try:
+        from app.data import signals_repository as sig
+        removed = ds.prune_reco_cache(sig.client_net_uids())
+        if removed:
+            print(f"reco cache: removed {removed} entries no current client can be joined to")
+    except Exception as exc:  # noqa: BLE001
+        print(f"reco cache not pruned ({type(exc).__name__}: {exc})")
 
     frames = [bf]
     if include_live:
@@ -297,6 +358,7 @@ def _rebuild_dataset(snapshots: list[str], include_live: bool) -> dict:
             for c in bf.columns:
                 if c not in live.columns:
                     live[c] = 0
+            live["dataset_rule"] = ds.DATASET_RULE
             live = live[bf.columns]
             frames.append(live)
             summary["live_rows"] = int(len(live))
@@ -311,6 +373,33 @@ def _rebuild_dataset(snapshots: list[str], include_live: bool) -> dict:
           f"(backfill={summary['backfill_rows']}, live={summary['live_rows']}); "
           f"cross_sell n={summary['cross_sell_n']} base={summary['cross_sell_base_rate']:.1%}")
     return summary
+
+
+def _use_work_dir(work_dir: Path, seed: Path) -> None:
+    """Point every path this run writes at work_dir and copy the production artefacts in.
+
+    The copy is what the run backs up, compares against and may overwrite; the directory it
+    came from is never written.
+    """
+    global ART, DATA, PARQUET
+    from app.ml import dataset as ds
+    from app.ml import train
+
+    work_dir = work_dir.resolve()
+    artifacts = work_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (work_dir / "data").mkdir(parents=True, exist_ok=True)
+    for name in PROD_ARTIFACTS:
+        source = seed / name
+        if source.exists() and source.resolve() != (artifacts / name).resolve():
+            shutil.copy2(source, artifacts / name)
+    ART = artifacts
+    DATA = work_dir / "data"
+    PARQUET = DATA / "nba_dataset.parquet"
+    train.ART = artifacts
+    train.DATA = PARQUET
+    ds._RECO_CACHE_DIR = str(DATA / "reco_cache")
+    print(f"work dir {work_dir}: artefacts seeded from {seed}; production is read-only")
 
 
 def _retrain_in_place() -> None:
@@ -335,7 +424,15 @@ def main() -> int:
                     help="skip the Mongo live-label union (backfill only)")
     ap.add_argument("--dry-run", action="store_true",
                     help="rebuild->train->validate, then restore production unconditionally")
+    ap.add_argument("--work-dir", type=Path, default=None,
+                    help="run entirely inside this directory: the dataset, the reco cache and the "
+                         "artefacts are written there and production artefacts are only read")
+    ap.add_argument("--seed-artifacts", type=Path, default=None,
+                    help="with --work-dir: the production artefact directory to compare against "
+                         "(default: this checkout's app/ml/artifacts)")
     args = ap.parse_args()
+    if args.work_dir is not None:
+        _use_work_dir(args.work_dir, args.seed_artifacts or ART)
 
     snapshots = rolling_snapshots(today, n=args.n_snapshots)
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -378,15 +475,28 @@ def main() -> int:
 
     # The regression gate only means something when both AUCs come from the same test fold.
     comparison_note = ""
-    if old_auc is not None and _oot_split(ART / "metrics.json") != _oot_split(backup_dir / "metrics.json"):
-        rescored, detail = _old_auc_on_current_split(backup_dir)
-        if rescored is None:
+    old_quality, old_quality_detail = (None, "")
+    if old_auc is not None:
+        old_quality, old_quality_detail = _old_quality_on_current_split(backup_dir)
+    if old_auc is not None and not _same_evaluation_rows(backup_dir):
+        if old_quality is None:
             old_auc = None
-            comparison_note = f"regression gate disabled: вікно OOT змінилось, {detail}"
+            comparison_note = ("regression gate disabled: тестові рядки змінились (вікно OOT або "
+                               f"правило датасету), {old_quality_detail}")
         else:
-            comparison_note = (f"old AUC re-scored on the current fold {detail}: "
+            rescored = float(old_quality["pooled"]["auc"])
+            comparison_note = (f"old AUC re-scored on the current fold {old_quality_detail}: "
                                f"{old_auc:.4f} -> {rescored:.4f}")
             old_auc = rescored
+    new_quality = json.loads((ART / "metrics.json").read_text()).get("oot_quality")
+    if old_quality is not None and new_quality:
+        print(f"previous model against the new one on the same out-of-time rows {old_quality_detail} "
+              "(the previous model was fitted on vintages that include this fold; the new one is "
+              "scored before its final refit, so the comparison leans towards the previous model):")
+        _print_comparison(old_quality, new_quality)
+        metrics = json.loads((ART / "metrics.json").read_text())
+        metrics["previous_model_on_current_fold"] = old_quality
+        (ART / "metrics.json").write_text(json.dumps(metrics, indent=2, default=float))
 
     from app.core.config import get_settings
     min_head_rows = (args.min_head_rows if args.min_head_rows is not None

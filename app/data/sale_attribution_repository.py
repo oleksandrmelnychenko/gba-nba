@@ -1,4 +1,10 @@
-"""Documentary sale/payment facts. Never infer contact causality or revalue money."""
+"""Documentary sale/payment facts. Never infer contact causality or revalue money.
+
+A return of a sale older than the imported history is anchored by the 1C import to a
+placeholder line (IMPORT_PLACEHOLDER_RETURN: the zero shape and caption the sync writes on an
+imported return), often inside an unrelated later sale of the same agreement. It is a fact of
+its own date, client and product, never a return of the sale that hosts the placeholder.
+"""
 
 from datetime import UTC
 from zoneinfo import ZoneInfo
@@ -30,6 +36,12 @@ CROSS APPLY (SELECT
       ELSE basis.event_at END document_at, basis.date_basis
 ) dates
 """
+
+IMPORT_PLACEHOLDER_LINE = (
+    "oi.Qty=0 AND oi.PricePerItem=0 AND oi.PricePerItemWithoutVat=0 "
+    "AND oi.ExchangeRateAmount=0 AND ISNULL(LTRIM(RTRIM(oi.Comment)),N'')=N'1С'"
+)
+IMPORT_PLACEHOLDER_RETURN = f"r.SourceDocumentID IS NOT NULL AND {IMPORT_PLACEHOLDER_LINE}"
 
 _SALES = (
     """
@@ -115,6 +127,20 @@ def _sale(row):
     }
 
 
+def _returns(ids: str, args: dict) -> list[dict]:
+    return query(
+        f"""SELECT s.ID sale_id,r.ID return_id,r.FromDate document_at,
+        ri.ID return_item_id,ri.Qty quantity,ri.IsMoneyReturned credit_processed,
+        CASE WHEN ri.RecordedGrossAmountVersion=1 THEN ri.Amount END recorded_return_credit_eur,
+        CASE WHEN r.Deleted=1 OR r.IsCanceled=1 OR ri.Deleted=1 THEN 1 ELSE 0 END canceled
+        FROM dbo.Sale s JOIN dbo.OrderItem oi ON oi.OrderID=s.OrderID
+        JOIN dbo.SaleReturnItem ri ON ri.OrderItemID=oi.ID JOIN dbo.SaleReturn r ON r.ID=ri.SaleReturnID
+        WHERE s.ID IN {ids} AND NOT ({IMPORT_PLACEHOLDER_RETURN})
+        ORDER BY r.FromDate,ri.ID""",
+        args,
+    )
+
+
 def facts(sale_net_uids: list[str]) -> dict[str, dict]:
     if not sale_net_uids:
         return {}
@@ -135,16 +161,7 @@ def facts(sale_net_uids: list[str]) -> dict[str, dict]:
         ORDER BY p.FromDate,x.ID""",
         args,
     )
-    returns = query(
-        f"""SELECT s.ID sale_id,r.ID return_id,r.FromDate document_at,
-        ri.ID return_item_id,ri.Qty quantity,ri.IsMoneyReturned credit_processed,
-        CASE WHEN ri.RecordedGrossAmountVersion=1 THEN ri.Amount END recorded_return_credit_eur,
-        CASE WHEN r.Deleted=1 OR r.IsCanceled=1 OR ri.Deleted=1 THEN 1 ELSE 0 END canceled
-        FROM dbo.Sale s JOIN dbo.OrderItem oi ON oi.OrderID=s.OrderID
-        JOIN dbo.SaleReturnItem ri ON ri.OrderItemID=oi.ID JOIN dbo.SaleReturn r ON r.ID=ri.SaleReturnID
-        WHERE s.ID IN {ids} ORDER BY r.FromDate,ri.ID""",
-        args,
-    )
+    returns = _returns(ids, args)
     by_id = {row["sale_id"]: row for row in result.values()}
     for row in by_id.values():
         row.update(payments=[], returns=[])

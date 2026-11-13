@@ -51,7 +51,7 @@ class Settings(BaseSettings):
 
     # API. Host stays 0.0.0.0 for container networking; the security boundary is internal_api_key
     # plus not publishing the port externally — NOT the bind address.
-    api_host: str = "0.0.0.0"
+    api_host: str = "127.0.0.1"
     api_port: int = 8002
     log_level: str = "INFO"
 

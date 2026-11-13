@@ -4,7 +4,7 @@ services:
   mongo:
     image: mongo:7
     container_name: gba-nba-mongo
-    ports: ["27017:27017"]
+    ports: ["127.0.0.1:27017:27017"]
     volumes: ["mongo_data:/data/db"]
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
@@ -20,7 +20,9 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017
       SOURCE_HISTORY_START_DATE: "${SOURCE_HISTORY_START_DATE:-2025-01-01}"
-    ports: ["8002:8002"]
+    ports:
+      - "127.0.0.1:8002:8002"
+      - "172.17.0.1:8002:8002"
     depends_on:
       mongo:
         condition: service_healthy

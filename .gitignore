@@ -19,3 +19,4 @@ app/ml/artifacts/model_meta.json
 app/ml/artifacts/metrics.json
 app/ml/artifacts/MODEL_CARD.md
 .venv-*/
+app/ml/artifacts/calibration.json

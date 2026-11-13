@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     debt_min_amount: float = 10.0        # EUR; drop settled/rounding sub-€10 overdues (~25% are noise)
     reorder_min_cycle_days: int = 7      # floor for span/(n-1) cycle, suppresses burst-buyer false-criticals
     reorder_max_overdue_mult: float = 3.0  # cap elapsed at N×cycle; beyond this the product is abandoned
+    # churn: a rate drop only counts once the silence exceeds the client's own rhythm.
+    # Backtest 2026-01..2026-10 (docs/task-quality-2026-11-13.md): admitted churn tasks whose client
+    # really stayed silent for 30 days went 49% -> 71% with max(30 days, 2 x own mean interval).
+    churn_min_silence_days: int = Field(default=30, ge=0)
+    churn_silence_cycle_mult: float = Field(default=2.0, ge=0)
     # cross_sell: only query reco for ACTIVE clients (reco needs history; cold clients yield no
     # discovery anyway). On real data this is ~20% of a manager's book — a 4-5× cut in reco calls.
     cross_sell_recent_days: int = 120
@@ -110,6 +115,8 @@ class Settings(BaseSettings):
     # A task type whose model head has fewer labelled training rows than this (or failed the
     # retrain per-type gate) is ranked by the deterministic heuristic, not the model probability.
     min_model_training_rows: int = Field(default=500, ge=0)
+    # The weekly retrain replaces the artefact; one older than this is reported as model_stale.
+    model_max_age_days: int = Field(default=21, gt=0)
     # Expected value is the EUR expected inside this horizon — the model's outcome window.
     ev_horizon_days: int = Field(default=60, gt=0)
 

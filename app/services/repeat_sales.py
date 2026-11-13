@@ -106,12 +106,9 @@ def read_snapshot(manager_id: int, as_of: str) -> tuple[list[dict], list[dict], 
                                             include_day=True, include_book=True)
     clients = {}
     products = []
-    churn = set()
     end = history.require_as_of(as_of) + timedelta(days=1)
-    baseline = history.rolling_days(end, 365)
-    recent = history.rolling_days(end, 90)
-    recent_days = (end - recent.effective_start).days
-    prior_days = (recent.effective_start - baseline.effective_start).days
+    churn = {int(row["client_id"])
+             for row in sig.churn_candidates_for_manager(manager_id, end.isoformat())}
     fields = ("client_id", "client_net_uid", "name", "full_name", "phone", "email", "last_order",
               "orders_cnt", "retained_orders_cnt", "turnover_eur")
     for fact in facts:
@@ -122,9 +119,6 @@ def read_snapshot(manager_id: int, as_of: str) -> tuple[list[dict], list[dict], 
                              "_cooldown_cycle_start": fact["cooldown_cycle_start"]})
         if fact.get("product_id") is not None:
             products.append(fact)
-        if (prior_days > 0 and recent_days > 0 and fact["prior_orders"] >= 2
-                and fact["recent_orders"] / recent_days < .5 * fact["prior_orders"] / prior_days):
-            churn.add(cid)
     rows = sorted(clients.values(), key=lambda r: (-float(r["turnover_eur"] or 0),
                                                    r.get("name") or "", r["client_id"]))
     return rows, products, churn

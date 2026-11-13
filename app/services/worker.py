@@ -63,11 +63,15 @@ def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bo
 
     total_persisted = ok = failed = stale_retired = 0
     stale_by_type: dict[str, int] = {}
+    degraded_reasons: list[str] = []
     for i, mid in enumerate(managers, 1):
         try:
             stats = orchestrator.generate_for_manager(mid, as_of)
             total_persisted += stats["persisted"]
             stale_retired += stats.get("stale_retired", 0)
+            for reason in stats.get("degraded_reasons") or []:
+                if reason not in degraded_reasons:
+                    degraded_reasons.append(reason)
             for task_type, count in (stats.get("stale_retired_by_type") or {}).items():
                 stale_by_type[task_type] = stale_by_type.get(task_type, 0) + count
             ok += 1
@@ -90,6 +94,7 @@ def run(as_of: str | None = None, limit: int | None = None, *, push_feedback: bo
              "sla_breached": sla["flagged"], "sla_escalated": sla["escalated"],
              "expired_purged": expired, "reco_feedback_clients": fb["clients"],
              "reco_feedback_products": fb["products"],
+             "degraded": bool(degraded_reasons), "degraded_reasons": degraded_reasons,
              "duration_s": round(time.time() - started, 1), "as_of": as_of}
     mongo.record_generation_run(stats, full_run=limit is None)
     log.info("regen_done", **stats)

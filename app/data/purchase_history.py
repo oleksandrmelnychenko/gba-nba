@@ -4,6 +4,8 @@ purchased_at is the verified Kyiv business wall clock, or the raw sale document 
 unknown. An imported sale is verified when its single-source lineage document date equals the
 sale document clock or the invoice clock (ChangedToInvoice): a sale that existed before it was
 invoiced keeps its creation date in Created, and the invoice clock carries the document date.
+An owned accounting sale (DataSyncAccountingSourceTarget, OwnershipType = 1) is a balance
+carrier, not a sale of goods, and is excluded exactly as in the gba-server sales reports.
 purchased_at_utc is populated ONLY with positive timestamp provenance. Draft-order
 creation is retained separately and never substituted for the confirmed purchase event.
 Callers supply internal SQL fragments/bound parameter names, never request text as scope_sql.
@@ -39,6 +41,10 @@ def retained_purchase_cte(
             FROM dbo.Sale s
             WHERE s.OrderID = o.ID AND s.Deleted = 0 AND s.IsMerged = 0
                   AND s.ChangedToInvoice IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dbo.DataSyncAccountingSourceTarget carrier
+                      WHERE carrier.TargetEntityType = N'Sale' AND carrier.TargetEntityID = s.ID
+                            AND carrier.IsCurrent = 1 AND carrier.OwnershipType = 1)
         ) sale
         OUTER APPLY (
             SELECT MIN(l.DestinationDocumentDate) AS first_date,

@@ -14,6 +14,7 @@ lift. It ranks who is most likely to convert, not who is most moved by a manager
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import pandas as pd
 
 from app.core import history
 from app.core.config import get_settings
+from app.ml import calibration
 
 ART = Path(__file__).resolve().parent / "artifacts"
 
@@ -137,6 +139,16 @@ def head_published(task_type: str, min_rows: int) -> bool:
     return head_training_rows(task_type) >= min_rows
 
 
+def model_age_days(now: datetime | None = None) -> float | None:
+    """Days since the serving artefact was written; None when it is absent."""
+    path = ART / "propensity_model.joblib"
+    try:
+        written = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    except OSError:
+        return None
+    return ((now or datetime.now(UTC)) - written).total_seconds() / 86400.0
+
+
 def _vectorize(task: dict[str, Any]) -> np.ndarray:
     tt = task.get("task_type")
     row = {f: 0.0 for f in FEATURES}
@@ -180,9 +192,11 @@ def score_task(task: dict[str, Any]) -> dict[str, float]:
     Returns p_outcome (calibrated), expected_value (EUR), ev_score (p*EUR, the ranking key),
     and priority (0..100 = 100*p_outcome convenience score).
     """
-    p = float(_model().predict_proba(_vectorize(task))[0, 1])
+    p_raw = float(_model().predict_proba(_vectorize(task))[0, 1])
+    p = calibration.apply(task.get("task_type"), p_raw)
     ev = expected_value(task)
     return {
+        "p_raw": round(p_raw, 6),
         "p_outcome": round(p, 6),
         "expected_value": round(ev, 2),
         "ev_score": round(p * ev, 4),
@@ -196,9 +210,11 @@ def score_batch(tasks: list[dict[str, Any]]) -> list[dict[str, float]]:
     X = pd.concat([_vectorize(t) for t in tasks], ignore_index=True)
     ps = _model().predict_proba(X)[:, 1]
     out = []
-    for t, p in zip(tasks, ps, strict=False):
+    for t, p_raw in zip(tasks, ps, strict=False):
+        p = calibration.apply(t.get("task_type"), float(p_raw))
         ev = expected_value(t)
-        out.append({"p_outcome": round(float(p), 6), "expected_value": round(ev, 2),
+        out.append({"p_raw": round(float(p_raw), 6), "p_outcome": round(float(p), 6),
+                    "expected_value": round(ev, 2),
                     "ev_score": round(float(p) * ev, 4), "priority": round(100.0 * float(p), 2)})
     return out
 

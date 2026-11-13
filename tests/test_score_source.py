@@ -27,6 +27,7 @@ def heads(monkeypatch):
             "cv_per_type": {name: {"n": n} for name, n in rows.items()}})
         monkeypatch.setattr(score_task, "_meta", lambda: {"heads": meta_heads} if meta_heads else {})
         monkeypatch.setattr(score_task, "_model", lambda: object())
+        monkeypatch.setattr(score_task, "model_age_days", lambda now=None: 1.0)
     return set_heads
 
 
@@ -101,8 +102,10 @@ def test_generation_marks_score_source_in_the_payload(heads, monkeypatch):
     monkeypatch.setattr(orchestrator, "_apply_pace_boost", lambda candidates, pace: None)
     orchestrator.generate_for_manager(1, "2026-11-12")
     payloads = {doc["task_type"]: doc["payload"] for doc in db["tasks"].find({})}
-    assert payloads["debt_followup"] == {"x": 1, "score_source": "heuristic"}
-    assert payloads["reorder_due"] == {"x": 1, "score_source": "model"}
+    assert payloads["debt_followup"] == {"x": 1, "score_source": "heuristic", "degraded": True,
+                                         "degraded_reason": "model_head_untrained"}
+    assert payloads["reorder_due"] == {"x": 1, "score_source": "model", "degraded": False,
+                                       "degraded_reason": None}
 
 
 def test_expected_value_uses_one_horizon_for_every_type(monkeypatch):

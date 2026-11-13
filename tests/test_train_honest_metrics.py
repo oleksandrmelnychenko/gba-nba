@@ -65,13 +65,13 @@ def test_baselines_exist_only_for_types_with_a_recency_rule():
     assert baseline_score(frame, "debt_followup") is None
 
 
-def test_served_rows_are_one_most_overdue_product_per_client_and_vintage():
+def test_served_rows_are_one_most_purchased_product_per_client_and_vintage():
     frame = _frame()
     served = served_reorder_rows(frame)
     reorder = frame[frame["task_type"] == "reorder_due"]
     assert len(served) == reorder["client_id"].nunique()
-    expected = reorder.groupby("client_id")["sig_overdue_ratio"].max()
-    assert (served.set_index("client_id")["sig_overdue_ratio"] == expected).all()
+    expected = reorder.groupby("client_id")["sig_n_orders"].max()
+    assert (served.set_index("client_id")["sig_n_orders"].sort_index() == expected).all()
 
 
 def test_report_names_model_baseline_and_served_rows_per_type():

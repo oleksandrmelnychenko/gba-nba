@@ -157,12 +157,14 @@ def baseline_score(frame: pd.DataFrame, task_type: str) -> np.ndarray | None:
 
 
 def served_reorder_rows(frame: pd.DataFrame) -> pd.DataFrame:
-    """The rows the live generator scores: per client and vintage, the most overdue product."""
+    """The rows the live generator scores: per client and vintage, the most purchased due
+    product (ties: the most recently bought), as in generators.reorder_due._likely_first."""
     reorder = frame[frame["task_type"] == "reorder_due"]
     if reorder.empty:
         return reorder
-    lead = reorder.groupby(["vintage", "client_id"])["sig_overdue_ratio"].idxmax()
-    return reorder.loc[lead]
+    ordered = reorder.sort_values(["sig_n_orders", "sig_elapsed_days"], ascending=[False, True],
+                                  kind="stable")
+    return ordered.groupby(["vintage", "client_id"], sort=False).head(1)
 
 
 def honest_oot_report(test: pd.DataFrame, p_col: str) -> dict:

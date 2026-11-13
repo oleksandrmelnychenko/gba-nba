@@ -1,7 +1,8 @@
 """Positive, document-level facts for task reconciliation; absence is never settlement.
 
-Small client batches only. Zero balances are deliberately included, deleted/missing rows are
-not evidence. Orders with no remaining purchased quantity cannot resolve a sales suggestion.
+Small client batches only. Zero balances are deliberately included, deleted/missing debt rows
+are not evidence. A debt whose only client attachment is soft-deleted is reported with a zero
+balance: gba-server and the sync close a paid document that way and leave Debt.Total unchanged. Orders with no remaining purchased quantity cannot resolve a sales suggestion.
 """
 from datetime import UTC, date, timedelta
 
@@ -24,11 +25,13 @@ def source_facts(client_ids: list[int], as_of: str) -> dict[int, dict]:
             WHERE c.ID IN {clause} AND c.Deleted = 0
         """, params)
         debts = query(f"""
-            SELECT cid.ClientID AS client_id, d.ID AS debt_id, d.Total AS balance
+            SELECT cid.ClientID AS client_id, d.ID AS debt_id,
+                   CASE WHEN MAX(CASE WHEN cid.Deleted = 0 THEN 1 ELSE 0 END) = 1
+                        THEN MAX(d.Total) ELSE 0 END AS balance
             FROM dbo.ClientInDebt cid
             JOIN dbo.Debt d ON d.ID = cid.DebtID AND d.Deleted = 0
-            WHERE cid.ClientID IN {clause} AND cid.Deleted = 0
-                  AND d.Created < :end
+            WHERE cid.ClientID IN {clause} AND d.Created < :end
+            GROUP BY cid.ClientID, d.ID
         """, params)
         purchase_cte = retained_purchase_cte(f"c.ID IN {clause}", "start", "end")
         orders = query(purchase_cte + """

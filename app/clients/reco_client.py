@@ -7,6 +7,12 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 
 log = get_logger("reco_client")
+_failures = {"recommend": 0}
+
+
+def recommend_failures() -> int:
+    """Failed recommend calls of this process; callers compare it before and after a batch."""
+    return _failures["recommend"]
 
 
 def _headers(s) -> dict:
@@ -34,6 +40,7 @@ def recommend(customer_id: int, top_n: int = 10, as_of_date: str | None = None,
         return r.json().get("recommendations", [])
     except Exception as exc:  # noqa: BLE001
         log.warning("reco_unavailable", customer_id=customer_id, error=str(exc))
+        _failures["recommend"] += 1
         return []
 
 

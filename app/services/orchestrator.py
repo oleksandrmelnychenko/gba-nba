@@ -162,16 +162,24 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     # collect candidates from all generators
     candidates = []
     generators_failed = 0
+    run_reasons: list[str] = []
     evaluated_types: set[str] = set()
     for gen in _GENERATORS:
         try:
             produced = gen.generate(manager_id, as_of, window)
         except Exception as exc:  # noqa: BLE001
             generators_failed += 1
+            failed_type = getattr(getattr(gen, "TYPE", None), "value", gen.__name__)
+            run_reasons.append(f"generator_failed:{failed_type}")
             log.warning("generator_failed", generator=gen.__name__, manager_id=manager_id, error=str(exc))
             continue
         candidates.extend(produced)
         gen_type = getattr(gen, "TYPE", None)
+        unavailable = getattr(gen, "unavailable_reason", None)
+        if not produced and unavailable is not None:
+            reason = unavailable(manager_id)
+            if reason:
+                run_reasons.append(reason)
         # cross_sell returns nothing when gba-reco is offline: an empty answer proves no absence.
         if gen_type is None:
             evaluated_types.update(task.task_type.value for task in produced)
@@ -208,7 +216,10 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
     }
     for task in candidates:
         task.signals = {**task.signals, **signal_history}
-        task.payload = {**task.payload, "score_source": scoring.score_source(task.task_type.value)}
+        basis = scoring.score_basis(task.task_type.value)
+        task.payload = {**task.payload, "score_source": basis["source"],
+                        "degraded": basis["reason"] is not None,
+                        "degraded_reason": basis["reason"]}
 
     # highest expected EUR first so caps keep the BEST tasks; priority remains the legacy fallback
     # and tie-breaker for candidates without an EV score.
@@ -304,6 +315,8 @@ def generate_for_manager(manager_id: int, as_of: str | None = None) -> dict:
              "by_type": {tt.value: n for tt, n in per_type.items()},
              "stale_retired": stale["retired"], "stale_retired_by_type": stale["by_type"],
              "stale_retired_by_rule": stale["by_rule"],
+             **{key: value for key, value in scoring.degradation(run_reasons).items()
+                if key != "score_sources"},
              **coverage.metadata(), **counters, **reconciliation_stats}
     log.info("generation_done", **stats)
     return stats

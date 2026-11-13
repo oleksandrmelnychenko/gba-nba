@@ -27,6 +27,7 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
         prior = int(r["prior_orders"] or 0)
         silence = int(r["silence_days"] or 0)
         drop_ratio = (recent / prior) if prior else 0.0
+        own_interval = r.get("own_interval_days")
         cf = feats.get(cid, {})
         monetary_cid = float(cf.get("monetary") or 0.0)
 
@@ -52,14 +53,17 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
             priority=prio, p_outcome=p_out, expected_value=ev, ev_score=ev_score,
             urgency=scoring.urgency_band(u),
             payload={"churn": {"recent_orders": recent, "prior_orders": prior,
-                              "drop_ratio": round(drop_ratio, 2), "silence_days": silence}},
+                              "drop_ratio": round(drop_ratio, 2), "silence_days": silence,
+                              "own_interval_days": own_interval}},
             signals={"drop_ratio": round(drop_ratio, 2), "silence_days": silence,
                      "recent_orders": recent, "prior_orders": prior,
                      "monetary": monetary_cid, "recency_days": cf.get("recency_days"),
                      "order_count": cf.get("order_count", 0)},
             explanation=Explanation(
                 factors=[f"активність впала на ~{drop_pct}% ({prior}→{recent} замовлень)",
-                         f"не замовляв {silence} дн",
+                         f"не замовляв {silence} дн"
+                         + (f" при звичному інтервалі ~{float(own_interval):.0f} дн"
+                            if own_interval else ""),
                          f"річний оборот {monetary_cid:.0f} EUR"],
                 source_signal="churn", confidence=conf),
             contact=Contact(phone=c.get("phone"), email=c.get("email"),

@@ -386,3 +386,9 @@ Inferred, not verified:
 - Debt and cross-sell: nothing could be evaluated.
 - At 15:00 the service health reported `db_connected: false` (the host was under heavy load from
   other work); live generation was not re-run for this review.
+
+## 13. Follow-up 2026-11-13
+
+Item 5 of section 9 (minimum churn silence) and the lead-product remark of section 1.2 are
+implemented with measured effects, and the calibration tables are redone on the artefacts that
+were live at each as-of date: `docs/task-quality-2026-11-13.md`.

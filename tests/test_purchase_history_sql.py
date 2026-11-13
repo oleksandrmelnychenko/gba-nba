@@ -46,6 +46,8 @@ def sql_fixture():
                     PricePerItem decimal(18,4), Deleted bit, IsValidForCurrentSale bit, Updated datetime2);
                 CREATE TABLE #Lineage(LocalSaleID bigint, DestinationDocumentDate datetime2, IsPresent bit,
                     SourceSaleID varbinary(16), ImportedForAmg bit);
+                CREATE TABLE #Carrier(TargetEntityType nvarchar(64), TargetEntityID bigint,
+                    IsCurrent bit, OwnershipType int);
                 INSERT #User VALUES(1,0),(2,0);
                 INSERT #Debt VALUES(501,50,'2026-09-01',0);
                 INSERT #ClientInDebt VALUES(10,501,0);
@@ -102,6 +104,7 @@ def sql_fixture():
                     "dbo.Client": "#Client",
                     "dbo.Sale": "#Sale",
                     "dbo.DataSyncImportedSaleSourceLine": "#Lineage",
+                    "dbo.DataSyncAccountingSourceTarget": "#Carrier",
                 }
                 for original, temporary in replacements.items():
                     sql = sql.replace(original, temporary)
@@ -155,3 +158,27 @@ def test_reconciliation_repository_uses_same_retained_scope_and_verified_instant
     assert after[10]["orders"]["7"]["order_id"] == 6
     assert after[10]["returns"]["7"]["order_id"] == 8
     assert Decimal(after[10]["returns"]["7"]["quantity"]) == 10
+
+
+def test_owned_accounting_sale_is_not_a_purchase(sql_fixture):
+    connection, run = sql_fixture
+    connection.exec_driver_sql(
+        "INSERT #Carrier VALUES(N'Sale',6,1,1),(N'Sale',8,1,2),(N'Sale',1,0,1),(N'Debt',2,1,1)")
+    rows = run(
+        retained_purchase_cte() + " SELECT * FROM retained_purchases",
+        {"mid": 1, "source_start": "2025-01-01", "asof": "2026-10-02"},
+    )
+    assert {row["order_id"] for row in rows} == {1, 2, 3, 8}
+
+
+def test_soft_deleted_debt_attachment_is_reported_as_settled(sql_fixture, monkeypatch):
+    from app.data import reconciliation_repository as repository
+
+    connection, run = sql_fixture
+    monkeypatch.setattr(repository, "query", run)
+    connection.exec_driver_sql("""
+        INSERT #Debt VALUES(502,70,'2026-09-02',0),(503,90,'2026-09-03',0);
+        INSERT #ClientInDebt VALUES(10,502,1),(10,503,1),(10,503,0);
+    """)
+    debts = repository.source_facts([10], "2026-10-01")[10]["debts"]
+    assert {key: float(value) for key, value in debts.items()} == {"501": 50.0, "502": 0.0, "503": 90.0}

@@ -164,6 +164,13 @@ def generation_readiness(max_lag_hours: int) -> dict:
     }
 
 
+def last_run_degraded_reasons() -> list[str]:
+    """Run-level degraded reasons (reco unavailable, a failed generator) of the latest full run."""
+    run = generation_runs().find_one({"full_run": True}, sort=[("completed_at", DESCENDING)])
+    return [str(reason) for reason in (run or {}).get("degraded_reasons") or []
+            if not str(reason).startswith("heuristic_score:") and reason != "model_stale"]
+
+
 def ping() -> bool:
     try:
         get_client().admin.command("ping")

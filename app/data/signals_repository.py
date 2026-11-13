@@ -10,10 +10,11 @@ Verified columns:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core import history
 from app.core.config import get_settings
@@ -24,6 +25,7 @@ from app.data.db import in_clause, query
 from app.data.purchase_history import retained_purchase_cte
 
 log = get_logger("signals")
+_KYIV = ZoneInfo("Europe/Kyiv")
 
 
 @lru_cache(maxsize=64)
@@ -540,14 +542,19 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
     order rate fell below half their baseline rate. Rates are window-length-normalized (recent =
     last :recent days; baseline = the :base..:recent days before that) so a steady buyer is NOT
     flagged just because the recent window is shorter than the baseline window.
+
+    The silence must also exceed the client's own rhythm: at least churn_min_silence_days and
+    churn_silence_cycle_mult times the client's mean gap between purchase days in the baseline
+    window. A client inside their natural cycle is not lapsing.
     """
+    settings = get_settings()
     baseline = history.rolling_days(as_of, baseline_days)
     recent = history.rolling_days(as_of, recent_days)
     recent_span_days = (recent.as_of - recent.effective_start).days
     prior_span_days = (recent.effective_start - baseline.effective_start).days
     if recent_span_days <= 0 or prior_span_days <= 0:
         return []
-    return query(
+    rows = query(
         retained_purchase_cte(start_param="start") + """
         , client_orders AS (
             SELECT DISTINCT client_id, order_id, purchased_at AS dt FROM retained_purchases
@@ -557,12 +564,15 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
                    SUM(CASE WHEN dt >= :recent_start THEN 1 ELSE 0 END) AS recent_orders,
                    SUM(CASE WHEN dt >= :start
                             AND dt < :recent_start THEN 1 ELSE 0 END) AS prior_orders,
-                   MAX(dt) AS last_order
+                   MAX(dt) AS last_order,
+                   COUNT(DISTINCT CONVERT(date, dt)) AS purchase_days,
+                   DATEDIFF(day, MIN(dt), MAX(dt)) AS purchase_span_days
             FROM client_orders
             GROUP BY client_id
         )
         SELECT client_id, recent_orders, prior_orders,
-               DATEDIFF(day, last_order, :asof) AS silence_days
+               DATEDIFF(day, last_order, :asof) AS silence_days,
+               purchase_days, purchase_span_days
         FROM agg
         WHERE prior_orders >= 2
               AND (recent_orders * 1.0 / :recent_span)
@@ -577,6 +587,22 @@ def churn_candidates_for_manager(manager_id: int, as_of: str,
             "prior_span": prior_span_days,
         },
     )
+    out = []
+    for row in rows:
+        days = int(row.get("purchase_days") or 0)
+        interval = (float(row.get("purchase_span_days") or 0) / (days - 1)) if days >= 2 else None
+        silence = int(row["silence_days"] or 0)
+        if silence < churn_silence_floor(interval, settings):
+            continue
+        out.append({**row, "own_interval_days": round(interval, 1) if interval is not None else None})
+    return out
+
+
+def churn_silence_floor(own_interval_days: float | None, settings=None) -> float:
+    """Days of silence before a rate drop counts as lapsing, given the client's own rhythm."""
+    settings = settings or get_settings()
+    return max(float(settings.churn_min_silence_days),
+               settings.churn_silence_cycle_mult * float(own_interval_days or 0.0))
 
 
 def client_features(client_ids: list[int], as_of: str, window_days: int = 365) -> dict[int, dict]:
@@ -674,32 +700,52 @@ def monthly_shipped(manager_id: int, since: str, as_of: str) -> InvoiceSeries:
     return series
 
 
-def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
-    """Per-month PAID cash (EUR) for a manager, by FromDate month, via ClientID->manager.
+def _kyiv_midnight_utc(day) -> str:
+    local = datetime.combine(day, datetime.min.time(), _KYIV)
+    return local.astimezone(UTC).replace(tzinfo=None).isoformat()
 
-    FromDate is the payment date; Created may be the bulk import timestamp. Use the persisted
-    document EuroAmount: current sync preserves its document FX/settlement conversion. Revaluing
-    it through today's rate tables changes the historical cash result. Reject missing conversion.
+
+def monthly_paid(manager_id: int, since: str, as_of: str) -> dict[str, Decimal]:
+    """Per-month PAID cash (EUR) for a manager, by the Kyiv register day, via ClientID->manager.
+
+    FromDate is the payment register date stored as a UTC instant (a document dated the 1st is
+    stored at 21:00/22:00 UTC of the previous day), so months and the as-of boundary are Kyiv
+    business days, never the raw UTC value. Created may be the bulk import timestamp. Use the
+    persisted document EuroAmount: current sync preserves its document FX/settlement conversion.
+    Revaluing it through today's rate tables changes the historical cash result. Reject missing
+    conversion. Owned accounting payments are balance carriers, not cash, as in gba-server.
     """
     window = history.explicit_window(since, as_of)
     rows = query(
         """
-        SELECT FORMAT(p.FromDate, 'yyyy-MM') AS ym,
+        SELECT p.FromDate AS registered_at,
                SUM(p.EuroAmount) AS amt,
                SUM(CASE WHEN p.Amount <> 0 AND (p.EuroAmount IS NULL OR p.EuroAmount = 0
                     OR SIGN(p.Amount) <> SIGN(p.EuroAmount)) THEN 1 ELSE 0 END) AS missing_conversion
         FROM dbo.IncomePaymentOrder p
         JOIN dbo.Client c ON c.ID = p.ClientID AND c.Deleted = 0 AND c.MainManagerID = :mid
         WHERE p.Deleted = 0 AND p.IsCanceled = 0
-              AND p.FromDate >= :since AND p.FromDate < :asof
-        GROUP BY FORMAT(p.FromDate, 'yyyy-MM')
+              AND p.FromDate >= :since_utc AND p.FromDate < :asof_utc
+              AND NOT EXISTS (
+                  SELECT 1 FROM dbo.DataSyncAccountingSourceTarget carrier
+                  WHERE carrier.TargetEntityType = 'IncomePaymentOrder'
+                        AND carrier.TargetEntityID = p.ID
+                        AND carrier.IsCurrent = 1 AND carrier.OwnershipType = 1)
+        GROUP BY p.FromDate
         """,
         {
             "mid": manager_id,
-            "since": window.effective_start.isoformat(),
-            "asof": window.as_of.isoformat(),
+            "since_utc": _kyiv_midnight_utc(window.effective_start),
+            "asof_utc": _kyiv_midnight_utc(window.as_of),
         },
     )
     if any(r['missing_conversion'] for r in rows):
         raise ValueError('payment_eur_conversion_missing')
-    return {r["ym"]: decimal_value(r["amt"]) for r in rows}
+    months: dict[str, Decimal] = {}
+    for row in rows:
+        registered = row["registered_at"]
+        if isinstance(registered, str):
+            registered = datetime.fromisoformat(registered)
+        month = registered.replace(tzinfo=UTC).astimezone(_KYIV).strftime("%Y-%m")
+        months[month] = months.get(month, Decimal("0")) + decimal_value(row["amt"])
+    return months

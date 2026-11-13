@@ -19,8 +19,21 @@ _MIN_SCORE = 0.05
 _RECO_REQUEST_N = 25
 
 
+_last_run: dict[int, dict] = {}
+
+
+def unavailable_reason(manager_id: int) -> str | None:
+    """Why the last run for this manager produced no cross-sell: reco down or every call failed."""
+    run = _last_run.get(manager_id) or {}
+    if run.get("offline") or (run.get("asked", 0) > 0 and run.get("failed", 0) == run["asked"]):
+        return scoring.RECO_UNAVAILABLE
+    return None
+
+
 def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
+    run = _last_run[manager_id] = {"offline": False, "asked": 0, "failed": 0}
     if not reco_client.is_healthy():
+        run["offline"] = True
         return []  # reco offline → no cross-sell this run (graceful)
 
     s = get_settings()
@@ -38,9 +51,12 @@ def generate(manager_id: int, as_of: str, window_tag: str) -> list[Task]:
     tasks: list[Task] = []
     for c in clients:
         cid = int(c["client_id"])
+        failures_before = reco_client.recommend_failures()
         recs = reco_client.recommend(cid, top_n=_RECO_REQUEST_N, as_of_date=as_of,
                                      path="/recommend/copurchase",
                                      timeout=s.reco_crosssell_timeout)
+        run["asked"] += 1
+        run["failed"] += reco_client.recommend_failures() > failures_before
         # cross-sell = NEW products (discovery), not repurchase
         discovery = [r for r in recs if r.get("source") == "discovery" and r.get("score", 0) >= _MIN_SCORE]
         if not discovery:

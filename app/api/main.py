@@ -294,6 +294,14 @@ def health() -> dict:
         and bool(model["model_compatible"])
     )
     metrics_health = _team_metrics_health()
+    scoring_state = _scoring_degradation() if mongo_ok else {
+        "degraded": True, "degraded_reasons": ["scoring_state_unavailable"], "score_sources": {}}
+    try:
+        from app.ml import calibration
+
+        calibration_state = calibration.state()
+    except Exception:  # noqa: BLE001
+        calibration_state = {"calibration_active": False, "calibration_reason": "calibration_unreadable"}
     healthy = db_ok and mongo_ok and business_ready and not metrics_health["metrics_degraded"]
     return {
         "status": "healthy" if healthy else "degraded",
@@ -305,6 +313,10 @@ def health() -> dict:
         **generation,
         **model,
         "source_history_contract_ready": source_history_contract_ready,
+        "scoring_degraded": scoring_state["degraded"],
+        "scoring_degraded_reasons": scoring_state["degraded_reasons"],
+        "score_sources": scoring_state["score_sources"],
+        **calibration_state,
         "version": "0.1.0",
         "model_version": settings.model_version,
     }
@@ -399,6 +411,23 @@ def generate(
     return stats
 
 
+def _scoring_degradation() -> dict:
+    """Explicit degraded marker of the scores in task payloads; never fails the caller."""
+    from app.services import scoring
+
+    try:
+        run_reasons = mongo.last_run_degraded_reasons()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("degradation_run_reasons_unavailable", error=type(exc).__name__)
+        run_reasons = []
+    try:
+        return scoring.degradation(run_reasons)
+    except Exception as exc:  # noqa: BLE001
+        log.error("scoring_degradation_failed", error=type(exc).__name__)
+        return {"degraded": True, "degraded_reasons": ["scoring_state_unavailable"],
+                "score_sources": {}}
+
+
 @app.get("/cockpit/inbox")
 def cockpit_inbox(
     manager_net_uid: str,
@@ -413,7 +442,7 @@ def cockpit_inbox(
     for it in items:
         it["_id"] = str(it["_id"])
     return {"manager_id": manager_id, "manager_net_uid": _canonical_net_uid(manager_net_uid),
-            "count": len(items), **page}
+            "count": len(items), **page, **_scoring_degradation()}
 
 
 @app.get("/cockpit/count")

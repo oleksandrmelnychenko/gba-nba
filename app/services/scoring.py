@@ -88,19 +88,77 @@ def score_task_priority(task_type: str, signals: dict) -> tuple[float, float, fl
     return s["priority"], s["p_outcome"], s["expected_value"], s["ev_score"]
 
 
-def score_source(task_type: str) -> str:
-    """"model" when the trained head may rank this task type, else "heuristic": an incompatible
-    artifact, or a head with fewer labelled training rows than min_model_training_rows (or one
-    the retrain gate withheld), has no basis for a probability."""
-    from app.ml.score_task import IncompatibleModelArtifactError, _model, head_published
+HEAD_UNTRAINED = "model_head_untrained"
+HEAD_WITHHELD = "model_head_withheld"
+MODEL_MISSING = "model_artifact_missing"
+MODEL_INCOMPATIBLE = "model_incompatible"
+MODEL_STALE = "model_stale"
+RECO_UNAVAILABLE = "reco_unavailable"
+SCORED_TYPES = ("debt_followup", "reorder_due", "churn_winback", "cross_sell")
 
-    if not head_published(task_type, get_settings().min_model_training_rows):
-        return "heuristic"
+
+def score_basis(task_type: str) -> dict:
+    """What stands behind p_outcome for a task type: {"source", "reason"}.
+
+    source "heuristic" always carries the reason the trained head is not used: no usable
+    artefact, a head with fewer labelled rows than min_model_training_rows, or a head the
+    retrain gate withheld. source "model" carries MODEL_STALE when the artefact is older than
+    model_max_age_days (the weekly retrain has not replaced it); the probability is still the
+    model's.
+    """
+    from app.ml import score_task
+
+    settings = get_settings()
+
+    def unusable() -> dict:
+        reasons = score_task.model_compatibility()["model_reasons"]
+        return {"source": "heuristic",
+                "reason": MODEL_MISSING if MODEL_MISSING in reasons else MODEL_INCOMPATIBLE}
+
     try:
-        _model()
-    except IncompatibleModelArtifactError:
-        return "heuristic"
-    return "model"
+        head = (score_task._meta().get("heads") or {}).get(task_type)
+    except (OSError, TypeError, ValueError):
+        head = None
+    if head is not None and not head.get("published", False):
+        return {"source": "heuristic", "reason": HEAD_WITHHELD}
+    if not score_task.head_published(task_type, settings.min_model_training_rows):
+        if score_task.head_training_rows(task_type) == 0 and score_task.model_age_days() is None:
+            return unusable()
+        return {"source": "heuristic", "reason": HEAD_UNTRAINED}
+    try:
+        score_task._model()
+    except score_task.IncompatibleModelArtifactError:
+        return unusable()
+    age = score_task.model_age_days()
+    stale = age is not None and age > settings.model_max_age_days
+    return {"source": "model", "reason": MODEL_STALE if stale else None}
+
+
+def score_source(task_type: str) -> str:
+    """"model" when the trained head may rank this task type, else "heuristic"."""
+    return score_basis(task_type)["source"]
+
+
+def degradation(extra_reasons: list[str] | None = None) -> dict:
+    """Explicit degraded marker of the scoring service for API payloads.
+
+    degraded_reasons lists every task type scored by the rule instead of the model as
+    "heuristic_score:<type>:<reason>", a stale artefact as MODEL_STALE, plus caller-supplied
+    run reasons such as RECO_UNAVAILABLE.
+    """
+    reasons: list[str] = []
+    sources: dict[str, dict] = {}
+    for task_type in SCORED_TYPES:
+        basis = score_basis(task_type)
+        sources[task_type] = basis
+        if basis["source"] == "heuristic":
+            reasons.append(f"heuristic_score:{task_type}:{basis['reason']}")
+        elif basis["reason"] and basis["reason"] not in reasons:
+            reasons.append(basis["reason"])
+    for reason in extra_reasons or []:
+        if reason not in reasons:
+            reasons.append(reason)
+    return {"degraded": bool(reasons), "degraded_reasons": reasons, "score_sources": sources}
 
 
 def _heuristic_probability(task_type: str, signals: dict) -> float:

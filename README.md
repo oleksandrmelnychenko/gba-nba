@@ -38,6 +38,38 @@ with the same command the timer runs (requires the `.env` SQL and Mongo access):
 
 Model-dependent scoring tests are skipped until the model exists.
 
+The retrain dataset is enumerated and labelled by the readers the generators serve from
+(`signals_repository.*_for_manager` with no manager = the whole managed book,
+`debt_snapshot.task_candidates`, `purchases_between`, `payments_between`), so a training row
+and a served task share one rule: confirmed purchases by invoice date on Kyiv days. Reco answers
+for cross-sell rows are cached under the client NetUID and re-used only for the same client id.
+The regression gate compares the new model with the previous one on the same out-of-time rows:
+when the fold or the dataset rule differs from the previous run, the previous artefact is
+re-scored on the current fold instead of trusting its stored AUC.
+
+A run that must not touch production writes everything into a scratch directory:
+
+```bash
+.venv/bin/python scripts/retrain.py --dry-run --work-dir /path/to/scratch \
+    --seed-artifacts app/ml/artifacts
+```
+
+## Debt rules
+
+One overdue rule (`app/data/debt_snapshot.py`) feeds the dashboard card, the aging chart, the
+«Мої клієнти» column and the follow-up tasks.
+
+- An opening balance (the debt's sale is an owned accounting carrier, entered 2024-12-31) is
+  counted as overdue on its stored date and reported as `debt_opening_balance_count/eur`
+  inside the overdue total. It never raises a task. One that is not past due by its stored
+  date and terms stays in `debt_unknown_date_count/eur`.
+- No follow-up task while the oldest overdue document is at most `DEBT_GRACE_DAYS` (3) past
+  terms. Past the grace period urgency follows collectability: 4–30 days high, 31–90 normal,
+  over 90 low («стара заборгованість», still listed). The most collectable document of a
+  client sets the urgency (`payload.debt.lead_days_past_terms`, `age_band`).
+- «Оборот (12м)» (`turnover_eur`) is gross — return documents are not subtracted;
+  `/cockpit/clients` states it as `turnover_basis`.
+
 ## Checks
 
 ```bash

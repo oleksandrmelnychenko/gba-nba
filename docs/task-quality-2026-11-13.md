@@ -244,15 +244,71 @@ through the existing stale rule after their due date (up to six days).
 
 ## 6. Not changed, for a decision
 
-- 144 unknown-date debt documents, 55,943.12 EUR (10162: 51 documents, 55,172.05 EUR). All are
-  opening balances of 2024-12-31. With `Debt.Created` taken as stored, 143 documents
-  (55,701.60 EUR) are 652–3,998 days past terms and one (241.52 EUR, 10146) carries a date
-  twelve years ahead; the clock uncertainty is hours. Counting the 143 moves the department
-  overdue figure from 45,219.11 to 100,920.71 EUR and 10162 from 891.15 to 56,063.20 EUR. Two
-  documents hold 42,026.11 EUR.
 - 20% holdout of admitted tasks: still the only way to measure the effect of a call. Nothing
   recorded yet: 0 outcomes on 2,681 tasks.
-- Debt grace period and urgency by age (section 2).
-- Training data still enumerates candidates and labels from raw orders by creation date, while
-  the generators use confirmed purchases by invoice date. The next retrain also sees the changed
-  lead product and churn rule only through serving, not through its dataset.
+
+## 7. Decisions applied
+
+### Opening balances
+
+The 144 unknown-date documents are the debts whose sale is an owned accounting carrier (the
+1C balances entered on 2024-12-31). 143 are counted as overdue on the stored date; the one
+whose stored date plus terms (9,000 days) lies years ahead stays unknown.
+
+| Figure | Before | After |
+|---|---:|---:|
+| Department overdue | 45,219.11 | 100,920.71 |
+| 10146 / 10154 / 10162 | 10,977.62 / 8,485.83 / 891.15 | 10,981.92 / 8,495.96 / 56,063.20 |
+| 10182 / 10183 / 10184 | 10,814.58 / 8,485.09 / 5,564.84 | 10,845.40 / 8,500.76 / 6,033.47 |
+| of which opening balances | — | 143 documents, 55,701.60 |
+| Unknown date | 144 documents, 55,943.12 | 1 document, 241.52 |
+
+Card = aging rows = «Мої клієнти» column for all six managers. Payload: `debt_opening_balance_count`,
+`debt_opening_balance_eur` on `/cockpit/dashboard`, per team row and as
+`total_debt_opening_balance_*` on `/cockpit/head/dashboard`, per client on `/cockpit/clients`.
+An opening balance never raises a follow-up task and is not part of a task's amount or
+document list.
+
+### Debt follow-up: grace period and urgency by collectability
+
+No task while the oldest overdue document is at most 3 days past terms. Urgency is set by the
+most collectable document past the grace period: 4–30 days high, 31–90 normal, over 90 low
+(«стара заборгованість», still listed).
+
+Replay on the open documents of 2026-11-08 with five days of follow-up (201 clients with
+overdue ≥ 10 EUR, 56,691.86 EUR):
+
+| Urgency | Tasks before | Tasks after | ≥ 50% settled in 5 days (after) |
+|---|---:|---:|---:|
+| critical | 9 | 0 | |
+| high | 192 | 146 | 60.3% |
+| normal | 0 | 4 | 50.0% |
+| low | 0 | 7 | 0.0% |
+| no task (grace) | — | 44 | 72.7% without a task |
+
+By document: 1–3 days 66.1% settled (257), 4–30 days 55.7% (497), 31–90 days 36.5% (52),
+over 90 days 5.6% (72). Candidates of 2026-11-13: 159 → 117 (8 critical + 151 high →
+110 high, 3 normal, 4 low; 42 inside the grace period).
+
+### Training data on the serving rule
+
+The retrain dataset is enumerated and labelled by the generators' own readers over the whole
+managed book; reco answers are cached under the client NetUID; the regression gate re-scores the
+previous artefact on the current fold whenever the fold or the dataset rule differs.
+
+Dry run of 2026-11-13 (vintages 2026-05-01 … 2026-09-01, test fold August–September, 9,557
+rows; 21,556 rows in all, reco asked for 1,024 clients, 0 failed calls, 1,017 cross-sell rows
+against 0 in the weekly run of 2026-11-09). Same out-of-time rows:
+
+| Model | AUC | Brier | Calibration error | Mean predicted (realised 0.203) |
+|---|---:|---:|---:|---:|
+| Live artefact (fitted on May–September, saw the fold) | 0.6872 | 0.1503 | 0.0331 | 0.235 |
+| Old rule, fitted on May–July, logit / HGB | 0.6841 / 0.6754 | 0.1511 / 0.1511 | 0.0430 / 0.0445 | 0.246 / 0.247 |
+| Serving rule, fitted on May–July, logit / HGB | 0.6902 / 0.6831 | 0.1485 / 0.1483 | 0.0354 / 0.0330 | 0.236 / 0.234 |
+
+Cross-sell rows (408): AUC 0.544 → 0.619, Brier 0.240 → 0.151, mean predicted 0.482 → 0.227
+against 0.191 realised. Reorder rows (8,885): 0.695 → 0.681; served reorder rows (563):
+0.762 → 0.735; churn (256): 0.810 → 0.782 — the live artefact had seen these months, and the
+candidate is HGB where the live one is logit (like for like: 0.7631 → 0.7620 served reorder,
+0.8040 → 0.8061 churn). Gate: pass (0.6831 ≥ 0.62 and ≥ 0.6872 − 0.01). Heads: reorder and
+churn published, cross-sell withheld (0.6187 < 0.62), debt withheld (19 rows).
